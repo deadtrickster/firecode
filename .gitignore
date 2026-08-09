@@ -1,15 +1,14 @@
 # firellm ignores
 images/
+runs/
+vendor/
+.jail/
+
 *.ext4
 *.squashfs
+*.tar
 vmlinux-*
-firecracker
-jailer
 *.log
 *.socket
-id_rsa*
-/srv/jailer/firellm/
-/tmp/firellm-*
-*.img
-work-*
 *.pid
+*.img

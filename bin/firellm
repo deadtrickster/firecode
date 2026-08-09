@@ -1,267 +1,1215 @@
 #!/usr/bin/env bash
+# firellm - run a coding agent inside a Firecracker microVM, under the jailer.
+#
+# The agent gets root, the network and your project. It does not get your
+# host: no host filesystem, no host processes, no host devices. Work is
+# copied back out to a sibling directory when the VM shuts down.
 set -euo pipefail
-
-# firellm - Firecracker jailer harness for safe agent runs
-# usage:
-#   firellm setup
-#   firellm prepare
-#   firellm run --task "..." [--workdir dir] [--no-net] [--id name]
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGES="$ROOT/images"
+GUEST="$ROOT/guest"
 SCRIPTS="$ROOT/scripts"
+VENDOR="$ROOT/vendor/bin"
+RUNS="$ROOT/runs"
+STATE_DIR="$ROOT/state"
+JAIL_BASE="$ROOT/.jail"
 
-FC="/usr/local/bin/firecracker"
-JAILER="/usr/local/bin/jailer"
-KERNEL=""
-ROOTFS=""
-ID="firellm-$(date +%s)-$$"
-TASK=""
-WORKDIR="."
+FC="$VENDOR/firecracker"
+JAILER="$VENDOR/jailer"
+
+# Where the host agents keep their configuration. Overridable mostly so the
+# harness can be exercised against a throwaway copy.
+CLAUDE_HOME="${FIRELLM_CLAUDE_HOME:-$HOME/.claude}"
+CLAUDE_CONF="${FIRELLM_CLAUDE_CONF:-$HOME/.claude.json}"
+OPENCODE_HOME="${FIRELLM_OPENCODE_HOME:-$HOME/.opencode}"
+
+# Defaults. Claude Code alone wants ~1.5G, so 1G was never going to work.
+MEM=4096
+VCPU=4
 NONET=0
-MEM=1024
-VCPU=2
+NOJAIL=0
+CGROUPS=0
+KEEP=0
+QUIET_BOOT=1
+AUTO_FLAGS=1
+TIMEOUT=0
+WORKDIR="."
+AGENT=""
+SYNC_BACK=1
+RESUME_TREE=auto
+IMPORT_SESSIONS=auto
+declare -a EXTRA_DIRS=()
+declare -a HOST_PORTS=()
+
+# Relative to $HOME. Never carried into the guest, whatever is asked for:
+# keeping keys and credentials out is most of the point of running in a VM.
+SENSITIVE_HOME_DIRS=(
+	.ssh
+	.gnupg
+	.aws
+	.kube
+	.docker
+	.config/gh
+	.password-store
+	.mozilla
+	.config/google-chrome
+	.config/chromium
+)
+
+refuse_if_sensitive() {
+	local path=$1 rel
+	for rel in "${SENSITIVE_HOME_DIRS[@]}"; do
+		local full="$HOME/$rel"
+		if [[ $path == "$full" || $path == "$full"/* ]]; then
+			die "refusing to put $full in the guest - keys and credentials stay on the host"
+		fi
+	done
+}
 
 log() { echo "[firellm] $*" >&2; }
 die() {
-	echo "[firellm] ERROR: $*" >&2
+	echo "[firellm] error: $*" >&2
 	exit 1
 }
 
-need_root() {
-	# shellcheck disable=SC2120
-	if [[ $EUID -ne 0 ]]; then
-		exec sudo "$0" "$@"
+# debugfs and mkfs.ext4 live in /usr/sbin, which is not always on a user PATH.
+sbin() {
+	local name=$1
+	shift
+	local p
+	for p in "$(command -v "$name" 2>/dev/null || true)" \
+		/usr/sbin/"$name" /sbin/"$name" /usr/local/sbin/"$name"; do
+		if [[ -n $p && -x $p ]]; then
+			"$p" "$@"
+			return
+		fi
+	done
+	die "$name not found (install e2fsprogs)"
+}
+
+priv() {
+	if [[ $EUID -eq 0 ]]; then
+		"$@"
+	else
+		sudo "$@"
 	fi
 }
 
-ensure_assets() {
-	if [[ ! -x "$FC" || ! -x "$JAILER" ]]; then
-		log "firecracker/jailer not found in /usr/local/bin, running setup"
-		sudo "$SCRIPTS/setup.sh"
+# ---------------------------------------------------------------- assets
+
+KERNEL=""
+ROOTFS=""
+
+resolve_assets() {
+	[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firellm setup"
+
+	local k
+	k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -type f | sort -V | tail -1)
+	[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firellm setup"
+	KERNEL=$k
+
+	# Explicitly the prepared image. Do not glob and take the first match:
+	# that is how this used to silently boot the untouched base image.
+	ROOTFS="$IMAGES/agent-firellm.ext4"
+	[[ -f $ROOTFS ]] || die "no guest rootfs - run: firellm prepare"
+}
+
+# ---------------------------------------------------------------- host MCP
+
+# Ports of MCP servers the host exposes over http/sse on localhost. Those are
+# the only ones that can be relayed into the guest; stdio servers are host
+# binaries and cannot come along.
+discover_mcp_ports() {
+	[[ -f $CLAUDE_CONF ]] || return 0
+	python3 - "$CLAUDE_CONF" <<'PY' 2>/dev/null || true
+import json, re, sys
+
+ports = set()
+
+def walk(o):
+    if isinstance(o, dict):
+        servers = o.get("mcpServers")
+        if isinstance(servers, dict):
+            for spec in servers.values():
+                url = spec.get("url") if isinstance(spec, dict) else None
+                if not url:
+                    continue
+                if "localhost:" in url or "127.0.0.1:" in url:
+                    m = re.search(r":(\d+)", url)
+                    if m:
+                        ports.add(int(m.group(1)))
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+
+try:
+    with open(sys.argv[1]) as fh:
+        walk(json.load(fh))
+except Exception:
+    sys.exit(0)
+
+print(" ".join(str(p) for p in sorted(ports)))
+PY
+}
+
+# ---------------------------------------------------------------- drives
+
+# ext4 image built straight from a directory, no mount and no root.
+mkimage_from_dir() {
+	local src=$1 out=$2 label=$3 size=$4
+	# Round up to a whole MiB: firecracker warns about anything that is not a
+	# multiple of the 512 byte sector size, and the tail would be invisible.
+	local mib=$((1024 * 1024))
+	size=$(((size + mib - 1) / mib * mib))
+	rm -f "$out"
+	truncate -s "$size" "$out"
+	sbin mkfs.ext4 -q -F -L "$label" -d "$src" "$out"
+}
+
+# Read-only drives never grow, so they only need their contents plus the
+# filesystem's own overhead.
+size_ro_dir() {
+	local dir=$1 used
+	used=$(du -sb --apparent-size "$dir" 2>/dev/null | cut -f1)
+	echo $((${used:-0} * 11 / 10 + 128 * 1024 * 1024))
+}
+
+# Bytes needed to hold a directory, with room for the agent to work in.
+size_for_dir() {
+	local dir=$1 floor=$2 used
+	used=$(du -sb --apparent-size "$dir" 2>/dev/null | cut -f1)
+	used=${used:-0}
+	local want=$((used * 2 + 2 * 1024 * 1024 * 1024))
+	((want < floor)) && want=$floor
+	echo "$want"
+}
+
+CFG_DRIVE="$IMAGES/agent-roconfig.ext4"
+CFG_STAMP="$IMAGES/.roconfig.stamp"
+
+config_fingerprint() {
+	local parts=() p bin
+	for p in "$CLAUDE_CONF" "$CLAUDE_HOME/settings.json" \
+		"$CLAUDE_HOME/settings.local.json" "$CLAUDE_HOME/.credentials.json"; do
+		[[ -e $p ]] && parts+=("$p:$(stat -Lc %Y "$p" 2>/dev/null || echo 0)")
+	done
+	for p in claude opencode; do
+		bin=$(command -v "$p" 2>/dev/null || true)
+		[[ -n $bin ]] && parts+=("$p:$(stat -Lc '%Y:%s' "$bin" 2>/dev/null || echo 0)")
+	done
+	printf '%s\n' ${parts+"${parts[@]}"} | sha256sum | cut -d' ' -f1
+}
+
+build_config_drive() {
+	local want
+	want=$(config_fingerprint)
+	if [[ -f $CFG_DRIVE && -f $CFG_STAMP ]] && [[ $(cat "$CFG_STAMP") == "$want" ]]; then
+		return 0
 	fi
-	KERNEL=$(find "$IMAGES" -name 'vmlinux-*' | sort -V | tail -1 || true)
-	ROOTFS=$(find "$IMAGES" -name '*.ext4' | head -1 || true)
-	[[ -f $KERNEL ]] || die "no kernel in $IMAGES, run ./scripts/setup.sh"
-	[[ -f $ROOTFS ]] || die "no rootfs, run ./scripts/prepare-rootfs.sh"
+
+	log "building the read-only config drive (host agent config + binaries)"
+	local stage="$IMAGES/.cfgstage"
+	rm -rf "$stage"
+	mkdir -p "$stage/bin" "$stage/claude"
+
+	local a bin
+	for a in claude opencode; do
+		bin=$(command -v "$a" 2>/dev/null || true)
+		if [[ -n $bin ]]; then
+			cp -L "$bin" "$stage/bin/$a"
+			chmod +x "$stage/bin/$a"
+			log "  $a $(basename "$(readlink -f "$bin")")"
+		else
+			log "  $a not installed on the host, skipping"
+		fi
+	done
+
+	# Only the parts of the host config that mean anything in a fresh VM. The
+	# rest is 1.6G of session history for projects that do not exist in there.
+	local item
+	for item in .credentials.json settings.json settings.local.json CLAUDE.md \
+		agents commands skills plugins output-styles; do
+		[[ -e $CLAUDE_HOME/$item ]] || continue
+		rsync -a --copy-unsafe-links "$CLAUDE_HOME/$item" "$stage/claude/" 2>/dev/null || true
+	done
+
+	if [[ -d $OPENCODE_HOME ]]; then
+		mkdir -p "$stage/opencode"
+		rsync -a --copy-unsafe-links \
+			--exclude=cache --exclude=.cache --exclude=log --exclude=logs \
+			"$OPENCODE_HOME"/ "$stage/opencode"/ 2>/dev/null || true
+	fi
+
+	# Hooks point at host binaries that do not exist in the guest; leaving
+	# them in produces a failed hook on every single tool call.
+	if [[ -f $stage/claude/settings.json ]]; then
+		python3 - "$stage/claude/settings.json" <<'PY' || true
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p) as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(0)
+if d.pop("hooks", None) is not None:
+    with open(p, "w") as fh:
+        json.dump(d, fh, indent=2)
+    print("[firellm]   dropped hooks from settings (they point at host paths)",
+          file=sys.stderr)
+PY
+	fi
+
+	if [[ -f $CLAUDE_CONF ]]; then
+		python3 - "$CLAUDE_CONF" "$stage/claude.json" <<'PY' || true
+import json, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as fh:
+    d = json.load(fh)
+
+# Per-project state refers to host paths that do not exist in the guest.
+d.pop("projects", None)
+
+servers = d.get("mcpServers")
+if isinstance(servers, dict):
+    kept, dropped = {}, []
+    for name, spec in servers.items():
+        url = spec.get("url") if isinstance(spec, dict) else None
+        if url and ("localhost:" in url or "127.0.0.1:" in url):
+            kept[name] = spec
+        else:
+            dropped.append(name)
+    d["mcpServers"] = kept
+    if dropped:
+        print("[firellm]   MCP unavailable in guest (host stdio binaries): "
+              + ", ".join(dropped), file=sys.stderr)
+    if kept:
+        print("[firellm]   MCP relayed over vsock: " + ", ".join(kept),
+              file=sys.stderr)
+
+d["hasCompletedOnboarding"] = True
+
+with open(dst, "w") as fh:
+    json.dump(d, fh, indent=2)
+PY
+	fi
+
+	local size
+	size=$(size_ro_dir "$stage")
+	mkimage_from_dir "$stage" "$CFG_DRIVE.new" firellm-cfg "$size"
+	mv -f "$CFG_DRIVE.new" "$CFG_DRIVE"
+	rm -rf "$stage"
+	echo "$want" >"$CFG_STAMP"
+	log "config drive: $(du -h --apparent-size "$CFG_DRIVE" | cut -f1)"
 }
 
-cmd_setup() {
-	need_root "$@"
-	"$SCRIPTS/setup.sh"
+# ---------------------------------------------------------------- state
+
+# Everything the agent writes under its home directory - sessions, history,
+# todos - lands on a per-project drive that outlives the VM. That is what
+# makes `--continue` and `--resume` work across runs: without it every VM
+# starts with no memory of the last one.
+
+STATE_FD=""
+STATE_PERSISTENT=0
+SLUG=""
+
+project_slug() {
+	local dir=$1 hash
+	hash=$(printf '%s' "$dir" | sha256sum | cut -c1-8)
+	echo "$(basename "$dir" | tr -c 'A-Za-z0-9._-' '-')-$hash"
 }
 
-cmd_prepare() {
-	"$SCRIPTS/prepare-rootfs.sh" "$@"
+# Prints the path of the state drive to attach.
+ensure_state_drive() {
+	local workdir=$1 run_dir=$2 img size
+	SLUG=$(project_slug "$workdir")
+	local slug=$SLUG
+	img="$STATE_DIR/$slug.ext4"
+	mkdir -p "$STATE_DIR"
+
+	if [[ ! -f $img ]]; then
+		local seed
+		seed=$(mktemp -d)
+		mkdir -p "$seed/upper" "$seed/work"
+		size=${FIRELLM_STATE_SIZE:-$((3 * 1024 * 1024 * 1024))}
+		mkimage_from_dir "$seed" "$img" firellm-state "$size"
+		rm -rf "$seed"
+		log "new agent state drive for this project: $(basename "$img")"
+	fi
+
+	# Two VMs writing one ext4 image would corrupt it, so a second concurrent
+	# run on the same project gets a throwaway copy instead.
+	exec {STATE_FD}>"$STATE_DIR/$slug.lock"
+	if flock -n "$STATE_FD"; then
+		STATE_PERSISTENT=1
+		echo "$img"
+	else
+		log "WARNING: another run holds this project's state drive."
+		log "         using a private copy - this session will not be resumable."
+		cp --sparse=always "$img" "$run_dir/state.ext4"
+		echo "$run_dir/state.ext4"
+	fi
 }
 
-cmd_run() {
+# Claude Code keys a project's transcripts by its working directory, with
+# every non-alphanumeric character turned into a dash. The guest works in
+# /src, so a host session has to be re-keyed to "-src" to be resumable there.
+claude_project_slug() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9' '-'
+}
+
+# Copies this project's host transcripts into the guest's agent home, with
+# every reference to the host path rewritten to /src. Only touches the state
+# drive; the host's own sessions are read and never modified.
+import_host_sessions() {
+	local workdir=$1 img=$2 only=${3:-} host_dir
+	host_dir="$CLAUDE_HOME/projects/$(claude_project_slug "$workdir")"
+
+	if [[ ! -d $host_dir ]]; then
+		log "no host sessions recorded for $workdir, nothing to import"
+		return 0
+	fi
+	if ! compgen -G "$host_dir/*.jsonl" >/dev/null; then
+		log "no transcripts in $host_dir"
+		return 0
+	fi
+
+	local tmp size
+	tmp=$(mktemp -d)
+	size=$(stat -c %s "$img")
+
+	# Pull the drive apart, add the sessions, put it back together. Writing
+	# into a mounted image would need root; this does not.
+	sbin debugfs -R "rdump / $tmp" "$img" >/dev/null 2>&1 || true
+	rm -rf "$tmp/lost+found"
+	mkdir -p "$tmp/upper/claude/projects/-src"
+
+	local n
+	n=$(
+		python3 - "$host_dir" "$tmp/upper/claude/projects/-src" "$workdir" "$only" <<'PY'
+import json, os, sys
+
+src_dir, dst_dir, workdir, only = sys.argv[1:5]
+workdir = workdir.rstrip("/")
+
+def retarget(o):
+    if isinstance(o, str):
+        # Not just the cwd fields: the transcript is full of the host path
+        # inside prose, tool arguments and diffs, and all of it has to line
+        # up with where the project actually is in the guest.
+        return o.replace(workdir, "/src") if workdir in o else o
+    if isinstance(o, dict):
+        return {k: retarget(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [retarget(v) for v in o]
+    return o
+
+count = 0
+for name in sorted(os.listdir(src_dir)):
+    if not name.endswith(".jsonl"):
+        continue
+    if only and not name.startswith(only):
+        continue
+    out_lines = []
+    with open(os.path.join(src_dir, name)) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out_lines.append(json.dumps(retarget(json.loads(line))))
+            except Exception:
+                # A line we cannot parse is better kept verbatim than dropped.
+                out_lines.append(line)
+    with open(os.path.join(dst_dir, name), "w") as fh:
+        fh.write("\n".join(out_lines) + "\n")
+    count += 1
+
+print(count)
+PY
+	)
+
+	if [[ ${n:-0} -eq 0 ]]; then
+		log "no matching sessions to import"
+		rm -rf "$tmp"
+		return 0
+	fi
+
+	mkimage_from_dir "$tmp" "$img.new" firellm-state "$size"
+	mv -f "$img.new" "$img"
+	rm -rf "$tmp"
+	log "imported $n host session(s) into the VM, paths rewritten to /src"
+}
+
+cmd_state() {
+	local sub=${1:-list}
+	shift || true
+	case "$sub" in
+	list)
+		if ! compgen -G "$STATE_DIR/*.ext4" >/dev/null; then
+			echo "no project state yet"
+			return 0
+		fi
+		local f
+		for f in "$STATE_DIR"/*.ext4; do
+			printf '%-44s %s\n' "$(basename "$f" .ext4)" \
+				"$(du -h --apparent-size "$f" | cut -f1)"
+		done
+		;;
+	sessions)
+		local dir=${1:-$PWD} img tmp
+		img="$STATE_DIR/$(project_slug "$(cd "$dir" && pwd)").ext4"
+		[[ -f $img ]] || die "no state for $dir yet"
+		tmp=$(mktemp -d)
+		sbin debugfs -R "rdump /upper/claude/projects $tmp" "$img" >/dev/null 2>&1 || true
+		if compgen -G "$tmp/projects/*/*.jsonl" >/dev/null; then
+			local s
+			# Newest last, so the most useful one is next to the prompt.
+			while IFS= read -r s; do
+				printf '%s  %s\n' "$(date -r "$s" '+%Y-%m-%d %H:%M')" \
+					"$(basename "$s" .jsonl)"
+			done < <(find "$tmp/projects" -name '*.jsonl' -printf '%T@ %p\n' |
+				sort -n | cut -d' ' -f2-)
+			echo
+			echo "resume with:  firellm claude --resume <id> 'next thing'"
+		else
+			echo "no sessions recorded for $dir yet"
+		fi
+		rm -rf "$tmp"
+		;;
+	reset)
+		local dir=${1:-$PWD} img
+		img="$STATE_DIR/$(project_slug "$(cd "$dir" && pwd)").ext4"
+		[[ -f $img ]] || die "no state for $dir"
+		rm -f "$img"
+		log "removed $img - the next run starts with a clean agent home"
+		;;
+	*)
+		die "usage: firellm state [list|sessions [dir]|reset [dir]]"
+		;;
+	esac
+}
+
+# ---------------------------------------------------------------- networking
+
+NET_SLOT=""
+TAP_DEV=""
+
+alloc_net_slot() {
+	local s
+	for ((s = 1; s <= 250; s++)); do
+		if ! ip link show "fcllm$s" >/dev/null 2>&1; then
+			echo "$s"
+			return 0
+		fi
+	done
+	return 1
+}
+
+net_up() {
+	NET_SLOT=$(alloc_net_slot) || die "no free network slot (250 VMs already running?)"
+	TAP_DEV="fcllm$NET_SLOT"
+	local host_ip="172.16.$NET_SLOT.1"
+
+	log "network: $TAP_DEV, guest 172.16.$NET_SLOT.2 via $host_ip"
+	priv ip tuntap add dev "$TAP_DEV" mode tap user "$(id -u)"
+	priv ip addr add "$host_ip/30" dev "$TAP_DEV"
+	priv ip link set "$TAP_DEV" up
+	priv sysctl -qw net.ipv4.ip_forward=1
+
+	# Docker sets the FORWARD policy to DROP, so the masquerade rule alone is
+	# not enough: the traffic has to be allowed through the filter table too.
+	priv iptables -t nat -A POSTROUTING -s "172.16.$NET_SLOT.0/30" \
+		! -o "$TAP_DEV" -j MASQUERADE
+	priv iptables -I FORWARD 1 -i "$TAP_DEV" -j ACCEPT
+	priv iptables -I FORWARD 1 -o "$TAP_DEV" -j ACCEPT
+}
+
+net_down() {
+	[[ -n $TAP_DEV ]] || return 0
+	priv iptables -t nat -D POSTROUTING -s "172.16.$NET_SLOT.0/30" \
+		! -o "$TAP_DEV" -j MASQUERADE 2>/dev/null || true
+	priv iptables -D FORWARD -i "$TAP_DEV" -j ACCEPT 2>/dev/null || true
+	priv iptables -D FORWARD -o "$TAP_DEV" -j ACCEPT 2>/dev/null || true
+	priv ip link del "$TAP_DEV" 2>/dev/null || true
+	TAP_DEV=""
+}
+
+# ---------------------------------------------------------------- MCP relay
+
+RELAY_PIDS=()
+
+# Firecracker turns a guest connection to CID 2 port N into a connection to
+# the unix socket <uds_path>_N on the host. Listening there and forwarding to
+# 127.0.0.1:N is what makes the guest's localhost:N the host's localhost:N.
+# The host MCP servers see an ordinary local connection and need no changes.
+relays_up() {
+	local jail_dir=$1 ports=$2 p
+	[[ -n $ports ]] || return 0
+	if ! command -v socat >/dev/null 2>&1; then
+		log "WARNING: socat not installed on the host, MCP will not be reachable"
+		return 0
+	fi
+	for p in $ports; do
+		# Bound from inside the jail directory on purpose. A unix socket path
+		# is capped at 108 bytes, and the absolute path to a run's jail is
+		# already longer than that for any normally placed checkout.
+		(cd "$jail_dir" && exec socat \
+			"UNIX-LISTEN:firecracker-vsock.sock_$p,fork,unlink-early" \
+			"TCP:127.0.0.1:$p") >>"$RUN_DIR/relays.log" 2>&1 &
+		RELAY_PIDS+=($!)
+	done
+	# Give socat time to create the sockets: firecracker resets the guest's
+	# connection if the matching one is not there yet.
+	local waited=0
+	while ((waited < 30)); do
+		local missing=0
+		for p in $ports; do
+			[[ -S $jail_dir/firecracker-vsock.sock_$p ]] || missing=1
+		done
+		((missing)) || break
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	log "host reachable from the guest on ports: $ports"
+}
+
+relays_down() {
+	local pid
+	for pid in ${RELAY_PIDS+"${RELAY_PIDS[@]}"}; do
+		kill "$pid" 2>/dev/null || true
+	done
+	RELAY_PIDS=()
+}
+
+# ---------------------------------------------------------------- arguments
+
+# Turn a natural command line into one that actually runs unattended. An
+# agent sitting at an interactive prompt with no tty just hangs until the
+# timeout, which is the least useful possible outcome for autopilot.
+massage_args() {
+	local agent=$1
+	shift
+	local -a in=("$@") out=()
+	local a has_print=0 has_perm=0 subcmd=0
+
+	for a in ${in+"${in[@]}"}; do
+		case "$a" in
+		-p | --print) has_print=1 ;;
+		--dangerously-skip-permissions | --permission-mode | --allowedTools | \
+			--allowed-tools) has_perm=1 ;;
+		esac
+	done
+
+	if [[ $agent == claude ]]; then
+		((has_print)) || out+=(-p)
+		# The whole point of the VM is that the agent does not need to ask.
+		((has_perm)) || out+=(--dangerously-skip-permissions)
+	elif [[ $agent == opencode ]]; then
+		case "${in[0]:-}" in
+		run | serve | models | auth | providers | agent | session | stats | \
+			export | import | github | pr | mcp | debug | upgrade | plugin | \
+			db | web | attach | acp | completion | uninstall) subcmd=1 ;;
+		esac
+		((subcmd)) || out+=(run)
+	fi
+
+	printf '%s\0' ${out+"${out[@]}"} ${in+"${in[@]}"}
+}
+
+# ---------------------------------------------------------------- launch
+
+RUN_DIR=""
+JAIL_DIR=""
+
+cleanup_run() {
+	local status=$?
+	trap - EXIT INT TERM
+	relays_down
+	net_down
+	if [[ $KEEP -eq 0 ]]; then
+		[[ -n $RUN_DIR ]] && rm -f "$RUN_DIR"/*.ext4
+		[[ -n $JAIL_DIR ]] && rm -rf "$(dirname "$JAIL_DIR")"
+	fi
+	return $status
+}
+
+launch() {
+	AGENT=$1
+	shift
+
+	local -a agent_args=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--task)
-			TASK="$2"
-			shift 2
-			;;
-		--workdir)
+		--workdir | --project)
 			WORKDIR="$2"
-			shift 2
-			;;
-		--id)
-			ID="$2"
 			shift 2
 			;;
 		--mem)
 			MEM="$2"
 			shift 2
 			;;
-		--vcpu)
+		--vcpu | --cpus)
 			VCPU="$2"
+			shift 2
+			;;
+		--timeout)
+			TIMEOUT="$2"
 			shift 2
 			;;
 		--no-net)
 			NONET=1
 			shift
 			;;
-		*) die "unknown arg $1" ;;
+		--no-jail)
+			NOJAIL=1
+			shift
+			;;
+		--no-sync)
+			SYNC_BACK=0
+			shift
+			;;
+		--keep)
+			KEEP=1
+			shift
+			;;
+		--cgroups)
+			CGROUPS=1
+			shift
+			;;
+		--debug-boot)
+			QUIET_BOOT=0
+			shift
+			;;
+		--no-auto-flags)
+			AUTO_FLAGS=0
+			shift
+			;;
+		--add-dir)
+			EXTRA_DIRS+=("$2")
+			shift 2
+			;;
+		--host-port)
+			HOST_PORTS+=("$2")
+			shift 2
+			;;
+		--import-sessions)
+			IMPORT_SESSIONS=1
+			shift
+			;;
+		--no-import-sessions)
+			IMPORT_SESSIONS=0
+			shift
+			;;
+		--fresh)
+			RESUME_TREE=0
+			shift
+			;;
+		--resume-tree)
+			RESUME_TREE=1
+			shift
+			;;
+		--)
+			shift
+			# With `firellm exec ... -- cmd args`, the command itself is the
+			# first thing after the separator.
+			if [[ -z $AGENT && $# -gt 0 ]]; then
+				AGENT="$1"
+				shift
+			fi
+			agent_args+=("$@")
+			break
+			;;
+		*)
+			# `firellm exec` passes an empty agent so that the first thing
+			# that is not a firellm option becomes the command to run.
+			if [[ -z $AGENT ]]; then
+				AGENT="$1"
+			else
+				agent_args+=("$1")
+			fi
+			shift
+			;;
 		esac
 	done
+	[[ -n $AGENT ]] || die "no command given"
 
-	ensure_assets
-	mkdir -p "$IMAGES"
+	resolve_assets
+	WORKDIR=$(cd "$WORKDIR" && pwd) || die "workdir does not exist"
 
-	WORKDIR=$(cd "$WORKDIR" && pwd)
-	log "launching VM id=$ID task='$TASK' workdir=$WORKDIR net=$((1 - NONET))"
-
-	# create a per-run writable overlay drive for work (or use the workdir via 9p? but drive is simpler)
-	WORK_DRIVE="$IMAGES/work-${ID}.ext4"
-	if [[ ! -f "$WORK_DRIVE" ]]; then
-		truncate -s 5G "$WORK_DRIVE"
-		mkfs.ext4 -F "$WORK_DRIVE" >/dev/null
+	# An agent invoked with no arguments has nothing to do unattended, so it
+	# gets a console instead. An explicit command always runs unattended.
+	local mode=auto
+	if [[ $AGENT == shell ]] ||
+		{ ((${#agent_args[@]} == 0)) && [[ $AGENT == claude || $AGENT == opencode ]]; }; then
+		mode=interactive
 	fi
 
-	# copy workdir contents into the drive? for now we will mount it as /work and rsync in guest or pre-populate
-	# simple: mount the host dir? can't easily. Pre-populate the drive from workdir.
-	if [[ -d "$WORKDIR" ]] && find "$WORKDIR" -mindepth 1 -maxdepth 1 | read -r _; then
-		log "populating work drive from $WORKDIR"
-		sudo mkdir -p /tmp/firellm-work-$$
-		sudo mount -o loop "$WORK_DRIVE" /tmp/firellm-work-$$
-		sudo rsync -a --delete "$WORKDIR"/ /tmp/firellm-work-$$/work/ 2>/dev/null || true
-		sudo umount /tmp/firellm-work-$$ || true
-		sudo rmdir /tmp/firellm-work-$$ || true
+	# Continuing a conversation but starting from the pristine host tree would
+	# be nonsense: the agent would be told it already made changes that are
+	# not there. So --continue/--resume carries the working tree forward too.
+	if [[ $RESUME_TREE == auto ]]; then
+		RESUME_TREE=0
+		local a
+		for a in ${agent_args+"${agent_args[@]}"}; do
+			case "$a" in
+			-c | --continue | -r | --resume) RESUME_TREE=1 ;;
+			esac
+		done
 	fi
 
-	# write task for guest agent
-	if [[ -n "$TASK" ]]; then
-		sudo mkdir -p /tmp/firellm-work-$$
-		sudo mount -o loop "$WORK_DRIVE" /tmp/firellm-work-$$
-		printf '%s\n' "$TASK" | sudo tee /tmp/firellm-work-$$/.firellm-task >/dev/null || true
-		sudo umount /tmp/firellm-work-$$ || true
-		sudo rmdir /tmp/firellm-work-$$ || true
+	local id
+	id="firellm-$(date +%Y%m%d-%H%M%S)-$$"
+	RUN_DIR="$RUNS/$id"
+	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
+	mkdir -p "$RUN_DIR" "$JAIL_DIR"
+	trap cleanup_run EXIT INT TERM
+
+	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
+
+	build_config_drive
+
+	# Everything the guest should be able to reach on the host's loopback:
+	# MCP servers found in the config, plus whatever --host-port asked for
+	# (a local llama-server or any other OpenAI-compatible endpoint).
+	local relay_ports
+	local -a mcp=()
+	read -r -a mcp <<<"$(discover_mcp_ports)"
+	relay_ports=$(printf '%s\n' ${mcp+"${mcp[@]}"} ${HOST_PORTS+"${HOST_PORTS[@]}"} |
+		grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
+	relay_ports=${relay_ports% }
+
+	# --- per-project agent state, so --continue and --resume have something
+	#     to continue from. Taken first: it decides where the src drive lives.
+	local state_drive
+	state_drive=$(ensure_state_drive "$WORKDIR" "$RUN_DIR")
+
+	# Continuing a conversation that only exists on the host means bringing
+	# the transcript in. Done once per project unless asked for again.
+	local imported_marker="$STATE_DIR/$SLUG.imported"
+	if [[ $IMPORT_SESSIONS == 1 ]] ||
+		{ [[ $IMPORT_SESSIONS == auto ]] && ((RESUME_TREE)) && [[ ! -f $imported_marker ]]; }; then
+		import_host_sessions "$WORKDIR" "$state_drive"
+		touch "$imported_marker"
 	fi
 
-	# prepare jailed paths: jailer requires files inside chroot to be hardlinks or copies owned properly
-	JAIL_BASE="/srv/jailer/firellm"
-	JAIL_DIR="$JAIL_BASE/firecracker/$ID/root"
-	sudo mkdir -p "$JAIL_DIR"
+	# --- src drive. Persistent per project when we hold the lock, so a
+	#     continuation run resumes the tree the last run left behind.
+	local src_drive src_size
+	if ((STATE_PERSISTENT)); then
+		src_drive="$STATE_DIR/$SLUG-src.ext4"
+	else
+		src_drive="$RUN_DIR/src.ext4"
+	fi
 
-	# hardlink (or copy if cross-device) the kernel and rootfs + work drive into jail
-	for f in "$KERNEL" "$ROOTFS" "$WORK_DRIVE"; do
-		base=$(basename "$f")
-		dest="$JAIL_DIR/$base"
-		if [[ ! -f "$dest" ]]; then
-			sudo ln -f "$f" "$dest" 2>/dev/null || sudo cp -f "$f" "$dest"
+	if ((RESUME_TREE)) && [[ -f $src_drive ]]; then
+		log "resuming the working tree from the previous run"
+	else
+		((RESUME_TREE)) && log "no previous tree for this project, starting from $WORKDIR"
+		src_size=$(size_for_dir "$WORKDIR" $((4 * 1024 * 1024 * 1024)))
+		log "packing $WORKDIR into a $((src_size / 1024 / 1024 / 1024))G drive"
+		mkimage_from_dir "$WORKDIR" "$src_drive" firellm-src "$src_size"
+	fi
+
+	# --- extra read-only context: sibling projects, notes, whatever. These
+	#     are copies, so the guest can read them and nothing goes back.
+	local -a extra_drives=() extra_spec=()
+	local n=0 d base
+	for d in ${EXTRA_DIRS+"${EXTRA_DIRS[@]}"}; do
+		d=$(cd "$d" 2>/dev/null && pwd) || die "--add-dir: no such directory: $d"
+		refuse_if_sensitive "$d"
+		n=$((n + 1))
+		base=$(basename "$d")
+		local bytes
+		bytes=$(du -sb --apparent-size "$d" 2>/dev/null | cut -f1)
+		if ((bytes > 32 * 1024 * 1024 * 1024)); then
+			die "--add-dir $d is $((bytes / 1024 / 1024 / 1024))G - too big to copy into a VM"
 		fi
-		sudo chown root:root "$dest"
-		sudo chmod 600 "$dest"
+		local img="$RUN_DIR/extra$n.ext4"
+		log "adding $d read-only at /mnt/$base"
+		mkimage_from_dir "$d" "$img" "firellm-x$n" "$(size_ro_dir "$d")"
+		extra_drives+=("$img")
+		extra_spec+=("firellm-x$n:/mnt/$base")
 	done
 
-	# config file inside the jail (relative paths)
-	CFG="$JAIL_DIR/vm-config.json"
-	cat >/tmp/firellm-vmcfg.$$.json <<EOF
+	# --- control drive: this run's parameters, read-only in the guest
+	local ctl_stage="$RUN_DIR/ctl"
+	mkdir -p "$ctl_stage"
+	{
+		echo "FIRELLM_ID=$id"
+		echo "FIRELLM_MODE=$mode"
+		[[ $AGENT != shell ]] && echo "FIRELLM_AGENT=$AGENT"
+		echo "FIRELLM_TIMEOUT=$TIMEOUT"
+		echo "FIRELLM_RELAY_PORTS='$relay_ports'"
+		echo "FIRELLM_EXTRA='${extra_spec[*]-}'"
+		# Read from the project, not from wherever firellm happens to live, so
+		# a repo-local identity wins the same way it would on the host.
+		echo "FIRELLM_GIT_NAME='$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)'"
+		echo "FIRELLM_GIT_EMAIL='$(git -C "$WORKDIR" config --get user.email 2>/dev/null || true)'"
+		if [[ $NONET -eq 0 ]]; then
+			echo "FIRELLM_GUEST_IP=172.16.SLOT.2/30"
+			echo "FIRELLM_GATEWAY=172.16.SLOT.1"
+			echo "FIRELLM_DNS='1.1.1.1 8.8.8.8'"
+		fi
+	} >"$ctl_stage/env"
+	cp -f "$GUEST/firellm-context.md" "$ctl_stage/context.md"
+
+	# The guest scripts ride along on the control drive and take precedence
+	# over the copies baked into the image, so changing the harness does not
+	# mean rebuilding a 6G rootfs.
+	local g
+	for g in firellm-setup.sh agent-entrypoint.sh profile.sh; do
+		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
+	done
+
+	if [[ $mode == auto ]]; then
+		if ((AUTO_FLAGS)); then
+			massage_args "$AGENT" ${agent_args+"${agent_args[@]}"} >"$ctl_stage/args"
+		else
+			printf '%s\0' ${agent_args+"${agent_args[@]}"} >"$ctl_stage/args"
+		fi
+		log "agent command: $AGENT $(tr '\0' ' ' <"$ctl_stage/args")"
+	fi
+
+	# --- networking, then patch the allocated slot into the control drive
+	if [[ $NONET -eq 0 ]]; then
+		net_up
+		sed -i "s/172\.16\.SLOT\./172.16.$NET_SLOT./g" "$ctl_stage/env"
+	fi
+
+	local ctl_drive="$RUN_DIR/ctl.ext4"
+	mkimage_from_dir "$ctl_stage" "$ctl_drive" firellm-ctl "$(size_ro_dir "$ctl_stage")"
+
+	# --- per-run copy of the rootfs, so the guest can wreck it freely
+	local root_drive="$RUN_DIR/root.ext4"
+	cp --sparse=always "$ROOTFS" "$root_drive"
+
+	# --- jail: everything the VM touches has to live inside the chroot
+	local f
+	for f in "$KERNEL" "$root_drive" "$src_drive" "$CFG_DRIVE" "$ctl_drive" \
+		"$state_drive" ${extra_drives+"${extra_drives[@]}"}; do
+		ln "$f" "$JAIL_DIR/$(basename "$f")" 2>/dev/null ||
+			cp "$f" "$JAIL_DIR/$(basename "$f")"
+	done
+
+	local extra_json="" i=0
+	for f in ${extra_drives+"${extra_drives[@]}"}; do
+		i=$((i + 1))
+		extra_json="$extra_json,
+    {\"drive_id\": \"extra$i\", \"path_on_host\": \"$(basename "$f")\", \"is_root_device\": false, \"is_read_only\": true}"
+	done
+
+	local net_ifaces="[]"
+	if [[ -n $TAP_DEV ]]; then
+		local mac
+		mac=$(printf '06:00:ac:10:%02x:02' "$NET_SLOT")
+		net_ifaces="[{\"iface_id\":\"eth0\",\"guest_mac\":\"$mac\",\"host_dev_name\":\"$TAP_DEV\"}]"
+	fi
+
+	local boot_args="console=ttyS0 reboot=k panic=1 pci=off"
+	((QUIET_BOOT)) && boot_args="$boot_args quiet loglevel=3 systemd.show_status=false"
+
+	local cid=$((3 + ${NET_SLOT:-0}))
+	cat >"$JAIL_DIR/vm-config.json" <<EOF
 {
   "boot-source": {
     "kernel_image_path": "$(basename "$KERNEL")",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+    "boot_args": "$boot_args"
   },
   "drives": [
-    {
-      "drive_id": "rootfs",
-      "path_on_host": "$(basename "$ROOTFS")",
-      "is_root_device": true,
-      "is_read_only": false
-    },
-    {
-      "drive_id": "work",
-      "path_on_host": "$(basename "$WORK_DRIVE")",
-      "is_root_device": false,
-      "is_read_only": false
-    }
+    {"drive_id": "rootfs",   "path_on_host": "$(basename "$root_drive")", "is_root_device": true,  "is_read_only": false},
+    {"drive_id": "src",      "path_on_host": "$(basename "$src_drive")",  "is_root_device": false, "is_read_only": false},
+    {"drive_id": "roconfig", "path_on_host": "$(basename "$CFG_DRIVE")",  "is_root_device": false, "is_read_only": true},
+    {"drive_id": "control",  "path_on_host": "$(basename "$ctl_drive")",  "is_root_device": false, "is_read_only": true},
+    {"drive_id": "state",    "path_on_host": "$(basename "$state_drive")","is_root_device": false, "is_read_only": false}$extra_json
   ],
-  "machine-config": {
-    "vcpu_count": $VCPU,
-    "mem_size_mib": $MEM
-  },
-  "network-interfaces": [],
-  "vsock": {
-    "vsock_id": "1",
-    "uds_path": "firecracker-vsock.sock"
-  }
+  "machine-config": {"vcpu_count": $VCPU, "mem_size_mib": $MEM},
+  "network-interfaces": $net_ifaces,
+  "vsock": {"guest_cid": $cid, "uds_path": "firecracker-vsock.sock"}
 }
 EOF
-	sudo cp /tmp/firellm-vmcfg.$$.json "$CFG"
-	sudo chown root:root "$CFG"
 
-	# launch via jailer (we stay root here)
-	API_SOCK="$JAIL_DIR/firecracker.socket"
-	sudo rm -f "$API_SOCK"
+	relays_up "$JAIL_DIR" "$relay_ports"
 
-	JAILER_ARGS=(
-		--id "$ID"
+	local -a jargs=(
+		--id "$id"
 		--exec-file "$FC"
 		--uid "$(id -u)"
 		--gid "$(id -g)"
 		--chroot-base-dir "$JAIL_BASE"
 		--new-pid-ns
-		--
-		--api-sock "/$(basename "$API_SOCK")"
-		--config-file "/$(basename "$CFG")"
 	)
+	if ((CGROUPS)); then
+		jargs+=(
+			--cgroup-version 2
+			--cgroup "memory.max=$(((MEM + 512) * 1024 * 1024))"
+			--cgroup "cpu.max=$((VCPU * 100000)) 100000"
+			--cgroup "pids.max=4096"
+		)
+	fi
+	jargs+=(-- --api-sock /firecracker.socket --config-file /vm-config.json)
 
-	log "starting jailed firecracker..."
-	# run jailer in background so we can interact
-	# shellcheck disable=SC2024
-	sudo "$JAILER" "${JAILER_ARGS[@]}" >"$IMAGES/jailer-${ID}.log" 2>&1 &
-	JAILER_PID=$!
-	echo $JAILER_PID >"$IMAGES/jailer-${ID}.pid"
+	# The VM boundary is Firecracker and KVM either way. The jailer adds a
+	# chroot, a dropped uid and a private pid namespace around the VMM
+	# process itself - defence in depth against a VMM escape, and the only
+	# part that needs root. Without it you still get a real VM.
+	local -a cmd=()
+	if ((NOJAIL)); then
+		log "WARNING: --no-jail, the VMM runs unconfined on the host"
+		cmd=("$FC" --api-sock firecracker.socket --config-file vm-config.json)
+	else
+		((EUID == 0)) || cmd=(sudo)
+		cmd+=("$JAILER" "${jargs[@]}")
+	fi
 
-	# wait for socket
-	for _ in {1..30}; do
-		[[ -S "$API_SOCK" ]] && break
-		sleep 0.2
+	log "booting ($VCPU vcpu, ${MEM}M)"
+	echo >&2
+
+	local rc=0
+	if [[ $mode == interactive ]]; then
+		# No pipe: firecracker hands the guest serial port straight to this
+		# terminal, and a pipe would break the tty the agent's UI needs.
+		(cd "$JAIL_DIR" && "${cmd[@]}") || rc=$?
+	else
+		(cd "$JAIL_DIR" && "${cmd[@]}") 2>&1 | tee "$RUN_DIR/console.log" || rc=$?
+	fi
+
+	echo >&2
+	log "VM exited (status $rc)"
+
+	if ((SYNC_BACK)); then
+		local out_dir="${WORKDIR}-${id#firellm-}"
+		log "copying /src out to $out_dir"
+		extract_image "$src_drive" "$out_dir"
+		local st="$out_dir/.firellm-exit-status"
+		if [[ -f $st ]]; then
+			log "agent exit status: $(cat "$st")"
+			rm -f "$st"
+		fi
+		echo
+		echo "  result:  $out_dir"
+		echo "  diff:    diff -ru --exclude=.git '$WORKDIR' '$out_dir' | less"
+		[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
+		if ((STATE_PERSISTENT)); then
+			echo "  resume:  firellm $AGENT --continue 'and now also ...'"
+			echo "           firellm state sessions"
+		fi
+		echo
+	fi
+
+	return $rc
+}
+
+# Read an ext4 image without mounting it, so no root is needed. Files the
+# guest created as root come out owned by you, which is what you want anyway.
+extract_image() {
+	local img=$1 dest=$2
+	mkdir -p "$dest"
+	sbin debugfs -R "rdump / $dest" "$img" >/dev/null 2>&1 ||
+		log "WARNING: extraction reported errors, check $dest"
+	rm -rf "$dest/lost+found"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_extract() {
+	local id=${1:-}
+	[[ -n $id ]] || die "usage: firellm extract <run-id> [dest]"
+	local img="$RUNS/$id/src.ext4"
+	[[ -f $img ]] || die "no src drive for run $id (already cleaned up?)"
+	local dest=${2:-$RUNS/$id/src}
+	log "extracting $img to $dest"
+	extract_image "$img" "$dest"
+	echo "$dest"
+}
+
+cmd_list() {
+	if [[ ! -d $RUNS ]]; then
+		echo "no runs yet"
+		return 0
+	fi
+	local d id state
+	for d in "$RUNS"/*/; do
+		[[ -d $d ]] || continue
+		id=$(basename "$d")
+		state="cleaned"
+		compgen -G "$d*.ext4" >/dev/null && state="drives kept"
+		printf '%-40s %s\n' "$id" "$state"
 	done
-	[[ -S "$API_SOCK" ]] || die "firecracker socket never appeared"
+}
 
-	log "VM started (jailer pid $JAILER_PID). Waiting for boot..."
+cmd_gc() {
+	local keep=${1:-5} n=0 d
+	[[ -d $RUNS ]] || return 0
+	# Newest first; anything past the keep count goes entirely.
+	while IFS= read -r d; do
+		n=$((n + 1))
+		if ((n > keep)); then
+			log "removing $(basename "$d")"
+			rm -rf "$d"
+		else
+			rm -f "$d"/*.ext4
+		fi
+	done < <(find "$RUNS" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
+		sort -rn | cut -d' ' -f2-)
+	rm -rf "${JAIL_BASE:?}/firecracker" 2>/dev/null || true
+	log "kept the $keep most recent runs (logs only)"
+}
 
-	# now configure any post-boot if needed. For this template we use config-file which auto starts.
-	# give it a few seconds
-	sleep 3
-
-	# for now, to "run task", we can use the serial console? but complicated.
-	# Instead: use the vsock or ssh (but net not set in this minimal cfg)
-	# For autopilot demo we will print how to connect and assume user or a guest agent script does the work.
-
-	log "To interact with the agent inside:"
-	log "  sudo chroot $JAIL_DIR /bin/bash   # (once guest has shell)"
-	log "  or use vsock from host: socat - UNIX-CONNECT:$JAIL_DIR/firecracker-vsock.sock"
-	log ""
-	log "Inside guest the workdir appears at /work (second drive)"
-	log "Run your agent manually for now, e.g.:"
-	log "  cd /work && /usr/local/bin/opencode --task \"$TASK\" || true"
-	log ""
-	log "When done: kill -9 $JAILER_PID ; sudo rm -rf $JAIL_DIR ; sudo rm -f $WORK_DRIVE"
+cmd_doctor() {
+	local ok=0 bad=0
+	check() {
+		if eval "$2" >/dev/null 2>&1; then
+			printf '  ok    %s\n' "$1"
+			ok=$((ok + 1))
+		else
+			printf '  FAIL  %s\n' "$1"
+			bad=$((bad + 1))
+		fi
+	}
+	echo "firellm doctor"
+	check "kvm accessible (/dev/kvm)" "test -r /dev/kvm -a -w /dev/kvm"
+	check "firecracker installed" "test -x '$FC'"
+	check "jailer installed" "test -x '$JAILER'"
+	check "guest kernel present" "compgen -G '$IMAGES/vmlinux-*'"
+	check "guest rootfs built" "test -f '$IMAGES/agent-firellm.ext4'"
+	check "docker usable (for prepare)" "docker info"
+	check "mkfs.ext4 present" "command -v mkfs.ext4 || test -x /usr/sbin/mkfs.ext4"
+	check "debugfs present" "command -v debugfs || test -x /usr/sbin/debugfs"
+	check "socat present (MCP relay)" "command -v socat"
+	check "rsync present" "command -v rsync"
+	check "iptables present" "command -v iptables || test -x /usr/sbin/iptables"
+	check "sudo without a password" "sudo -n true"
+	check "claude on host" "command -v claude"
+	echo
+	echo "  $ok ok, $bad failed"
+	if ! sudo -n true >/dev/null 2>&1; then
+		echo
+		echo "  Runs will prompt for a password. For unattended use:"
+		echo "      sudo $SCRIPTS/install-privileged.sh"
+	fi
+	((bad == 0))
 }
 
 usage() {
-	cat <<EOF
-firellm - firecracker jailer agent harness
+	cat <<'EOF'
+firellm - run a coding agent in a Firecracker microVM
 
-commands:
-  setup                 download/install firecracker + kernel (needs sudo)
-  prepare               build agent rootfs
-  run [options]         start a jailed VM for an agent task
+  firellm setup                 fetch firecracker, jailer and a guest kernel
+  firellm prepare [--full]      build the guest rootfs (via docker, no root)
+  firellm doctor                check the host is ready
 
-run options:
-  --task "string"       description of work for the agent
-  --workdir DIR         directory to expose to guest at /work (default .)
-  --id NAME             vm id
-  --mem MiB             memory (1024)
-  --vcpu N              vcpus (2)
-  --no-net              disable networking
+  firellm claude [args...]      run claude in a VM over the current directory
+  firellm opencode [args...]    same, with opencode
+  firellm shell                 interactive root shell in a VM
+  firellm exec CMD [args...]    run any command in a VM over this directory
+
+  firellm list                  runs, and whether their drives still exist
+  firellm extract <id> [dest]   pull a run's /src back out
+  firellm gc [keep]             drop old run drives (default: keep 5)
+
+  firellm state list            per-project agent state drives
+  firellm state sessions [dir]  session ids you can --resume
+  firellm state reset [dir]     forget this project's agent history
+
+options (before the agent's own arguments):
+  --workdir DIR   project to put in /src            (default: .)
+  --add-dir DIR   extra host dir, read-only at /mnt/<name>, repeatable
+  --host-port N   make the host's localhost:N reachable at localhost:N in the
+                  guest, over vsock; repeatable. For a local llama-server or
+                  any other OpenAI-compatible endpoint on loopback.
+  --resume-tree   carry the previous run's /src forward (implied by -c/-r)
+  --fresh         start from the host tree even when continuing
+  --import-sessions    copy this project's host transcripts into the VM,
+                       rewriting host paths to /src so they can be resumed
+  --no-import-sessions never do that
+  --mem MB        guest memory                      (default: 4096)
+  --vcpu N        guest cpus                        (default: 4)
+  --timeout SEC   kill the agent after SEC seconds  (default: none)
+  --no-net        no network at all
+  --no-jail       skip the jailer (still a real VM, less hardening, no root)
+  --no-sync       do not copy /src back out
+  --keep          keep the run's drives afterwards
+  --cgroups       also cap the host-side process via jailer cgroups
+  --debug-boot    verbose guest boot
+  --no-auto-flags do not add -p / --dangerously-skip-permissions
+  --              everything after this goes to the agent verbatim
+
+Given arguments, the agent runs unattended and the VM powers off when it is
+done. Given none, you get an interactive session on the guest console.
+
+Work is copied to a sibling directory, <project>-<timestamp>-<pid>. Your
+project directory is never written to.
+
+The agent's home directory is kept on a per-project drive that outlives the
+VM, so a later run can pick up where the last one stopped:
+
+  firellm claude "start the refactor"
+  firellm claude --continue "now do the tests too"
+  firellm state sessions
+  firellm claude --resume 3f9a1c2e "and update the docs"
 
 examples:
-  ./bin/firellm setup
-  ./bin/firellm prepare
-  ./bin/firellm run --task "add tests" --workdir ~/src/myapp
+  firellm claude "add tests for the parser"
+  firellm claude --timeout 3600 -- -p "fix the failing build" --model opus
+  firellm opencode "fix the tests"
+  firellm claude --workdir ~/Projects/foo "update the readme"
+  firellm claude --add-dir ~/Projects "match the API used in the sibling repo"
+  firellm shell
 EOF
 }
 
 case "${1:-}" in
 setup)
 	shift
-	cmd_setup "$@"
+	"$SCRIPTS/setup.sh" "$@"
 	;;
 prepare)
 	shift
-	cmd_prepare "$@"
+	"$SCRIPTS/prepare-rootfs.sh" "$@"
 	;;
-run)
+doctor)
 	shift
-	cmd_run "$@"
+	cmd_doctor
 	;;
--h | --help | help) usage ;;
-*)
+list | ls)
+	shift
+	cmd_list
+	;;
+extract)
+	shift
+	cmd_extract "$@"
+	;;
+gc)
+	shift
+	cmd_gc "$@"
+	;;
+state)
+	shift
+	cmd_state "$@"
+	;;
+claude | opencode)
+	agent=$1
+	shift
+	launch "$agent" "$@"
+	;;
+shell)
+	shift
+	launch shell "$@"
+	;;
+exec)
+	shift
+	[[ $# -gt 0 ]] || die "usage: firellm exec [options] <command> [args...]"
+	launch "" "$@"
+	;;
+-h | --help | help | "")
 	usage
-	exit 1
+	;;
+*)
+	die "unknown command: $1 (try: firellm help)"
 	;;
 esac
