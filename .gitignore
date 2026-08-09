@@ -1,0 +1,15 @@
+# firellm ignores
+images/
+*.ext4
+*.squashfs
+vmlinux-*
+firecracker
+jailer
+*.log
+*.socket
+id_rsa*
+/srv/jailer/firellm/
+/tmp/firellm-*
+*.img
+work-*
+*.pid

@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# firellm - Firecracker jailer harness for safe agent runs
+# usage:
+#   firellm setup
+#   firellm prepare
+#   firellm run --task "..." [--workdir dir] [--no-net] [--id name]
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+IMAGES="$ROOT/images"
+SCRIPTS="$ROOT/scripts"
+
+FC="/usr/local/bin/firecracker"
+JAILER="/usr/local/bin/jailer"
+KERNEL=""
+ROOTFS=""
+ID="firellm-$(date +%s)-$$"
+TASK=""
+WORKDIR="."
+NONET=0
+MEM=1024
+VCPU=2
+
+log() { echo "[firellm] $*" >&2; }
+die() {
+	echo "[firellm] ERROR: $*" >&2
+	exit 1
+}
+
+need_root() {
+	# shellcheck disable=SC2120
+	if [[ $EUID -ne 0 ]]; then
+		exec sudo "$0" "$@"
+	fi
+}
+
+ensure_assets() {
+	if [[ ! -x "$FC" || ! -x "$JAILER" ]]; then
+		log "firecracker/jailer not found in /usr/local/bin, running setup"
+		sudo "$SCRIPTS/setup.sh"
+	fi
+	KERNEL=$(find "$IMAGES" -name 'vmlinux-*' | sort -V | tail -1 || true)
+	ROOTFS=$(find "$IMAGES" -name '*.ext4' | head -1 || true)
+	[[ -f $KERNEL ]] || die "no kernel in $IMAGES, run ./scripts/setup.sh"
+	[[ -f $ROOTFS ]] || die "no rootfs, run ./scripts/prepare-rootfs.sh"
+}
+
+cmd_setup() {
+	need_root "$@"
+	"$SCRIPTS/setup.sh"
+}
+
+cmd_prepare() {
+	"$SCRIPTS/prepare-rootfs.sh" "$@"
+}
+
+cmd_run() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--task)
+			TASK="$2"
+			shift 2
+			;;
+		--workdir)
+			WORKDIR="$2"
+			shift 2
+			;;
+		--id)
+			ID="$2"
+			shift 2
+			;;
+		--mem)
+			MEM="$2"
+			shift 2
+			;;
+		--vcpu)
+			VCPU="$2"
+			shift 2
+			;;
+		--no-net)
+			NONET=1
+			shift
+			;;
+		*) die "unknown arg $1" ;;
+		esac
+	done
+
+	ensure_assets
+	mkdir -p "$IMAGES"
+
+	WORKDIR=$(cd "$WORKDIR" && pwd)
+	log "launching VM id=$ID task='$TASK' workdir=$WORKDIR net=$((1 - NONET))"
+
+	# create a per-run writable overlay drive for work (or use the workdir via 9p? but drive is simpler)
+	WORK_DRIVE="$IMAGES/work-${ID}.ext4"
+	if [[ ! -f "$WORK_DRIVE" ]]; then
+		truncate -s 5G "$WORK_DRIVE"
+		mkfs.ext4 -F "$WORK_DRIVE" >/dev/null
+	fi
+
+	# copy workdir contents into the drive? for now we will mount it as /work and rsync in guest or pre-populate
+	# simple: mount the host dir? can't easily. Pre-populate the drive from workdir.
+	if [[ -d "$WORKDIR" ]] && find "$WORKDIR" -mindepth 1 -maxdepth 1 | read -r _; then
+		log "populating work drive from $WORKDIR"
+		sudo mkdir -p /tmp/firellm-work-$$
+		sudo mount -o loop "$WORK_DRIVE" /tmp/firellm-work-$$
+		sudo rsync -a --delete "$WORKDIR"/ /tmp/firellm-work-$$/work/ 2>/dev/null || true
+		sudo umount /tmp/firellm-work-$$ || true
+		sudo rmdir /tmp/firellm-work-$$ || true
+	fi
+
+	# write task for guest agent
+	if [[ -n "$TASK" ]]; then
+		sudo mkdir -p /tmp/firellm-work-$$
+		sudo mount -o loop "$WORK_DRIVE" /tmp/firellm-work-$$
+		printf '%s\n' "$TASK" | sudo tee /tmp/firellm-work-$$/.firellm-task >/dev/null || true
+		sudo umount /tmp/firellm-work-$$ || true
+		sudo rmdir /tmp/firellm-work-$$ || true
+	fi
+
+	# prepare jailed paths: jailer requires files inside chroot to be hardlinks or copies owned properly
+	JAIL_BASE="/srv/jailer/firellm"
+	JAIL_DIR="$JAIL_BASE/firecracker/$ID/root"
+	sudo mkdir -p "$JAIL_DIR"
+
+	# hardlink (or copy if cross-device) the kernel and rootfs + work drive into jail
+	for f in "$KERNEL" "$ROOTFS" "$WORK_DRIVE"; do
+		base=$(basename "$f")
+		dest="$JAIL_DIR/$base"
+		if [[ ! -f "$dest" ]]; then
+			sudo ln -f "$f" "$dest" 2>/dev/null || sudo cp -f "$f" "$dest"
+		fi
+		sudo chown root:root "$dest"
+		sudo chmod 600 "$dest"
+	done
+
+	# config file inside the jail (relative paths)
+	CFG="$JAIL_DIR/vm-config.json"
+	cat >/tmp/firellm-vmcfg.$$.json <<EOF
+{
+  "boot-source": {
+    "kernel_image_path": "$(basename "$KERNEL")",
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "$(basename "$ROOTFS")",
+      "is_root_device": true,
+      "is_read_only": false
+    },
+    {
+      "drive_id": "work",
+      "path_on_host": "$(basename "$WORK_DRIVE")",
+      "is_root_device": false,
+      "is_read_only": false
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": $VCPU,
+    "mem_size_mib": $MEM
+  },
+  "network-interfaces": [],
+  "vsock": {
+    "vsock_id": "1",
+    "uds_path": "firecracker-vsock.sock"
+  }
+}
+EOF
+	sudo cp /tmp/firellm-vmcfg.$$.json "$CFG"
+	sudo chown root:root "$CFG"
+
+	# launch via jailer (we stay root here)
+	API_SOCK="$JAIL_DIR/firecracker.socket"
+	sudo rm -f "$API_SOCK"
+
+	JAILER_ARGS=(
+		--id "$ID"
+		--exec-file "$FC"
+		--uid "$(id -u)"
+		--gid "$(id -g)"
+		--chroot-base-dir "$JAIL_BASE"
+		--new-pid-ns
+		--
+		--api-sock "/$(basename "$API_SOCK")"
+		--config-file "/$(basename "$CFG")"
+	)
+
+	log "starting jailed firecracker..."
+	# run jailer in background so we can interact
+	# shellcheck disable=SC2024
+	sudo "$JAILER" "${JAILER_ARGS[@]}" >"$IMAGES/jailer-${ID}.log" 2>&1 &
+	JAILER_PID=$!
+	echo $JAILER_PID >"$IMAGES/jailer-${ID}.pid"
+
+	# wait for socket
+	for _ in {1..30}; do
+		[[ -S "$API_SOCK" ]] && break
+		sleep 0.2
+	done
+	[[ -S "$API_SOCK" ]] || die "firecracker socket never appeared"
+
+	log "VM started (jailer pid $JAILER_PID). Waiting for boot..."
+
+	# now configure any post-boot if needed. For this template we use config-file which auto starts.
+	# give it a few seconds
+	sleep 3
+
+	# for now, to "run task", we can use the serial console? but complicated.
+	# Instead: use the vsock or ssh (but net not set in this minimal cfg)
+	# For autopilot demo we will print how to connect and assume user or a guest agent script does the work.
+
+	log "To interact with the agent inside:"
+	log "  sudo chroot $JAIL_DIR /bin/bash   # (once guest has shell)"
+	log "  or use vsock from host: socat - UNIX-CONNECT:$JAIL_DIR/firecracker-vsock.sock"
+	log ""
+	log "Inside guest the workdir appears at /work (second drive)"
+	log "Run your agent manually for now, e.g.:"
+	log "  cd /work && /usr/local/bin/opencode --task \"$TASK\" || true"
+	log ""
+	log "When done: kill -9 $JAILER_PID ; sudo rm -rf $JAIL_DIR ; sudo rm -f $WORK_DRIVE"
+}
+
+usage() {
+	cat <<EOF
+firellm - firecracker jailer agent harness
+
+commands:
+  setup                 download/install firecracker + kernel (needs sudo)
+  prepare               build agent rootfs
+  run [options]         start a jailed VM for an agent task
+
+run options:
+  --task "string"       description of work for the agent
+  --workdir DIR         directory to expose to guest at /work (default .)
+  --id NAME             vm id
+  --mem MiB             memory (1024)
+  --vcpu N              vcpus (2)
+  --no-net              disable networking
+
+examples:
+  ./bin/firellm setup
+  ./bin/firellm prepare
+  ./bin/firellm run --task "add tests" --workdir ~/src/myapp
+EOF
+}
+
+case "${1:-}" in
+setup)
+	shift
+	cmd_setup "$@"
+	;;
+prepare)
+	shift
+	cmd_prepare "$@"
+	;;
+run)
+	shift
+	cmd_run "$@"
+	;;
+-h | --help | help) usage ;;
+*)
+	usage
+	exit 1
+	;;
+esac
