@@ -779,6 +779,9 @@ launch() {
 
 	resolve_assets
 	WORKDIR=$(cd "$WORKDIR" && pwd) || die "workdir does not exist"
+	# The project directory is a way into the guest just as much as --add-dir
+	# is. Matters most if launching is ever exposed to something automated.
+	refuse_if_sensitive "$WORKDIR"
 
 	# An agent invoked with no arguments has nothing to do unattended, so it
 	# gets a console instead. An explicit command always runs unattended.
