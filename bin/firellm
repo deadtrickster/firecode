@@ -39,8 +39,10 @@ AGENT=""
 SYNC_BACK=1
 RESUME_TREE=auto
 IMPORT_SESSIONS=auto
+USE_GITIGNORE=1
 declare -a EXTRA_DIRS=()
 declare -a HOST_PORTS=()
+declare -a EXCLUDES=()
 
 # Relative to $HOME. Never carried into the guest, whatever is asked for:
 # keeping keys and credentials out is most of the point of running in a VM.
@@ -167,6 +169,35 @@ mkimage_from_dir() {
 	rm -f "$out"
 	truncate -s "$size" "$out"
 	sbin mkfs.ext4 -q -F -L "$label" -d "$src" "$out"
+}
+
+# Lay the project out for imaging. Build artefacts are the difference between
+# a 150K drive and a 10G one, so ignored files are left behind by default.
+# Hardlinked where the filesystems allow it, so this copies no data.
+stage_project() {
+	local workdir=$1 stage=$2
+	rm -rf "$stage"
+	mkdir -p "$stage"
+
+	local -a rs=(-a --link-dest="$workdir")
+	if ((USE_GITIGNORE)) && [[ -d $workdir/.git ]]; then
+		# Per-directory .gitignore rules, the same set git itself would skip.
+		# .git is not covered by those, so the history still comes along.
+		rs+=(--filter=':- .gitignore')
+	fi
+	local p
+	for p in ${EXCLUDES+"${EXCLUDES[@]}"}; do
+		rs+=(--exclude="$p")
+	done
+
+	rsync "${rs[@]}" "$workdir"/ "$stage"/ 2>/dev/null || true
+
+	local full staged
+	full=$(du -sb --apparent-size "$workdir" 2>/dev/null | cut -f1)
+	staged=$(du -sb --apparent-size "$stage" 2>/dev/null | cut -f1)
+	if ((${full:-0} > ${staged:-0} + 64 * 1024 * 1024)); then
+		log "left behind $(numfmt --to=iec $((full - staged))) of ignored files (--all-files to include them)"
+	fi
 }
 
 # Read-only drives never grow, so they only need their contents plus the
@@ -697,6 +728,14 @@ launch() {
 			HOST_PORTS+=("$2")
 			shift 2
 			;;
+		--exclude)
+			EXCLUDES+=("$2")
+			shift 2
+			;;
+		--all-files)
+			USE_GITIGNORE=0
+			shift
+			;;
 		--import-sessions)
 			IMPORT_SESSIONS=1
 			shift
@@ -810,9 +849,12 @@ launch() {
 		log "resuming the working tree from the previous run"
 	else
 		((RESUME_TREE)) && log "no previous tree for this project, starting from $WORKDIR"
-		src_size=$(size_for_dir "$WORKDIR" $((4 * 1024 * 1024 * 1024)))
+		local src_stage="$RUN_DIR/src"
+		stage_project "$WORKDIR" "$src_stage"
+		src_size=$(size_for_dir "$src_stage" $((4 * 1024 * 1024 * 1024)))
 		log "packing $WORKDIR into a $((src_size / 1024 / 1024 / 1024))G drive"
-		mkimage_from_dir "$WORKDIR" "$src_drive" firellm-src "$src_size"
+		mkimage_from_dir "$src_stage" "$src_drive" firellm-src "$src_size"
+		rm -rf "$src_stage"
 	fi
 
 	# --- extra read-only context: sibling projects, notes, whatever. These
@@ -1118,6 +1160,8 @@ firellm - run a coding agent in a Firecracker microVM
 
 options (before the agent's own arguments):
   --workdir DIR   project to put in /src            (default: .)
+  --exclude PAT   leave PAT out of /src, repeatable
+  --all-files     include gitignored files too (they are left out by default)
   --add-dir DIR   extra host dir, read-only at /mnt/<name>, repeatable
   --host-port N   make the host's localhost:N reachable at localhost:N in the
                   guest, over vsock; repeatable. For a local llama-server or
