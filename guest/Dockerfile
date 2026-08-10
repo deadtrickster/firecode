@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	build-essential make pkg-config \
 	python3 python3-pip python3-venv \
 	ripgrep fd-find jq unzip tar xz-utils zstd \
+	libicu74 \
 	vim less tmux procps psmisc file bash-completion \
 	&& ln -sf /usr/bin/fdfind /usr/local/bin/fd \
 	&& rm -rf /var/lib/apt/lists/*
@@ -64,9 +65,41 @@ RUN if [ "$FIRECODE_TOOLCHAINS" = "full" ]; then \
 	ln -sf "/usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig" /usr/local/bin/zig; \
 	fi
 
-# mise, so the guest can match whatever tool versions a project pins.
+# mise, in a place every user in the guest can read. The default under /root
+# is invisible to the account the agent actually runs as.
+ENV MISE_DATA_DIR=/opt/mise \
+	MISE_CONFIG_DIR=/opt/mise/config \
+	MISE_STATE_DIR=/opt/mise/state \
+	MISE_CACHE_DIR=/var/cache/mise
 RUN curl -fsSL https://mise.run | sh \
-	&& ln -sf /root/.local/bin/mise /usr/local/bin/mise
+	&& install -m 0755 /root/.local/bin/mise /usr/local/bin/mise \
+	&& mkdir -p /opt/mise /var/cache/mise && chmod 0755 /opt/mise
+
+# Toolchains for the base image, which every project inherits read-only. This
+# is where a dotnet or a JDK belongs: installed once here rather than once per
+# workspace, where each VM would download it again.
+#
+#   firecode prepare --with "dotnet@10 java@temurin-21 uv"
+ARG FIRECODE_TOOLS=
+RUN if [ -n "$FIRECODE_TOOLS" ]; then \
+	set -eux; \
+	mise use -g $FIRECODE_TOOLS; \
+	mise install -y; \
+	mise reshim; \
+	mise ls --installed; \
+	chmod -R a+rX /opt/mise; \
+	fi
+# These are build-time ENV as far as Docker is concerned; the guest needs them
+# too, or mise looks under the user's home, finds nothing, and reports every
+# shim as invalid.
+RUN printf '%s\n' \
+	'export MISE_DATA_DIR=/opt/mise' \
+	'export MISE_CONFIG_DIR=/opt/mise/config' \
+	'export MISE_STATE_DIR=/opt/mise/state' \
+	'export MISE_CACHE_DIR=/var/cache/mise' \
+	'export PATH=/opt/mise/shims:$PATH' \
+	> /etc/profile.d/10-mise.sh \
+	&& chmod 0644 /etc/profile.d/10-mise.sh
 
 # ---------------------------------------------------------------- guest bits
 COPY firecode-setup.sh agent-entrypoint.sh profile.sh /opt/firecode/
@@ -141,9 +174,13 @@ RUN : > /etc/machine-id \
 	> /etc/fstab
 
 RUN printf '%s\n' \
-	'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+	'PATH=/opt/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
 	'FIRECODE=1' \
 	'IS_SANDBOX=1' \
+	'MISE_DATA_DIR=/opt/mise' \
+	'MISE_CONFIG_DIR=/opt/mise/config' \
+	'MISE_STATE_DIR=/opt/mise/state' \
+	'MISE_CACHE_DIR=/var/cache/mise' \
 	> /etc/environment
 
 CMD ["/sbin/init"]

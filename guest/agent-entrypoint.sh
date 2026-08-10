@@ -55,7 +55,11 @@ declare -a ENV=(
 	"IS_SANDBOX=1"
 	"FIRECODE=1"
 	"TERM=${TERM:-dumb}"
-	"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+	"PATH=/opt/mise/shims:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+	"MISE_DATA_DIR=/opt/mise"
+	"MISE_CONFIG_DIR=/opt/mise/config"
+	"MISE_STATE_DIR=/opt/mise/state"
+	"MISE_CACHE_DIR=/var/cache/mise"
 )
 
 declare -a CMD=()

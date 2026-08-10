@@ -58,7 +58,11 @@ declare -a env=(
 	"TERM=$_term"
 	"TERM_PROGRAM=${FIRECODE_TERM_PROGRAM:-}"
 	"COLORTERM=${FIRECODE_COLORTERM:-}"
-	"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+	"PATH=/opt/mise/shims:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+	"MISE_DATA_DIR=/opt/mise"
+	"MISE_CONFIG_DIR=/opt/mise/config"
+	"MISE_STATE_DIR=/opt/mise/state"
+	"MISE_CACHE_DIR=/var/cache/mise"
 )
 [[ -n ${FIRECODE_ROWS:-} ]] && env+=("LINES=$FIRECODE_ROWS" "COLUMNS=$FIRECODE_COLS")
 

@@ -14,6 +14,11 @@ IMAGE_TAG=firecode/rootfs:latest
 OUT="$IMAGES/agent-firecode.ext4"
 SIZE=${FIRECODE_ROOTFS_SIZE:-6G}
 TOOLCHAINS=lean
+# Remembered between builds. A rebuild for an unrelated reason must not
+# silently drop the toolchain every project depends on.
+TOOLS_FILE="$IMAGES/.tools"
+TOOLS=${FIRECODE_TOOLS:-}
+[[ -z $TOOLS && -f $TOOLS_FILE ]] && TOOLS=$(cat "$TOOLS_FILE")
 FORCE=0
 NO_CACHE=""
 
@@ -21,6 +26,9 @@ usage() {
 	cat <<'EOF'
 usage: firecode prepare [--full] [--force] [--no-cache] [--size 6G]
 
+  --with LIST tools for the base image, which every project inherits.
+              mise syntax, quoted: --with "dotnet@10 java@temurin-21 uv"
+              remembered, so later rebuilds keep them. --with "" to clear.
   --full      also install rust, go, zig, clang/llvm and sbcl
               (much slower build, roughly 3x the image size)
   --force     rebuild even if the image looks current
@@ -34,6 +42,10 @@ while [[ $# -gt 0 ]]; do
 	--full)
 		TOOLCHAINS=full
 		shift
+		;;
+	--with)
+		TOOLS="$2"
+		shift 2
 		;;
 	-f | --force)
 		FORCE=1
@@ -82,9 +94,13 @@ if [[ -f $OUT && $FORCE -eq 0 ]]; then
 fi
 
 echo "[prepare] building container image ($TOOLCHAINS toolchains)"
+[[ -n $TOOLS ]] && echo "[prepare] base toolchain: $TOOLS"
+mkdir -p "$IMAGES"
+printf '%s' "$TOOLS" >"$TOOLS_FILE"
 # shellcheck disable=SC2086  # NO_CACHE is a deliberate single optional flag
 docker build $NO_CACHE \
 	--build-arg "FIRECODE_TOOLCHAINS=$TOOLCHAINS" \
+	--build-arg "FIRECODE_TOOLS=$TOOLS" \
 	-t "$IMAGE_TAG" \
 	"$GUEST"
 

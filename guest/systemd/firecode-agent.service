@@ -13,7 +13,9 @@ ConditionPathExists=/opt/firecode/run/args
 
 [Service]
 Type=oneshot
-WorkingDirectory=/src
+# No WorkingDirectory: the project lives at its host path, which is not known
+# until the control drive is read, and systemd fails a unit outright when the
+# directory does not exist. The entrypoint changes into it itself.
 ExecStart=/opt/firecode/agent-entrypoint.sh
 StandardOutput=journal+console
 StandardError=journal+console

@@ -1743,6 +1743,9 @@ firecode - run a coding agent in a Firecracker microVM
 
   firecode setup                 fetch firecracker, jailer and a guest kernel
   firecode prepare [--full]      build the guest rootfs (via docker, no root)
+  firecode prepare --with "dotnet@10 uv"
+                                put toolchains in the base image, so every
+                                project has them without installing anything
   firecode net-setup [--count N] pre-create taps once, so runs need no root
   firecode doctor                check the host is ready
 
