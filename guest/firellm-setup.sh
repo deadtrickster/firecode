@@ -259,8 +259,25 @@ main() {
 	if [[ -f $CONFIG_MNT/claude.json ]]; then
 		# Claude rewrites this file, so it must be a real copy, not a symlink
 		# onto the read-only drive.
-		cp -f "$CONFIG_MNT/claude.json" "${FIRELLM_HOME:-/root}/.claude.json"
-		chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "${FIRELLM_HOME:-/root}/.claude.json"
+		local conf="${FIRELLM_HOME:-/root}/.claude.json"
+		cp -f "$CONFIG_MNT/claude.json" "$conf"
+		# Per-project state was stripped on the host - it named host paths for
+		# projects that are not in here. But the project *is* here, and without
+		# an entry marking it trusted, an interactive session opens on "is this
+		# a folder you trust?" instead of on the conversation. In a VM built
+		# from that very folder the question has one answer.
+		if [[ -n ${FIRELLM_PROJECT:-} ]] && command -v python3 >/dev/null 2>&1; then
+			python3 - "$conf" "$FIRELLM_PROJECT" <<'PY' 2>/dev/null || true
+import json, sys
+path, project = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    d = json.load(fh)
+d.setdefault("projects", {}).setdefault(project, {})["hasTrustDialogAccepted"] = True
+with open(path, "w") as fh:
+    json.dump(d, fh, indent=2)
+PY
+		fi
+		chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$conf"
 	fi
 
 	# The agent binaries live on the read-only config drive so they always

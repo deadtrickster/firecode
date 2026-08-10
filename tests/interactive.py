@@ -27,7 +27,10 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r")
 
 class Session:
     def __init__(self, argv, cwd):
-        self.buf = ""
+        # Raw, and a stripped view derived from it. Stripping each read on its
+        # own loses any escape sequence that straddles a read boundary, which
+        # then shows up in the middle of the text being matched.
+        self.raw = ""
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd)
@@ -59,7 +62,11 @@ class Session:
                     f"--- last 2000 chars seen ---\n{self.buf[-2000:]}")
             if not chunk:
                 raise TimeoutError(f"eof before {what or pattern!r}")
-            self.buf += ANSI.sub("", chunk.decode("utf-8", "replace"))
+            self.raw += chunk.decode("utf-8", "replace")
+
+    @property
+    def buf(self):
+        return ANSI.sub("", self.raw)
 
     def send(self, line):
         os.write(self.fd, (line + "\n").encode())
@@ -74,8 +81,7 @@ class Session:
             r, _, _ = select.select([self.fd], [], [], 0.5)
             if r:
                 try:
-                    self.buf += ANSI.sub(
-                        "", os.read(self.fd, 65536).decode("utf-8", "replace"))
+                    self.raw += os.read(self.fd, 65536).decode("utf-8", "replace")
                 except OSError:
                     pass
         raise TimeoutError("the VM did not shut down after exit")

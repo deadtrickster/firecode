@@ -609,12 +609,22 @@ alloc_net_slot() {
 	mkdir -p "$STATE_DIR/net"
 	for ((s = 1; s <= 250; s++)); do
 		exec {fd}>"$STATE_DIR/net/$s.lock"
-		if flock -n "$fd"; then
-			NET_FD=$fd
-			NET_SLOT=$s
-			return 0
+		if ! flock -n "$fd"; then
+			exec {fd}>&-
+			continue
 		fi
-		exec {fd}>&-
+		# The lock says no live firellm holds this slot, which is not the same
+		# as the tap being free: a VM outlives a firellm that was killed
+		# rather than asked to stop, and it keeps the device open. A tap with
+		# a process attached has carrier; an idle one does not.
+		if [[ $(cat "/sys/class/net/fcllm$s/carrier" 2>/dev/null || echo 0) == 1 ]]; then
+			log "fcllm$s is still in use by something, trying the next slot"
+			exec {fd}>&-
+			continue
+		fi
+		NET_FD=$fd
+		NET_SLOT=$s
+		return 0
 	done
 	return 1
 }
@@ -794,13 +804,15 @@ massage_args() {
 	printf '%s\0' ${out+"${out[@]}"} ${in+"${in[@]}"}
 }
 
-# An unattended claude run is `claude -p ...`, and print mode with nothing to
-# do fails immediately - "provide a prompt to continue the conversation" for a
-# bare --resume. Cheaper to say so here than to build four drives and boot a
-# VM to find out.
-require_prompt() {
+# Is there an actual task in here, as opposed to only flags?
+#
+# This is what decides unattended versus interactive. Arguments alone are not
+# the test: `--resume <id>` is a flag and a session id, not something to do,
+# and treating it as a task produced `claude -p --resume <id>` with nothing to
+# respond to - which fails on its first line.
+has_prompt() {
 	local -a in=("$@")
-	local i skip=0 left=0
+	local i skip=0
 
 	for ((i = 0; i < ${#in[@]}; i++)); do
 		local a=${in[i]}
@@ -809,34 +821,17 @@ require_prompt() {
 			continue
 		fi
 		case "$a" in
-		# Flags whose value would otherwise look like a prompt.
+		# Flags whose value would otherwise look like a task.
 		-r | --resume | --model | --agent | --settings | --permission-mode | \
 			--append-system-prompt | --system-prompt | --autocompact | \
 			--output-format | --input-format | --session-id | --fallback-model)
 			skip=1
 			;;
 		-*) ;;
-		*) left=$((left + 1)) ;;
+		*) return 0 ;;
 		esac
 	done
-
-	((left > 0)) && return 0
-
-	die "nothing for the agent to do.
-
-       You gave arguments, so this is an unattended run, and firellm adds -p
-       to make it one - nobody is at a terminal to answer a prompt. Claude in
-       print mode with only --resume and no task exits straight away with
-       \"provide a prompt to continue the conversation\".
-
-       Say what it should do:
-         firellm claude --resume <id> 'carry on with the next step'
-
-       Or take the session interactively, where no -p is added:
-         firellm claude          (then /resume inside)
-
-       Or send the command through exactly as written:
-         firellm claude --no-auto-flags --resume <id>"
+	return 1
 }
 
 # ---------------------------------------------------------------- launch
@@ -974,11 +969,15 @@ launch() {
 	# is. Matters most if launching is ever exposed to something automated.
 	refuse_if_sensitive "$WORKDIR"
 
-	# An agent invoked with no arguments has nothing to do unattended, so it
-	# gets a console instead. An explicit command always runs unattended.
+	# A task means unattended. Flags on their own - `--resume <id>`, a model
+	# choice - mean you want the session, and you are the one driving it, so
+	# you get a console with those flags passed straight through.
 	local mode=auto
-	if [[ $AGENT == shell ]] ||
-		{ ((${#agent_args[@]} == 0)) && [[ $AGENT == claude || $AGENT == opencode ]]; }; then
+	if [[ $AGENT == shell ]]; then
+		mode=interactive
+	elif [[ $AGENT == claude || $AGENT == opencode ]]; then
+		has_prompt ${agent_args+"${agent_args[@]}"} || mode=interactive
+	elif ((${#agent_args[@]} == 0)); then
 		mode=interactive
 	fi
 
@@ -1000,10 +999,21 @@ launch() {
 		fi
 	fi
 
-	# Before anything expensive: building four drives and booting a VM only to
-	# have the agent exit on its first line is a waste of a minute.
-	if [[ $mode == auto ]] && ((AUTO_FLAGS)) && [[ $AGENT == claude ]]; then
-		require_prompt ${agent_args+"${agent_args[@]}"}
+	# Known issue, cause not pinned down. Firecracker wires the guest serial
+	# port to its own stdin and stdout - that is what the console is. Run the
+	# jailer under sudo with those on a terminal and firecracker stops right
+	# after opening its API socket: silently, exit 0, before it even reads the
+	# config. Unattended runs pipe their output through tee, never touch a
+	# terminal, and are unaffected. Wrapping it in script(1) to give it a
+	# private pty does not help, so sudo's use_pty is not the whole story.
+	#
+	# Giving up the jailer costs the chroot, the dropped uid and the pid
+	# namespace around the VMM process. The guest is still a KVM VM with its
+	# own kernel and no view of this filesystem, which is the boundary that
+	# was the point.
+	if [[ $mode == interactive ]] && ((NOJAIL == 0)); then
+		NOJAIL=1
+		log "interactive: not jailed - a jailed guest console dies on a terminal"
 	fi
 
 	local id
@@ -1126,12 +1136,31 @@ launch() {
 	done
 
 	if [[ $mode == auto ]]; then
+		# The presence of this file is what starts firellm-agent.service.
 		if ((AUTO_FLAGS)); then
 			massage_args "$AGENT" ${agent_args+"${agent_args[@]}"} >"$ctl_stage/args"
 		else
 			printf '%s\0' ${agent_args+"${agent_args[@]}"} >"$ctl_stage/args"
 		fi
 		log "agent command: $AGENT $(tr '\0' ' ' <"$ctl_stage/args")"
+	elif ((${#agent_args[@]} > 0)); then
+		# Interactive, but with flags to hand the agent. Under a different
+		# name, or the agent service would take it as an unattended run.
+		local -a iargs=(${agent_args+"${agent_args[@]}"})
+		# No -p here - there is a terminal, and you are on it. Permissions
+		# still get bypassed: the VM is the boundary, not the prompt.
+		if ((AUTO_FLAGS)) && [[ $AGENT == claude ]]; then
+			local a has_perm=0
+			for a in "${iargs[@]}"; do
+				case "$a" in
+				--dangerously-skip-permissions | --permission-mode | \
+					--allowedTools | --allowed-tools) has_perm=1 ;;
+				esac
+			done
+			((has_perm)) || iargs=(--dangerously-skip-permissions "${iargs[@]}")
+		fi
+		printf '%s\0' "${iargs[@]}" >"$ctl_stage/interactive-args"
+		log "interactive: $AGENT ${iargs[*]}"
 	fi
 
 	# --- networking, then patch the allocated slot into the control drive

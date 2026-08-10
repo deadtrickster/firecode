@@ -57,9 +57,14 @@ declare -a _fl_env=(
 declare -a _fl_cmd=(bash -i)
 if [[ ${FIRELLM_MODE:-} == interactive && -n ${FIRELLM_AGENT:-} ]]; then
 	if command -v "$FIRELLM_AGENT" >/dev/null 2>&1; then
-		echo "  starting $FIRELLM_AGENT ..."
+		# Whatever was asked for on the host - --resume, a model, and so on.
+		declare -a _fl_args=()
+		if [[ -f /opt/firellm/run/interactive-args ]]; then
+			mapfile -d '' -t _fl_args </opt/firellm/run/interactive-args
+		fi
+		echo "  starting $FIRELLM_AGENT ${_fl_args[*]-}"
 		echo
-		_fl_cmd=("$FIRELLM_AGENT")
+		_fl_cmd=("$FIRELLM_AGENT" ${_fl_args+"${_fl_args[@]}"})
 	else
 		echo "  WARNING: $FIRELLM_AGENT is not installed in this guest."
 		echo
