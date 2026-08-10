@@ -320,6 +320,27 @@ test_ro_image_cached() {
 	fi
 }
 
+# The jailed path, if it can be reached without a prompt. Everything else
+# runs --no-jail so the suite needs no privileges at all.
+test_jailed() {
+	local project out
+	if ((QUICK)); then
+		ok "jailed boot (skipped, needs a VM)"
+		return
+	fi
+	if ! sudo -n true 2>/dev/null; then
+		ok "jailed boot (skipped, needs passwordless sudo for the jailer)"
+		return
+	fi
+	project=$(make_project)
+	out=$(cd "$project" && timeout 240 "$FIRELLM" exec --no-net -- \
+		bash -c 'echo "U=$(id -un)"; echo "P=$(pwd)"; echo "F=$(ls)"' 2>&1 |
+		sed -n 's/.*agent-entrypoint\.sh\[[0-9]*\]: //p')
+	contains "boots under the jailer as the right user" "U=$(id -un)" "$out"
+	contains "project is mounted in the jailed guest" "P=$project" "$out"
+	contains "the project files are there" "README.md" "$out"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -372,6 +393,7 @@ run_test state_persists
 run_test session_import_resumable
 run_test results_come_back
 run_test ro_image_cached
+run_test jailed
 
 echo
 if ((FAIL == 0)); then

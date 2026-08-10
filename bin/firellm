@@ -109,12 +109,23 @@ sbin() {
 	die "$name not found (install e2fsprogs)"
 }
 
-priv() {
-	if [[ $EUID -eq 0 ]]; then
-		"$@"
+# How to become root, worked out once. Empty when we already are.
+#
+# With no controlling terminal - cron, a hook, another agent - sudo cannot
+# prompt and just fails. If an askpass helper is configured it can ask on the
+# desktop instead, which is the difference between an unattended run working
+# and not.
+declare -a SUDO=()
+if ((EUID != 0)); then
+	if [[ ! -t 0 && -n ${SUDO_ASKPASS:-} ]] && ! sudo -n true 2>/dev/null; then
+		SUDO=(sudo -A)
 	else
-		sudo "$@"
+		SUDO=(sudo)
 	fi
+fi
+
+priv() {
+	"${SUDO[@]}" "$@"
 }
 
 # ---------------------------------------------------------------- assets
@@ -1122,8 +1133,7 @@ EOF
 		log "WARNING: --no-jail, the VMM runs unconfined on the host"
 		cmd=("$FC" --api-sock firecracker.socket --config-file vm-config.json)
 	else
-		((EUID == 0)) || cmd=(sudo)
-		cmd+=("$JAILER" "${jargs[@]}")
+		cmd=(${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
 	fi
 
 	log "booting ($VCPU vcpu, ${MEM}M)"

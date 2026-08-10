@@ -25,14 +25,31 @@ git clone ... firellm && cd firellm
 ./bin/firellm doctor     # check everything is in place
 ```
 
-Only two things need privileges at run time: the jailer, and creating the tap
-device. To stop those prompting on every run:
+Two things need root. Networking needs it once:
+
+```sh
+sudo ./bin/firellm net-setup --count 4
+```
+
+That leaves persistent tap devices behind that belong to you, so no run needs
+privileges for the network again. The jailer cannot be made one-time, since it
+has to be root to chroot and drop privileges. Either let it prompt, or:
 
 ```sh
 sudo ./scripts/install-privileged.sh
 ```
 
-Read the top of that script first. It is passwordless root for four binaries.
+Read the top of that script first - the jailer execs a binary as a uid of the
+caller's choosing, so treat it as passwordless root. If you would rather not,
+`--no-jail` needs nothing at all.
+
+With no controlling terminal - cron, a hook, another agent - sudo cannot
+prompt. Set `SUDO_ASKPASS` to an askpass helper and it will ask on the desktop
+instead:
+
+```sh
+SUDO_ASKPASS=/usr/bin/ksshaskpass firellm claude "..."
+```
 
 ## What it protects against
 
