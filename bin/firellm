@@ -1119,6 +1119,16 @@ launch() {
 			[[ -n ${rows:-} && -n ${cols:-} && $rows != 0 && $cols != 0 ]] &&
 				printf 'FIRELLM_ROWS=%s\nFIRELLM_COLS=%s\n' "$rows" "$cols"
 		fi
+		# What kind of terminal is really on the other end. The guest console
+		# is handed to it directly, so it is that terminal answering capability
+		# probes - but agetty labels the line vt220, and an application that
+		# believes it then mis-decodes everything the real terminal sends back.
+		# Enter is the one you notice: a terminal speaking the kitty keyboard
+		# protocol reports it as CSI 13 u, arrows stay ordinary CSI, so the
+		# arrows work and Enter appears dead.
+		echo "FIRELLM_TERM='${TERM:-}'"
+		echo "FIRELLM_TERM_PROGRAM='${TERM_PROGRAM:-}'"
+		echo "FIRELLM_COLORTERM='${COLORTERM:-}'"
 		echo "FIRELLM_USER='$(id -un)'"
 		echo "FIRELLM_UID=$(id -u)"
 		echo "FIRELLM_GID=$(id -g)"

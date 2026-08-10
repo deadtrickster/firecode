@@ -44,13 +44,30 @@ cat <<BANNER
 
 BANNER
 
+# agetty labels the serial line vt220, but the thing on the far end of it is
+# the host's terminal, and it is the one answering capability probes. An
+# application that believes the vt220 label then mis-decodes what that
+# terminal sends back. Enter is the one you notice: a terminal speaking the
+# kitty keyboard protocol reports it as CSI 13 u while arrows stay ordinary
+# CSI, so the arrows work and Enter looks dead.
+_fl_term=${FIRELLM_TERM:-}
+if [[ -z $_fl_term ]] || ! infocmp "$_fl_term" >/dev/null 2>&1; then
+	_fl_term=xterm-256color
+	infocmp "$_fl_term" >/dev/null 2>&1 || _fl_term=${TERM:-vt220}
+fi
+export TERM=$_fl_term
+[[ -n ${FIRELLM_TERM_PROGRAM:-} ]] && export TERM_PROGRAM=$FIRELLM_TERM_PROGRAM
+[[ -n ${FIRELLM_COLORTERM:-} ]] && export COLORTERM=$FIRELLM_COLORTERM
+
 declare -a _fl_env=(
 	"HOME=$FIRELLM_HOME"
 	"USER=$FIRELLM_USER"
 	"LOGNAME=$FIRELLM_USER"
 	"IS_SANDBOX=1"
 	"FIRELLM=1"
-	"TERM=${TERM:-xterm-256color}"
+	"TERM=$_fl_term"
+	"TERM_PROGRAM=${FIRELLM_TERM_PROGRAM:-}"
+	"COLORTERM=${FIRELLM_COLORTERM:-}"
 	"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 )
 
