@@ -325,6 +325,15 @@ PY
 		fi
 	fi
 
+	# File transfer in and out of a running VM. Firecracker cannot share a
+	# host directory, so this is the only live channel there is.
+	if [[ -x $CTL_MNT/fileserver.sh ]]; then
+		systemd-run --unit=firellm-files --collect --quiet \
+			socat "VSOCK-LISTEN:${FIRELLM_FILES_PORT:-1025},fork,reuseaddr" \
+			"EXEC:$CTL_MNT/fileserver.sh" 2>/dev/null ||
+			log "WARNING: could not start the file channel"
+	fi
+
 	# firellm-agent.service declares Conflicts=serial-getty@ttyS0.service so the
 	# agent owns the console. systemd acts on that when the job is queued, not
 	# when the unit's condition is evaluated - so in interactive mode, where

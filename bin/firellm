@@ -74,6 +74,7 @@ PORTS_FILE="${FIRELLM_PORTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/host
 
 # Guest vsock port the interactive session listens on.
 CONSOLE_PORT=${FIRELLM_CONSOLE_PORT:-1024}
+FILES_PORT=${FIRELLM_FILES_PORT:-1025}
 
 refuse_if_sensitive() {
 	local path=$1 rel full line
@@ -610,6 +611,34 @@ snapshot_parts() {
 	echo "$STATE_DIR/$slug.ext4:agent"
 	echo "$STATE_DIR/$slug-src.ext4:src"
 	echo "$STATE_DIR/$slug-root.ext4:root"
+}
+
+# Files in or out of a VM that is running now. Firecracker cannot mount a host
+# directory into a guest, so this streams a tar over vsock instead.
+cmd_cp() {
+	local src=${1:-} dst=${2:-}
+	[[ -n $src && -n $dst ]] || die "usage: firellm cp <src> <dst>   (vm:/path for the guest side)"
+
+	# Whichever VM is running right now. One at a time is the common case; be
+	# explicit about it rather than guessing between several.
+	local -a socks=()
+	local d
+	for d in "$JAIL_BASE"/firecracker/*/root; do
+		[[ -S $d/firecracker-vsock.sock ]] || continue
+		# The file outlives the VM. Only something listening counts.
+		socat -u /dev/null "UNIX-CONNECT:$d/firecracker-vsock.sock" 2>/dev/null &&
+			socks+=("$d/firecracker-vsock.sock")
+	done
+	((${#socks[@]} > 0)) || die "no VM is running"
+	((${#socks[@]} == 1)) || die "${#socks[@]} VMs are running - stop all but one"
+
+	if [[ $src == vm:* ]]; then
+		python3 "$SCRIPTS/vsock-cp.py" "${socks[0]}" "$FILES_PORT" get "${src#vm:}" "$dst"
+	elif [[ $dst == vm:* ]]; then
+		python3 "$SCRIPTS/vsock-cp.py" "${socks[0]}" "$FILES_PORT" put "$src" "${dst#vm:}"
+	else
+		die "one side has to be vm:<path>"
+	fi
 }
 
 cmd_snapshot() {
@@ -1283,6 +1312,7 @@ launch() {
 		# protocol reports it as CSI 13 u, arrows stay ordinary CSI, so the
 		# arrows work and Enter appears dead.
 		echo "FIRELLM_CONSOLE_PORT=$CONSOLE_PORT"
+		echo "FIRELLM_FILES_PORT=$FILES_PORT"
 		echo "FIRELLM_TERM='${TERM:-}'"
 		echo "FIRELLM_TERM_PROGRAM='${TERM_PROGRAM:-}'"
 		echo "FIRELLM_COLORTERM='${COLORTERM:-}'"
@@ -1308,7 +1338,8 @@ launch() {
 	# over the copies baked into the image, so changing the harness does not
 	# mean rebuilding a 6G rootfs.
 	local g
-	for g in firellm-setup.sh agent-entrypoint.sh profile.sh keydump.sh console.sh; do
+	for g in firellm-setup.sh agent-entrypoint.sh profile.sh keydump.sh \
+		console.sh fileserver.sh; do
 		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
 	done
 
@@ -1482,6 +1513,13 @@ EOF
 
 	relays_up "$JAIL_DIR" "$relay_ports"
 
+	# Your host is the other end of the guest's link, so anything it serves is
+	# reachable directly - no forwarding involved.
+	if [[ -n $TAP_DEV ]]; then
+		log "guest is 172.16.$NET_SLOT.2 - a server it starts on PORT is at"
+		log "  http://172.16.$NET_SLOT.2:PORT"
+	fi
+
 	local -a jargs=(
 		--id "$id"
 		--exec-file "$FC"
@@ -1621,7 +1659,18 @@ cmd_gc() {
 		fi
 	done < <(find "$RUNS" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
 		sort -rn | cut -d' ' -f2-)
-	rm -rf "${JAIL_BASE:?}/firecracker" 2>/dev/null || true
+	# Jail directories outlive a VM that was killed rather than stopped.
+	local j
+	for j in "$JAIL_BASE"/firecracker/*/; do
+		[[ -d $j ]] || continue
+		if [[ -S $j/root/firecracker-vsock.sock ]] &&
+			socat -u /dev/null "UNIX-CONNECT:$j/root/firecracker-vsock.sock" 2>/dev/null; then
+			continue # still alive
+		fi
+		# The jailer makes device nodes in there as root, so a plain rm can
+		# come up short.
+		rm -rf "$j" 2>/dev/null || priv rm -rf "$j"
+	done
 	log "kept the $keep most recent runs (logs only)"
 }
 
@@ -1682,6 +1731,8 @@ firellm - run a coding agent in a Firecracker microVM
   firellm opencode [args...]    same, with opencode
   firellm shell                 interactive root shell in a VM
   firellm keys                  show what the guest receives for each keypress
+  firellm cp SRC DST            move files in or out of a running VM,
+                                with vm: naming the guest side
   firellm exec CMD [args...]    run any command in a VM over this directory
 
   firellm list                  runs, and whether their drives still exist
@@ -1805,6 +1856,10 @@ shell)
 keys)
 	shift
 	launch keys "$@"
+	;;
+cp)
+	shift
+	cmd_cp "$@"
 	;;
 exec)
 	shift

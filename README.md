@@ -143,6 +143,35 @@ firellm claude --add-dir ~/Projects "match the API the sibling repo uses"
 Those are copies. The guest can read them; nothing written there goes back out.
 The only thing that ever comes back is `/src`.
 
+## Reaching a server the agent started
+
+Your host is the other end of the guest's link, so anything it serves is
+reachable directly - no forwarding, no configuration. firellm prints the
+address when the VM starts:
+
+```
+[firellm] guest is 172.16.1.2 - a server it starts on PORT is at
+[firellm]   http://172.16.1.2:PORT
+```
+
+So a dev server on 3000 inside is `http://172.16.1.2:3000` in your browser.
+Not under `--no-net`, which leaves the guest with no network at all.
+
+## Moving files in and out
+
+Firecracker cannot mount a host directory into a guest - it has no virtio-fs
+and no 9p, deliberately - so there is no shared folder to be had. What there
+is, is vsock:
+
+```sh
+firellm cp vm:/src/dist ./dist        # out of a running VM
+firellm cp ./logo.png vm:/src/assets  # into one
+```
+
+Files and directories, in either direction, while the VM is running. Ordinary
+runs still copy the whole project out to a sibling directory when they finish;
+this is for when you want something sooner, or want to hand something in.
+
 ## Snapshots
 
 A project's VM state is three drives: the agent's home (sessions), the working
