@@ -396,6 +396,49 @@ test_concurrent_runs() {
 		"not be resumable" "$(cat "$b")"
 }
 
+# `firellm shell` hands the guest console to a terminal, which a pipe is not,
+# so this is the only test that drives a real pty. It is where the console
+# was found dead: firellm-agent.service declared a conflict with the getty,
+# and systemd acted on it even though the unit itself was skipped.
+test_interactive() {
+	local project out rc
+	project=$(make_project)
+	if ((QUICK)); then
+		ok "an interactive session (skipped, needs a VM)"
+		return
+	fi
+	out=$(timeout 300 python3 -u "$ROOT/tests/interactive.py" "$project" "$FIRELLM" 2>&1)
+	rc=$?
+	printf '%s\n' "$out" | sed 's/^  /    /'
+	# interactive.py prints its own ok/FAIL lines; count them here.
+	local n_ok n_fail
+	n_ok=$(grep -c '^  ok' <<<"$out")
+	n_fail=$(grep -c '^  FAIL' <<<"$out")
+	PASS=$((PASS + n_ok))
+	FAIL=$((FAIL + n_fail))
+	((n_fail > 0)) && FAILED+=("interactive session")
+	((rc != 0 && n_fail == 0)) && no "the interactive test exited $rc"
+	return 0
+}
+
+# `claude -p` with nothing to do fails on its first line. Catch it before
+# building drives and booting a VM.
+test_prompt_required() {
+	local project out
+	project=$(make_project)
+
+	out=$("$FIRELLM" claude --workdir "$project" --resume abc123 2>&1)
+	contains "a bare --resume is refused" "no prompt" "$out"
+
+	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net --timeout 1 \
+		--resume abc123 "carry on" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
+	contains "--resume with a prompt is not refused" "carry on" "$out"
+
+	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net --timeout 1 \
+		--model opus "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
+	contains "a flag value is not mistaken for a prompt" "do a thing" "$out"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -440,6 +483,7 @@ echo "firellm tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full
 run_test shellcheck
 run_test denylist
 run_test arg_massaging
+run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched
 run_test gitignore_excluded
@@ -451,6 +495,7 @@ run_test no_relays
 run_test concurrent_runs
 run_test ro_image_cached
 run_test jailed
+run_test interactive
 
 echo
 if ((FAIL == 0)); then

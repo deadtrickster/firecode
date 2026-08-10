@@ -279,6 +279,16 @@ main() {
 		cp -f "$CTL_MNT/context.md" "${FIRELLM_HOME:-/root}/FIRELLM.md"
 	fi
 
+	# firellm-agent.service declares Conflicts=serial-getty@ttyS0.service so the
+	# agent owns the console. systemd acts on that when the job is queued, not
+	# when the unit's condition is evaluated - so in interactive mode, where
+	# the agent is skipped for want of an args file, the getty is stopped for a
+	# unit that never runs and the console is left dead. Start it back.
+	if [[ ${FIRELLM_MODE:-} != auto ]]; then
+		systemctl start --no-block serial-getty@ttyS0.service 2>/dev/null ||
+			log "WARNING: could not start the console getty"
+	fi
+
 	log "setup complete (mode=${FIRELLM_MODE:-interactive} agent=${FIRELLM_AGENT:-none})"
 }
 

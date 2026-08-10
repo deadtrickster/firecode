@@ -794,6 +794,46 @@ massage_args() {
 	printf '%s\0' ${out+"${out[@]}"} ${in+"${in[@]}"}
 }
 
+# An unattended claude run is `claude -p ...`, and print mode with nothing to
+# do fails immediately - "provide a prompt to continue the conversation" for a
+# bare --resume. Cheaper to say so here than to build four drives and boot a
+# VM to find out.
+require_prompt() {
+	local -a in=("$@")
+	local i skip=0 left=0
+
+	for ((i = 0; i < ${#in[@]}; i++)); do
+		local a=${in[i]}
+		if ((skip)); then
+			skip=0
+			continue
+		fi
+		case "$a" in
+		# Flags whose value would otherwise look like a prompt.
+		-r | --resume | --model | --agent | --settings | --permission-mode | \
+			--append-system-prompt | --system-prompt | --autocompact | \
+			--output-format | --input-format | --session-id | --fallback-model)
+			skip=1
+			;;
+		-*) ;;
+		*) left=$((left + 1)) ;;
+		esac
+	done
+
+	((left > 0)) && return 0
+
+	die "no prompt. \`claude -p\` needs something to do, and a bare --resume
+       fails with \"provide a prompt to continue the conversation\".
+
+       Say what to do:
+         firellm claude --resume <id> 'carry on with the next step'
+
+       Or drop into the session interactively instead:
+         firellm claude          (then /resume inside)
+
+       Or pass the command through untouched with --no-auto-flags."
+}
+
 # ---------------------------------------------------------------- launch
 
 RUN_DIR=""
@@ -953,6 +993,12 @@ launch() {
 				esac
 			done
 		fi
+	fi
+
+	# Before anything expensive: building four drives and booting a VM only to
+	# have the agent exit on its first line is a waste of a minute.
+	if [[ $mode == auto ]] && ((AUTO_FLAGS)) && [[ $AGENT == claude ]]; then
+		require_prompt ${agent_args+"${agent_args[@]}"}
 	fi
 
 	local id
