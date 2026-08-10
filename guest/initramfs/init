@@ -1,0 +1,89 @@
+#!/bin/busybox sh
+# firellm initramfs: assemble the root filesystem out of layers, then hand over.
+#
+# The guest root is not one disk. It is an overlay:
+#
+#   lower   the base image prepare built, read-only, shared by every VM
+#   lower   the project's own layer, where its installed toolchains live
+#   upper   this session's layer, which is the only thing that gets written
+#
+# A session started from a git worktree therefore inherits everything the main
+# project installed, without copying it and without being able to damage it.
+# Which layer is the writable one is the host's decision, passed on the kernel
+# command line - for the project's own workspace the project layer is writable,
+# so what it installs is still there next time.
+#
+# Kernel command line:
+#   firellm.lower=/dev/vda[,/dev/vdb...]   read-only layers, highest first
+#   firellm.upper=/dev/vdc                 the writable layer
+set -u
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+say() { echo "[firellm-initrd] $*"; }
+
+fail() {
+	say "ERROR: $*"
+	say "dropping to a shell in the initramfs"
+	exec /bin/busybox sh
+}
+
+/bin/busybox mkdir -p /proc /sys /dev /base /upper /newroot
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null || true
+
+lower=""
+upper=""
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	firellm.lower=*) lower=${arg#firellm.lower=} ;;
+	firellm.upper=*) upper=${arg#firellm.upper=} ;;
+	esac
+done
+
+[ -n "$lower" ] || fail "no firellm.lower on the kernel command line"
+[ -n "$upper" ] || fail "no firellm.upper on the kernel command line"
+
+# Mount each read-only layer. The order given is the order overlayfs wants:
+# leftmost wins, so the project's layer comes before the base image.
+lowerdirs=""
+n=0
+for dev in $(echo "$lower" | /bin/busybox tr ',' ' '); do
+	n=$((n + 1))
+	dir=/base/$n
+	/bin/busybox mkdir -p "$dir"
+	/bin/busybox mount -t ext4 -o ro "$dev" "$dir" || fail "cannot mount $dev read-only"
+	# A layer image holds upper/ and work/ at its root, so what it contributes
+	# to the stack is its upper directory. The base image is a whole root
+	# filesystem and contributes itself.
+	if [ -d "$dir/upper" ] && [ -d "$dir/work" ]; then
+		dir=$dir/upper
+	fi
+	if [ -z "$lowerdirs" ]; then
+		lowerdirs=$dir
+	else
+		lowerdirs=$lowerdirs:$dir
+	fi
+done
+
+/bin/busybox mount -t ext4 "$upper" /upper || fail "cannot mount $upper"
+/bin/busybox mkdir -p /upper/upper /upper/work
+
+/bin/busybox mount -t overlay overlay \
+	-o "lowerdir=$lowerdirs,upperdir=/upper/upper,workdir=/upper/work" \
+	/newroot || fail "cannot assemble the overlay root"
+
+# The layers have to come along, or the running system cannot see the
+# filesystems its own root is built from.
+/bin/busybox mkdir -p /newroot/run/firellm/base /newroot/run/firellm/upper
+/bin/busybox mount --move /upper /newroot/run/firellm/upper 2>/dev/null || true
+
+/bin/busybox mount --move /dev /newroot/dev 2>/dev/null || true
+/bin/busybox umount /proc 2>/dev/null || true
+/bin/busybox umount /sys 2>/dev/null || true
+
+[ -x /newroot/sbin/init ] || fail "no /sbin/init in the assembled root"
+
+exec /bin/busybox switch_root /newroot /sbin/init

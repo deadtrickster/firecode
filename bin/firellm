@@ -45,7 +45,7 @@ RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
 NO_MCP=0
-KEEP_ROOT=0
+FRESH_ROOT=0
 declare -a EXTRA_DIRS=()
 declare -a HOST_PORTS=()
 declare -a EXCLUDES=()
@@ -143,6 +143,7 @@ priv() {
 
 KERNEL=""
 ROOTFS=""
+INITRD=""
 
 resolve_assets() {
 	[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firellm setup"
@@ -156,6 +157,10 @@ resolve_assets() {
 	# that is how this used to silently boot the untouched base image.
 	ROOTFS="$IMAGES/agent-firellm.ext4"
 	[[ -f $ROOTFS ]] || die "no guest rootfs - run: firellm prepare"
+
+	# Assembles the layered root before handing over to the guest's init.
+	INITRD="$IMAGES/initrd.gz"
+	[[ -f $INITRD ]] || die "no initrd - rebuild with: firellm prepare --force"
 }
 
 # ---------------------------------------------------------------- host MCP
@@ -571,6 +576,32 @@ import_host_sessions() {
 	mv -f "$img.new" "$img"
 	rm -rf "$tmp"
 	log "imported $n host session(s), resumable at their original paths"
+}
+
+# The checkout a worktree belongs to, or the directory itself when it is not
+# one. git points every worktree at the repository's common directory, which
+# is what makes "inherit what the main checkout installed" well defined.
+main_checkout() {
+	local dir=$1 common
+	common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+	[[ $common == */.git ]] || return 0
+	echo "${common%/.git}"
+}
+
+# An empty ext4 for one overlay layer. Sparse, so it costs what it holds.
+ensure_layer() {
+	local slug=$1
+	local img="$STATE_DIR/$slug-layer.ext4"
+	mkdir -p "$STATE_DIR"
+	if [[ ! -f $img ]]; then
+		local seed
+		seed=$(mktemp -d)
+		mkdir -p "$seed/upper" "$seed/work"
+		mkimage_from_dir "$seed" "$img" "fl-layer" \
+			"${FIRELLM_LAYER_SIZE:-$((16 * 1024 * 1024 * 1024))}"
+		rm -rf "$seed"
+	fi
+	echo "$img"
 }
 
 # A project's whole persistent state, as three drives.
@@ -1045,8 +1076,8 @@ launch() {
 			USE_GITIGNORE=0
 			shift
 			;;
-		--keep-root)
-			KEEP_ROOT=1
+		--fresh-root)
+			FRESH_ROOT=1
 			shift
 			;;
 		--no-mcp)
@@ -1129,12 +1160,6 @@ launch() {
 			done
 		fi
 	fi
-
-	# Resuming means resuming the whole thing. The conversation without the
-	# tree it was talking about is worse than useless - the agent is told it
-	# made changes that are not there - and without the packages it installed
-	# it starts by installing them again.
-	((RESUME_TREE)) && KEEP_ROOT=1
 
 	local id
 	# BASHPID, not $$: in a subshell $$ is still the parent's pid, so two runs
@@ -1324,27 +1349,45 @@ launch() {
 	local ctl_drive="$RUN_DIR/ctl.ext4"
 	mkimage_from_dir "$ctl_stage" "$ctl_drive" firellm-ctl "$(size_ro_dir "$ctl_stage")"
 
-	# --- the rootfs. A per-run copy by default, so the guest can wreck it
-	#     freely and start clean next time. Kept per project on request:
-	#     anything installed in there - a dotnet SDK, apt packages - is
-	#     otherwise downloaded again on every single run.
-	local root_drive="$RUN_DIR/root.ext4"
-	if ((KEEP_ROOT)) && ((STATE_PERSISTENT)); then
-		root_drive="$STATE_DIR/$SLUG-root.ext4"
-		if [[ ! -f $root_drive ]]; then
-			log "new persistent rootfs for this project (installs will survive)"
-			cp --sparse=always "$ROOTFS" "$root_drive"
-		elif [[ $ROOTFS -nt $root_drive ]]; then
-			log "the base image is newer; keeping this project's rootfs anyway"
-			log "  (firellm state reset drops it and starts from the new base)"
-		fi
-	else
-		cp --sparse=always "$ROOTFS" "$root_drive"
+	# --- the root, as layers rather than a copy.
+	#
+	#   base       the image prepare built, read-only, shared by every VM
+	#   project    the main checkout's layer, where its toolchains live
+	#   workspace  this directory's own layer, the only thing written
+	#
+	# A git worktree gets its own workspace layer and inherits the main
+	# checkout's, read-only - the same relationship the worktree has to the
+	# repository. Nothing is copied, so a run no longer starts by duplicating
+	# six gigabytes.
+	local -a lower_drives=()
+	local workspace_layer main_layer="" main_dir
+	main_dir=$(main_checkout "$WORKDIR")
+
+	if [[ -n $main_dir && $main_dir != "$WORKDIR" ]]; then
+		main_layer=$(ensure_layer "$(project_slug "$main_dir")")
+		# A layer whose VM was killed rather than shut down has a dirty
+		# journal, and the kernel cannot replay one on a read-only mount - it
+		# refuses the mount instead. Replaying it here is cheap when clean.
+		sbin e2fsck -p "$main_layer" >/dev/null 2>&1 || true
+		lower_drives+=("$main_layer")
+		log "inheriting the layer of $main_dir (this is a worktree of it)"
 	fi
+	lower_drives+=("$ROOTFS")
+
+	workspace_layer="$STATE_DIR/$SLUG-layer.ext4"
+	if ((FRESH_ROOT)) && [[ -f $workspace_layer ]]; then
+		log "discarding this workspace's layer, starting from the base image"
+		rm -f "$workspace_layer"
+	fi
+	[[ -f $workspace_layer ]] || {
+		log "new workspace layer (what gets installed here stays here)"
+		ensure_layer "$SLUG" >/dev/null
+	}
 
 	# --- jail: everything the VM touches has to live inside the chroot
 	local f
-	for f in "$KERNEL" "$root_drive" "$src_drive" "$CFG_DRIVE" "$ctl_drive" \
+	for f in "$KERNEL" "$INITRD" ${lower_drives+"${lower_drives[@]}"} \
+		"$workspace_layer" "$src_drive" "$CFG_DRIVE" "$ctl_drive" \
 		"$state_drive" ${extra_drives+"${extra_drives[@]}"}; do
 		ln "$f" "$JAIL_DIR/$(basename "$f")" 2>/dev/null ||
 			cp "$f" "$JAIL_DIR/$(basename "$f")"
@@ -1364,22 +1407,72 @@ launch() {
 		net_ifaces="[{\"iface_id\":\"eth0\",\"guest_mac\":\"$mac\",\"host_dev_name\":\"$TAP_DEV\"}]"
 	fi
 
+	# Drives get vda, vdb, ... in the order they appear here, and the
+	# initramfs is told which of those are layers by device name.
+	local -a drive_json=()
+	local dev_i=0 dev_lower="" dev_upper="" NEXT_DEV=""
+	# Sets NEXT_DEV rather than printing it. A command substitution runs in a
+	# subshell, so an echoing version would hand out /dev/vda every time and
+	# the counter would never move - which is exactly what it did.
+	next_dev() {
+		local letters=abcdefghijklmnopqrstuvwxyz
+		NEXT_DEV="/dev/vd${letters:$dev_i:1}"
+		dev_i=$((dev_i + 1))
+	}
+	add_drive() {
+		local id=$1 path=$2 ro=$3 root=${4:-false}
+		drive_json+=("{\"drive_id\": \"$id\", \"path_on_host\": \"$(basename "$path")\", \"is_root_device\": $root, \"is_read_only\": $ro}")
+	}
+
+	local li=0 f
+	for f in ${lower_drives+"${lower_drives[@]}"}; do
+		li=$((li + 1))
+		next_dev
+		if [[ -z $dev_lower ]]; then
+			dev_lower=$NEXT_DEV
+		else
+			dev_lower="$dev_lower,$NEXT_DEV"
+		fi
+		add_drive "lower$li" "$f" true "$([[ $li == 1 ]] && echo true || echo false)"
+	done
+	next_dev
+	dev_upper=$NEXT_DEV
+	add_drive "upper" "$workspace_layer" false
+
+	# The rest are found by filesystem label once udev is up, so their device
+	# names do not matter - only their position in this list does.
+	next_dev
+	add_drive "src" "$src_drive" false
+	next_dev
+	add_drive "roconfig" "$CFG_DRIVE" true
+	next_dev
+	add_drive "control" "$ctl_drive" true
+	next_dev
+	add_drive "state" "$state_drive" false
+	local xi=0
+	for f in ${extra_drives+"${extra_drives[@]}"}; do
+		xi=$((xi + 1))
+		next_dev
+		add_drive "extra$xi" "$f" true
+	done
+
 	local boot_args="console=ttyS0 reboot=k panic=1 pci=off"
+	boot_args="$boot_args firellm.lower=$dev_lower firellm.upper=$dev_upper"
 	((QUIET_BOOT)) && boot_args="$boot_args quiet loglevel=3 systemd.show_status=false"
 
 	local cid=$((3 + ${NET_SLOT:-0}))
+	local drives_joined
+	drives_joined=$(printf '%s,\n    ' "${drive_json[@]}")
+	drives_joined=${drives_joined%,$'\n    '}
 	cat >"$JAIL_DIR/vm-config.json" <<EOF
 {
   "boot-source": {
     "kernel_image_path": "$(basename "$KERNEL")",
+    "initrd_path": "$(basename "$INITRD")",
     "boot_args": "$boot_args"
   },
   "drives": [
-    {"drive_id": "rootfs",   "path_on_host": "$(basename "$root_drive")", "is_root_device": true,  "is_read_only": false},
-    {"drive_id": "src",      "path_on_host": "$(basename "$src_drive")",  "is_root_device": false, "is_read_only": false},
-    {"drive_id": "roconfig", "path_on_host": "$(basename "$CFG_DRIVE")",  "is_root_device": false, "is_read_only": true},
-    {"drive_id": "control",  "path_on_host": "$(basename "$ctl_drive")",  "is_root_device": false, "is_read_only": true},
-    {"drive_id": "state",    "path_on_host": "$(basename "$state_drive")","is_root_device": false, "is_read_only": false}$extra_json
+    $drives_joined
   ],
   "machine-config": {"vcpu_count": $VCPU, "mem_size_mib": $MEM},
   "network-interfaces": $net_ifaces,
@@ -1608,8 +1701,8 @@ options (before the agent's own arguments):
   --workdir DIR   project to put in /src            (default: .)
   --exclude PAT   leave PAT out of /src, repeatable
   --all-files     include gitignored files too (they are left out by default)
-  --keep-root     keep this project's guest rootfs between runs, so packages
-                  the agent installs are still there next time
+  --fresh-root    throw away this workspace's layer and start from the base
+                  image again (packages it installed are lost)
   --add-dir DIR   extra host dir, read-only at /mnt/<name>, repeatable
   --host-port N   make the host's localhost:N reachable at localhost:N in the
                   guest, over vsock; repeatable. For a local llama-server or

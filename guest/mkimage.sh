@@ -32,6 +32,14 @@ mkfs.ext4 -q -F -L firellm-root -d "$STAGE" "$OUT.tmp"
 
 chown "$HOST_UID:$HOST_GID" "$OUT.tmp"
 mv -f "$OUT.tmp" "$OUT"
+
+# The initramfs that assembles the layered root. Built into this image, needed
+# on the host, so it comes out alongside the rootfs.
+if [ -f /firellm-initrd.gz ]; then
+	cp -f /firellm-initrd.gz "$(dirname "$OUT")/initrd.gz"
+	chown "$HOST_UID:$HOST_GID" "$(dirname "$OUT")/initrd.gz"
+	echo "[mkimage] wrote $(dirname "$OUT")/initrd.gz"
+fi
 rm -rf "$STAGE"
 
 echo "[mkimage] wrote $OUT"

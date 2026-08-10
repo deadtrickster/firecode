@@ -75,6 +75,22 @@ COPY systemd/firellm-mounts.service systemd/firellm-agent.service \
 	/etc/systemd/system/
 COPY mkimage.sh /usr/local/sbin/firellm-mkimage
 
+# An initramfs that assembles the root out of layers before handing over, so a
+# VM can share one read-only base image instead of getting a copy of it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	busybox-static cpio && rm -rf /var/lib/apt/lists/*
+COPY initramfs/init /usr/local/share/firellm-initrd-init
+RUN set -eux; \
+	d=$(mktemp -d); \
+	mkdir -p "$d/bin" "$d/proc" "$d/sys" "$d/dev" "$d/newroot"; \
+	cp /usr/bin/busybox "$d/bin/busybox"; \
+	cp /usr/local/share/firellm-initrd-init "$d/init"; \
+	chmod +x "$d/init" "$d/bin/busybox"; \
+	ln -sf busybox "$d/bin/sh"; \
+	(cd "$d" && find . | cpio -o -H newc --quiet | gzip -9) > /firellm-initrd.gz; \
+	rm -rf "$d"; \
+	ls -l /firellm-initrd.gz
+
 RUN chmod +x /opt/firellm/firellm-setup.sh /opt/firellm/agent-entrypoint.sh \
 	/usr/local/sbin/firellm-mkimage \
 	&& mkdir -p /src /opt/firellm/config /opt/firellm/run /var/lib/firellm
