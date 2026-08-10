@@ -1828,7 +1828,8 @@ firecode - run a coding agent in a Firecracker microVM
                                 with vm: naming the guest side
   firecode exec CMD [args...]    run any command in a VM over this directory
 
-  firecode list                  runs, and whether their drives still exist
+  firecode attach [project]      reattach to a running session
+  firecode list                  sessions, runs, and whether drives still exist
   firecode extract <id> [dest]   pull a run's /src back out
   firecode gc [keep]             drop old run drives (default: keep 5)
 
