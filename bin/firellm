@@ -6,7 +6,9 @@
 # copied back out to a sibling directory when the VM shuts down.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Resolved, so this still finds the repo when it is reached through a symlink
+# in ~/bin rather than by its real path.
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 IMAGES="$ROOT/images"
 GUEST="$ROOT/guest"
 SCRIPTS="$ROOT/scripts"

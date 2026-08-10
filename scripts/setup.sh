@@ -5,7 +5,7 @@
 # running a VM needs privileges, and only for the jailer and the tap device.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 IMAGES="$ROOT/images"
 VENDOR="$ROOT/vendor/bin"
 

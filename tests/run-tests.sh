@@ -11,7 +11,7 @@
 # shellcheck disable=SC2016  # single quotes are deliberate: these run in the guest
 set -uo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 FIRELLM="$ROOT/bin/firellm"
 WORK=$(mktemp -d /tmp/firellm-tests.XXXXXX)
 

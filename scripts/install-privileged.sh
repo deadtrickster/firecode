@@ -19,7 +19,7 @@
 #   sudo ./scripts/install-privileged.sh [--user NAME] [--uninstall]
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 JAILER="$ROOT/vendor/bin/jailer"
 SUDOERS=/etc/sudoers.d/firellm
 

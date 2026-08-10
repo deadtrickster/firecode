@@ -6,7 +6,7 @@
 # inside a throwaway container (which is root, so ownership survives).
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 IMAGES="$ROOT/images"
 GUEST="$ROOT/guest"
 
