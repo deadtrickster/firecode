@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""firellm-spawn - an MCP server that lets an agent inside a VM start more VMs.
+"""firecode-spawn - an MCP server that lets an agent inside a VM start more VMs.
 
-Firecracker exposes no virtualisation extensions to its guests, so a firellm
-VM can never run a firellm VM. This runs on the *host* instead: the guest
+Firecracker exposes no virtualisation extensions to its guests, so a firecode
+VM can never run a firecode VM. This runs on the *host* instead: the guest
 reaches it over the vsock relay (`--host-port`), and it starts siblings.
 
-    guest agent -> localhost:9770 -> vsock -> this -> firellm claude ...
+    guest agent -> localhost:9770 -> vsock -> this -> firecode claude ...
 
 That inverts the trust direction, so it is deliberately narrow:
 
@@ -32,10 +32,10 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "firellm-spawn", "version": "1.0.0"}
+SERVER_INFO = {"name": "firecode-spawn", "version": "1.0.0"}
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FIRELLM = os.path.join(ROOT, "bin", "firellm")
+FIRECODE = os.path.join(ROOT, "bin", "firecode")
 
 
 class Config:
@@ -94,7 +94,7 @@ class Runs:
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, run_id + ".log")
 
-            cmd = [FIRELLM, self.cfg.agent,
+            cmd = [FIRECODE, self.cfg.agent,
                    "--workdir", workdir,
                    "--timeout", str(int(timeout or self.cfg.default_timeout)),
                    "--no-mcp"]
@@ -369,7 +369,7 @@ def main(argv):
             config_path = args.pop(0)
         elif a in ("-h", "--help"):
             print(__doc__)
-            print("usage: firellm spawn-server [--port N] [--config FILE]")
+            print("usage: firecode spawn-server [--port N] [--config FILE]")
             return 0
         else:
             print(f"unknown option: {a}", file=sys.stderr)
@@ -391,7 +391,7 @@ def main(argv):
     print(f"[spawn] at most {cfg.max_concurrent} at once, "
           f"{cfg.max_total} in total")
     print("[spawn] reach it from a guest with: "
-          f"firellm claude --host-port {port} ...")
+          f"firecode claude --host-port {port} ...")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

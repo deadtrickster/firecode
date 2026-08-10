@@ -1,5 +1,5 @@
 #!/bin/busybox sh
-# firellm initramfs: assemble the root filesystem out of layers, then hand over.
+# firecode initramfs: assemble the root filesystem out of layers, then hand over.
 #
 # The guest root is not one disk. It is an overlay:
 #
@@ -14,14 +14,14 @@
 # so what it installs is still there next time.
 #
 # Kernel command line:
-#   firellm.lower=/dev/vda[,/dev/vdb...]   read-only layers, highest first
-#   firellm.upper=/dev/vdc                 the writable layer
+#   firecode.lower=/dev/vda[,/dev/vdb...]   read-only layers, highest first
+#   firecode.upper=/dev/vdc                 the writable layer
 set -u
 
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
-say() { echo "[firellm-initrd] $*"; }
+say() { echo "[firecode-initrd] $*"; }
 
 fail() {
 	say "ERROR: $*"
@@ -38,13 +38,13 @@ lower=""
 upper=""
 for arg in $(cat /proc/cmdline); do
 	case "$arg" in
-	firellm.lower=*) lower=${arg#firellm.lower=} ;;
-	firellm.upper=*) upper=${arg#firellm.upper=} ;;
+	firecode.lower=*) lower=${arg#firecode.lower=} ;;
+	firecode.upper=*) upper=${arg#firecode.upper=} ;;
 	esac
 done
 
-[ -n "$lower" ] || fail "no firellm.lower on the kernel command line"
-[ -n "$upper" ] || fail "no firellm.upper on the kernel command line"
+[ -n "$lower" ] || fail "no firecode.lower on the kernel command line"
+[ -n "$upper" ] || fail "no firecode.upper on the kernel command line"
 
 # Mount each read-only layer. The order given is the order overlayfs wants:
 # leftmost wins, so the project's layer comes before the base image.
@@ -77,8 +77,8 @@ done
 
 # The layers have to come along, or the running system cannot see the
 # filesystems its own root is built from.
-/bin/busybox mkdir -p /newroot/run/firellm/base /newroot/run/firellm/upper
-/bin/busybox mount --move /upper /newroot/run/firellm/upper 2>/dev/null || true
+/bin/busybox mkdir -p /newroot/run/firecode/base /newroot/run/firecode/upper
+/bin/busybox mount --move /upper /newroot/run/firecode/upper 2>/dev/null || true
 
 /bin/busybox mount --move /dev /newroot/dev 2>/dev/null || true
 /bin/busybox umount /proc 2>/dev/null || true

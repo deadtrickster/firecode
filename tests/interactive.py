@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Drive an interactive firellm session through a pty.
+"""Drive an interactive firecode session through a pty.
 
-`firellm shell` hands the guest's serial console to the terminal, so nothing
+`firecode shell` hands the guest's serial console to the terminal, so nothing
 in the normal test suite touches it - a pipe is not a tty and the whole path
 behaves differently. This is the expect script, without needing expect.
 
-usage: interactive.py <project-dir> [firellm-path]
+usage: interactive.py <project-dir> [firecode-path]
 exits 0 if the session behaved, 1 with a reason if not.
 """
 
@@ -89,14 +89,14 @@ class Session:
 
 def main():
     project = sys.argv[1]
-    firellm = sys.argv[2] if len(sys.argv) > 2 else "firellm"
+    firecode = sys.argv[2] if len(sys.argv) > 2 else "firecode"
 
-    s = Session([firellm, "shell", "--no-jail", "--no-net"], project)
+    s = Session([firecode, "shell", "--no-jail", "--no-net"], project)
 
-    s.expect(r"firellm microVM", what="the guest banner")
+    s.expect(r"firecode microVM", what="the guest banner")
     print("  ok    the banner appears on the console")
 
-    s.expect(r"@firellm:[^\r\n]*[$#]", what="a shell prompt")
+    s.expect(r"@firecode:[^\r\n]*[$#]", what="a shell prompt")
     print("  ok    an interactive shell is waiting")
 
     s.send("id -un; pwd")
@@ -116,9 +116,9 @@ def main():
 
     code = s.wait()
     if code != 0:
-        print(f"  FAIL  firellm exited {code}")
+        print(f"  FAIL  firecode exited {code}")
         return 1
-    print("  ok    firellm exits cleanly")
+    print("  ok    firecode exits cleanly")
 
     if "result:" not in s.buf:
         print("  FAIL  no result directory was reported")

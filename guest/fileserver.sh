@@ -15,8 +15,8 @@
 set -u
 
 # shellcheck source=/dev/null
-[[ -f /opt/firellm/run/env ]] && . /opt/firellm/run/env
-RUN_USER=${FIRELLM_USER:-root}
+[[ -f /opt/firecode/run/env ]] && . /opt/firecode/run/env
+RUN_USER=${FIRECODE_USER:-root}
 
 read -r verb path || exit 1
 # Strip the carriage return a line-oriented sender may have added.

@@ -1,6 +1,6 @@
-# firellm guest rootfs.
+# firecode guest rootfs.
 #
-# Built with Docker so `firellm prepare` needs no root on the host: the
+# Built with Docker so `firecode prepare` needs no root on the host: the
 # container is exported and converted to an ext4 image with `mkfs.ext4 -d`.
 #
 # The agent binaries (claude, opencode) are deliberately NOT installed here.
@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
 # lean = boots fast, enough for most work. full = adds rust/go/zig/llvm/sbcl.
-ARG FIRELLM_TOOLCHAINS=lean
+ARG FIRECODE_TOOLCHAINS=lean
 
 # Init system and the pieces the guest setup relies on. udev is what gives us
 # /dev/disk/by-label, which is how the drives are found regardless of the
@@ -44,7 +44,7 @@ RUN curl -fsSL https://bun.sh/install | bash \
 
 # Optional heavy toolchains. Skipped by default: they roughly quadruple both
 # the build time and the image size.
-RUN if [ "$FIRELLM_TOOLCHAINS" = "full" ]; then \
+RUN if [ "$FIRECODE_TOOLCHAINS" = "full" ]; then \
 	set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends clang clang-tools lld llvm sbcl; \
@@ -69,38 +69,38 @@ RUN curl -fsSL https://mise.run | sh \
 	&& ln -sf /root/.local/bin/mise /usr/local/bin/mise
 
 # ---------------------------------------------------------------- guest bits
-COPY firellm-setup.sh agent-entrypoint.sh profile.sh /opt/firellm/
-COPY firellm-context.md /opt/firellm/
-COPY systemd/firellm-mounts.service systemd/firellm-agent.service \
+COPY firecode-setup.sh agent-entrypoint.sh profile.sh /opt/firecode/
+COPY firecode-context.md /opt/firecode/
+COPY systemd/firecode-mounts.service systemd/firecode-agent.service \
 	/etc/systemd/system/
-COPY mkimage.sh /usr/local/sbin/firellm-mkimage
+COPY mkimage.sh /usr/local/sbin/firecode-mkimage
 
 # An initramfs that assembles the root out of layers before handing over, so a
 # VM can share one read-only base image instead of getting a copy of it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	busybox-static cpio && rm -rf /var/lib/apt/lists/*
-COPY initramfs/init /usr/local/share/firellm-initrd-init
+COPY initramfs/init /usr/local/share/firecode-initrd-init
 RUN set -eux; \
 	d=$(mktemp -d); \
 	mkdir -p "$d/bin" "$d/proc" "$d/sys" "$d/dev" "$d/newroot"; \
 	cp /usr/bin/busybox "$d/bin/busybox"; \
-	cp /usr/local/share/firellm-initrd-init "$d/init"; \
+	cp /usr/local/share/firecode-initrd-init "$d/init"; \
 	chmod +x "$d/init" "$d/bin/busybox"; \
 	ln -sf busybox "$d/bin/sh"; \
-	(cd "$d" && find . | cpio -o -H newc --quiet | gzip -9) > /firellm-initrd.gz; \
+	(cd "$d" && find . | cpio -o -H newc --quiet | gzip -9) > /firecode-initrd.gz; \
 	rm -rf "$d"; \
-	ls -l /firellm-initrd.gz
+	ls -l /firecode-initrd.gz
 
-RUN chmod +x /opt/firellm/firellm-setup.sh /opt/firellm/agent-entrypoint.sh \
-	/usr/local/sbin/firellm-mkimage \
-	&& mkdir -p /src /opt/firellm/config /opt/firellm/run /var/lib/firellm
+RUN chmod +x /opt/firecode/firecode-setup.sh /opt/firecode/agent-entrypoint.sh \
+	/usr/local/sbin/firecode-mkimage \
+	&& mkdir -p /src /opt/firecode/config /opt/firecode/run /var/lib/firecode
 
 # systemctl cannot enable units in a container, so link the wants by hand.
 RUN mkdir -p /etc/systemd/system/multi-user.target.wants \
-	&& ln -sf /etc/systemd/system/firellm-mounts.service \
-	/etc/systemd/system/multi-user.target.wants/firellm-mounts.service \
-	&& ln -sf /etc/systemd/system/firellm-agent.service \
-	/etc/systemd/system/multi-user.target.wants/firellm-agent.service
+	&& ln -sf /etc/systemd/system/firecode-mounts.service \
+	/etc/systemd/system/multi-user.target.wants/firecode-mounts.service \
+	&& ln -sf /etc/systemd/system/firecode-agent.service \
+	/etc/systemd/system/multi-user.target.wants/firecode-agent.service
 
 # Autologin root on the serial console, for interactive sessions.
 RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d \
@@ -111,8 +111,8 @@ RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d \
 	> /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf \
 	&& passwd -d root \
 	&& printf '%s\n' \
-	'# firellm' \
-	'[ -f /opt/firellm/profile.sh ] && . /opt/firellm/profile.sh' \
+	'# firecode' \
+	'[ -f /opt/firecode/profile.sh ] && . /opt/firecode/profile.sh' \
 	> /root/.bash_profile
 
 # Units that either hang without real hardware or fight with our own setup.
@@ -135,14 +135,14 @@ RUN systemctl mask \
 # /etc/resolv.conf, /etc/hosts and /etc/hostname are deliberately left alone:
 # Docker bind-mounts them during a build, so they cannot be replaced here and
 # edits to them are not committed to the image. The guest writes them itself
-# at boot, in firellm-setup.sh.
+# at boot, in firecode-setup.sh.
 RUN : > /etc/machine-id \
-	&& printf '# firellm mounts its drives from firellm-setup.sh, by label\n' \
+	&& printf '# firecode mounts its drives from firecode-setup.sh, by label\n' \
 	> /etc/fstab
 
 RUN printf '%s\n' \
 	'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-	'FIRELLM=1' \
+	'FIRECODE=1' \
 	'IS_SANDBOX=1' \
 	> /etc/environment
 

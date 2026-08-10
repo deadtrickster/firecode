@@ -1,12 +1,13 @@
-# firellm
+# firecode
 
 Run a coding agent inside a Firecracker microVM, so you can walk away from it.
 
 ```sh
-firellm claude "port the parser to the new AST and make the tests pass"
+firecode claude "port the parser to the new AST and make the tests pass"
 ```
 
-The agent gets root, the network, and your project at `/src`. It does not get
+The agent gets root, the network, and your project - at the same path it has
+here. It does not get
 your host: no host filesystem, no host processes, no host devices. It runs with
 permission checks off, because there is nothing in there worth protecting.
 When it finishes, the VM powers off and the work is copied out to a sibling
@@ -18,17 +19,17 @@ Needs Linux with KVM, docker (for building the guest image), and e2fsprogs.
 
 ```sh
 sudo usermod -aG kvm,docker "$USER"   # then log back in
-git clone ... firellm && cd firellm
+git clone ... firecode && cd firecode
 
-./bin/firellm setup      # firecracker + jailer + guest kernel, no root
-./bin/firellm prepare    # build the guest rootfs via docker, no root
-./bin/firellm doctor     # check everything is in place
+./bin/firecode setup      # firecracker + jailer + guest kernel, no root
+./bin/firecode prepare    # build the guest rootfs via docker, no root
+./bin/firecode doctor     # check everything is in place
 ```
 
 Two things need root. Networking needs it once:
 
 ```sh
-sudo ./bin/firellm net-setup --count 4
+sudo ./bin/firecode net-setup --count 4
 ```
 
 That leaves persistent tap devices behind that belong to you, so no run needs
@@ -48,7 +49,7 @@ prompt. Set `SUDO_ASKPASS` to an askpass helper and it will ask on the desktop
 instead:
 
 ```sh
-SUDO_ASKPASS=/usr/bin/ksshaskpass firellm claude "..."
+SUDO_ASKPASS=/usr/bin/ksshaskpass firecode claude "..."
 ```
 
 ## What it protects against
@@ -68,17 +69,17 @@ credentials, because otherwise it cannot work.
 ```sh
 cd ~/Projects/thing
 
-firellm claude "add tests for the parser"        # unattended, shuts down when done
-firellm claude --timeout 3600 "big refactor"     # give up after an hour
-firellm opencode "fix the failing build"
-firellm shell                                    # poke around inside by hand
-firellm exec make -j8                            # run any command in the sandbox
+firecode claude "add tests for the parser"        # unattended, shuts down when done
+firecode claude --timeout 3600 "big refactor"     # give up after an hour
+firecode opencode "fix the failing build"
+firecode shell                                    # poke around inside by hand
+firecode exec make -j8                            # run any command in the sandbox
 ```
 
 Anything after `--` goes to the agent untouched:
 
 ```sh
-firellm claude -- -p "review the diff" --model opus --output-format stream-json
+firecode claude -- -p "review the diff" --model opus --output-format stream-json
 ```
 
 Results land next to the project:
@@ -96,11 +97,11 @@ The agent's home directory lives on a per-project drive that outlives the VM,
 so a second run can pick up where the first stopped:
 
 ```sh
-firellm claude "start the refactor"
-firellm claude --continue "now do the tests too"
+firecode claude "start the refactor"
+firecode claude --continue "now do the tests too"
 
-firellm state sessions                       # session ids you can resume
-firellm claude --resume 3f9a1c2e "and the docs"
+firecode state sessions                       # session ids you can resume
+firecode claude --resume 3f9a1c2e "and the docs"
 ```
 
 `--continue` and `--resume` also carry the **working tree** forward, not just
@@ -110,13 +111,14 @@ the agent it had already made changes that were not there. `--fresh` opts out.
 A session you started on the host can be moved in and continued unattended:
 
 ```sh
-firellm claude --import-sessions --resume <session-id> "carry on without me"
+firecode claude --import-sessions --resume <session-id> "carry on without me"
 ```
 
-That copies this project's host transcripts onto the state drive and rewrites
-every reference to the host path to `/src`, which is where the project lives in
-the guest. Your host transcripts are only read, never modified. It happens
-automatically the first time you continue a project in a VM.
+That copies this project's host transcripts onto the state drive. Nothing is
+rewritten, because the project has the same path on both sides - which is the
+main reason it has the same path. Your host transcripts are only read, never
+modified. It happens automatically the first time you continue a project in a
+VM.
 
 ## Reaching things on the host
 
@@ -126,7 +128,7 @@ loopback needs naming:
 
 ```sh
 # local llama-server on 127.0.0.1:18080, OpenAI-compatible
-firellm claude --host-port 18080 "..."
+firecode claude --host-port 18080 "..."
 ```
 
 Inside the guest that is `http://localhost:18080/v1`, with no config rewriting
@@ -137,21 +139,21 @@ named.
 Extra context that is not the project itself goes in read-only:
 
 ```sh
-firellm claude --add-dir ~/Projects "match the API the sibling repo uses"
+firecode claude --add-dir ~/Projects "match the API the sibling repo uses"
 ```
 
 Those are copies. The guest can read them; nothing written there goes back out.
-The only thing that ever comes back is `/src`.
+The only thing that ever comes back is the project itself.
 
 ## Reaching a server the agent started
 
 Your host is the other end of the guest's link, so anything it serves is
-reachable directly - no forwarding, no configuration. firellm prints the
+reachable directly - no forwarding, no configuration. firecode prints the
 address when the VM starts:
 
 ```
-[firellm] guest is 172.16.1.2 - a server it starts on PORT is at
-[firellm]   http://172.16.1.2:PORT
+[firecode] guest is 172.16.1.2 - a server it starts on PORT is at
+[firecode]   http://172.16.1.2:PORT
 ```
 
 So a dev server on 3000 inside is `http://172.16.1.2:3000` in your browser.
@@ -164,8 +166,8 @@ and no 9p, deliberately - so there is no shared folder to be had. What there
 is, is vsock:
 
 ```sh
-firellm cp vm:/src/dist ./dist        # out of a running VM
-firellm cp ./logo.png vm:/src/assets  # into one
+firecode cp vm:~/Projects/thing/dist ./dist   # out of a running VM
+firecode cp ./logo.png vm:~/Projects/thing/assets  # into one
 ```
 
 Files and directories, in either direction, while the VM is running. Ordinary
@@ -185,10 +187,10 @@ A project's VM state is three drives: the agent's home (sessions), the working
 tree, and the rootfs. `snapshot` captures all three together.
 
 ```sh
-firellm snapshot before-the-refactor
-firellm snapshot ls
-firellm snapshot restore before-the-refactor
-firellm snapshot rm before-the-refactor
+firecode snapshot before-the-refactor
+firecode snapshot ls
+firecode snapshot restore before-the-refactor
+firecode snapshot rm before-the-refactor
 ```
 
 Restoring puts the next run back exactly where the snapshot was taken: same
@@ -206,15 +208,15 @@ packages the agent installed has to be downloaded again next time. For a
 project that needs a toolchain the image does not carry:
 
 ```sh
-firellm claude --keep-root "build and test it"
+firecode claude --keep-root "build and test it"
 ```
 
 That keeps this project's rootfs between runs, so the second run starts with
-whatever the first one installed. `firellm state reset` throws it away again,
+whatever the first one installed. `firecode state reset` throws it away again,
 and a run without the flag still gets a clean one.
 
 For something you want in every project, put it in the image instead - edit
-`guest/Dockerfile` and `firellm prepare --force`. `--full` already adds rust,
+`guest/Dockerfile` and `firecode prepare --force`. `--full` already adds rust,
 go, zig, clang/llvm and sbcl.
 
 ## Commits
@@ -230,16 +232,16 @@ device order:
 
 | label | mount | contents |
 | --- | --- | --- |
-| `firellm-root` | `/` | per-run sparse copy of the guest image, thrown away after |
-| `firellm-src` | the project's host path | your project, writable, copied back out |
-| `firellm-cfg` | `/opt/firellm/config` | read-only: agent binaries and host config |
-| `firellm-ctl` | `/opt/firellm/run` | read-only: this run's parameters and guest scripts |
-| `firellm-state` | `/var/lib/firellm` | per-project agent home, survives the VM |
-| `firellm-x*` | their host paths | read-only: whatever `--add-dir` asked for |
+| `firecode-root` | `/` | per-run sparse copy of the guest image, thrown away after |
+| `firecode-src` | the project's host path | your project, writable, copied back out |
+| `firecode-cfg` | `/opt/firecode/config` | read-only: agent binaries and host config |
+| `firecode-ctl` | `/opt/firecode/run` | read-only: this run's parameters and guest scripts |
+| `firecode-state` | `/var/lib/firecode` | per-project agent home, survives the VM |
+| `firecode-x*` | their host paths | read-only: whatever `--add-dir` asked for |
 
-Inside the guest, `firellm-mounts.service` mounts those, brings up the network,
+Inside the guest, `firecode-mounts.service` mounts those, brings up the network,
 starts the MCP relays and layers `~/.claude` and `~/.opencode` as writable
-overlays on the read-only config drive. Then `firellm-agent.service` runs the
+overlays on the read-only config drive. Then `firecode-agent.service` runs the
 agent on the serial console and powers off when it returns.
 
 Images are built and read without root: `mkfs.ext4 -d` writes an image straight
@@ -253,17 +255,17 @@ Three things reach the model, and only these:
 
 - your host `~/.claude/CLAUDE.md`, unchanged - your own rules travel with it
 - the project's own `CLAUDE.md`, if it has one
-- a firellm section appended to the first, saying where it is: that it has
+- a firecode section appended to the first, saying where it is: that it has
   root and should stop asking, that the project leaves through a sibling
   directory, that installs persist in the workspace layer, that stdio MCP
   servers are absent while http ones are relayed, that there is no `gh` and no
   ssh key
 
 That last one has to be appended to `CLAUDE.md` because that is a file the
-agent reads. It used to be written to `~/FIRELLM.md`, which nothing opens - so
+agent reads. It used to be written to `~/FIRECODE.md`, which nothing opens - so
 the agent had no idea it was in a VM, and behaved like it was on your laptop.
 
-`FIRELLM=1` and `IS_SANDBOX=1` are in the environment for anything that wants
+`FIRECODE=1` and `IS_SANDBOX=1` are in the environment for anything that wants
 to detect the sandbox.
 
 ### Agents
@@ -299,7 +301,7 @@ enough. `--no-net` gives you a VM with no network at all; MCP still works,
 since vsock is not networking.
 
 DNS in the guest is 1.1.1.1 and 8.8.8.8. If you need a private resolver, edit
-`FIRELLM_DNS` in `bin/firellm`.
+`FIRECODE_DNS` in `bin/firecode`.
 
 ### Resource limits
 
@@ -310,15 +312,15 @@ and off by default because cgroup delegation is fiddly on systemd hosts.
 
 ## Spawning more VMs
 
-Firecracker exposes no virtualization extensions to its guests, so a firellm
-VM can never run a firellm VM. What it can do is ask the host to start a
+Firecracker exposes no virtualization extensions to its guests, so a firecode
+VM can never run a firecode VM. What it can do is ask the host to start a
 *sibling*, through an MCP server that runs on the host and is reached over the
 same vsock relay as everything else:
 
 ```sh
 cp mcp/spawn.example.json spawn.json    # list the projects that may be spawned for
-firellm spawn-server                    # host side, listens on 127.0.0.1:9770
-firellm claude --host-port 9770 "farm this out across the sub-projects"
+firecode spawn-server                    # host side, listens on 127.0.0.1:9770
+firecode claude --host-port 9770 "farm this out across the sub-projects"
 ```
 
 Tools: `list_projects`, `spawn`, `status`, `output`, `cancel`.
@@ -332,9 +334,9 @@ the server and spawn in turn. Concurrency and total runs are capped.
 ## Tests
 
 ```sh
-firellm test           # everything, boots VMs, a few minutes
-firellm test --quick   # host-side only, seconds
-firellm test denylist  # one by name
+firecode test           # everything, boots VMs, a few minutes
+firecode test --quick   # host-side only, seconds
+firecode test denylist  # one by name
 ```
 
 They run with `--no-jail --no-net`, so no privileges are needed. What they pin
@@ -357,13 +359,13 @@ down, in rough order of how much it would hurt to get wrong:
 ## Housekeeping
 
 ```sh
-firellm list             # what has run
-firellm extract <id>     # pull a run's /src back out (if --keep was used)
-firellm gc               # drop old run drives, keep the last 5
+firecode list             # what has run
+firecode extract <id>     # pull a run's project back out (if --keep was used)
+firecode gc               # drop old run drives, keep the last 5
 
-firellm state list       # per-project agent state drives
-firellm state sessions   # resumable session ids for this project
-firellm state reset      # forget this project's agent history and tree
+firecode state list       # per-project agent state drives
+firecode state sessions   # resumable session ids for this project
+firecode state reset      # forget this project's agent history and tree
 ```
 
 Per-run drives are deleted when the VM exits unless you pass `--keep`. Console
@@ -381,7 +383,7 @@ unprivileged. Only two things need root: the jailer, and creating the tap
 device. `--no-jail` skips the first and `--no-net` removes the second, so
 
 ```sh
-firellm claude --no-jail --no-net --host-port 18080 "..."
+firecode claude --no-jail --no-net --host-port 18080 "..."
 ```
 
 needs no privileges at all. That is still a real KVM guest with its own kernel

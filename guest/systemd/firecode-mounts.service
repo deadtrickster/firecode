@@ -1,13 +1,13 @@
 [Unit]
-Description=firellm guest setup (drives, network, MCP relays)
+Description=firecode guest setup (drives, network, MCP relays)
 After=systemd-udevd.service local-fs.target
 Wants=systemd-udevd.service
-Before=firellm-agent.service serial-getty@ttyS0.service
+Before=firecode-agent.service serial-getty@ttyS0.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/opt/firellm/firellm-setup.sh
+ExecStart=/opt/firecode/firecode-setup.sh
 StandardOutput=journal+console
 StandardError=journal+console
 

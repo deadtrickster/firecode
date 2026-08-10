@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# firellm - run a coding agent inside a Firecracker microVM, under the jailer.
+# firecode - run a coding agent inside a Firecracker microVM, under the jailer.
 #
 # The agent gets root, the network and your project. It does not get your
 # host: no host filesystem, no host processes, no host devices. Work is
@@ -22,11 +22,11 @@ JAILER="$VENDOR/jailer"
 
 # Where the host agents keep their configuration. Overridable mostly so the
 # harness can be exercised against a throwaway copy.
-CLAUDE_HOME="${FIRELLM_CLAUDE_HOME:-$HOME/.claude}"
-CLAUDE_CONF="${FIRELLM_CLAUDE_CONF:-$HOME/.claude.json}"
-OPENCODE_HOME="${FIRELLM_OPENCODE_HOME:-$HOME/.opencode}"
-OPENCODE_SHARE="${FIRELLM_OPENCODE_SHARE:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
-OPENCODE_CONF="${FIRELLM_OPENCODE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+CLAUDE_HOME="${FIRECODE_CLAUDE_HOME:-$HOME/.claude}"
+CLAUDE_CONF="${FIRECODE_CLAUDE_CONF:-$HOME/.claude.json}"
+OPENCODE_HOME="${FIRECODE_OPENCODE_HOME:-$HOME/.opencode}"
+OPENCODE_SHARE="${FIRECODE_OPENCODE_SHARE:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
+OPENCODE_CONF="${FIRECODE_OPENCODE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
 
 # Defaults. Claude Code alone wants ~1.5G, so 1G was never going to work.
 MEM=4096
@@ -67,14 +67,14 @@ SENSITIVE_HOME_DIRS=(
 
 # Your own list, one path or glob per line, # for comments. For work that
 # must never end up on a VM drive - client code, anything under NDA.
-DENY_FILE="${FIRELLM_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/never-share}"
+DENY_FILE="${FIRECODE_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firecode/never-share}"
 
 # Host loopback ports every run should be able to reach, one per line.
-PORTS_FILE="${FIRELLM_PORTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/host-ports}"
+PORTS_FILE="${FIRECODE_PORTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firecode/host-ports}"
 
 # Guest vsock port the interactive session listens on.
-CONSOLE_PORT=${FIRELLM_CONSOLE_PORT:-1024}
-FILES_PORT=${FIRELLM_FILES_PORT:-1025}
+CONSOLE_PORT=${FIRECODE_CONSOLE_PORT:-1024}
+FILES_PORT=${FIRECODE_FILES_PORT:-1025}
 
 refuse_if_sensitive() {
 	local path=$1 rel full line
@@ -100,9 +100,9 @@ refuse_if_sensitive() {
 	done <"$DENY_FILE"
 }
 
-log() { echo "[firellm] $*" >&2; }
+log() { echo "[firecode] $*" >&2; }
 die() {
-	echo "[firellm] error: $*" >&2
+	echo "[firecode] error: $*" >&2
 	exit 1
 }
 
@@ -147,21 +147,21 @@ ROOTFS=""
 INITRD=""
 
 resolve_assets() {
-	[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firellm setup"
+	[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firecode setup"
 
 	local k
 	k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -type f | sort -V | tail -1)
-	[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firellm setup"
+	[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
 	KERNEL=$k
 
 	# Explicitly the prepared image. Do not glob and take the first match:
 	# that is how this used to silently boot the untouched base image.
-	ROOTFS="$IMAGES/agent-firellm.ext4"
-	[[ -f $ROOTFS ]] || die "no guest rootfs - run: firellm prepare"
+	ROOTFS="$IMAGES/agent-firecode.ext4"
+	[[ -f $ROOTFS ]] || die "no guest rootfs - run: firecode prepare"
 
 	# Assembles the layered root before handing over to the guest's init.
 	INITRD="$IMAGES/initrd.gz"
-	[[ -f $INITRD ]] || die "no initrd - rebuild with: firellm prepare --force"
+	[[ -f $INITRD ]] || die "no initrd - rebuild with: firecode prepare --force"
 }
 
 # ---------------------------------------------------------------- host MCP
@@ -410,11 +410,11 @@ build_config_drive() {
 	# agent had no idea it was in a VM at all: not that it can install
 	# whatever it likes, not that its work leaves through a sibling
 	# directory, not that half the MCP servers it expects are absent.
-	if [[ -f $GUEST/firellm-context.md ]]; then
+	if [[ -f $GUEST/firecode-context.md ]]; then
 		{
 			[[ -f $stage/claude/CLAUDE.md ]] && cat "$stage/claude/CLAUDE.md"
 			echo
-			cat "$GUEST/firellm-context.md"
+			cat "$GUEST/firecode-context.md"
 		} >"$stage/claude/CLAUDE.md.new"
 		mv -f "$stage/claude/CLAUDE.md.new" "$stage/claude/CLAUDE.md"
 	fi
@@ -433,7 +433,7 @@ except Exception:
 if d.pop("hooks", None) is not None:
     with open(p, "w") as fh:
         json.dump(d, fh, indent=2)
-    print("[firellm]   dropped hooks from settings (they point at host paths)",
+    print("[firecode]   dropped hooks from settings (they point at host paths)",
           file=sys.stderr)
 PY
 	fi
@@ -460,10 +460,10 @@ if isinstance(servers, dict):
             dropped.append(name)
     d["mcpServers"] = kept
     if dropped:
-        print("[firellm]   MCP unavailable in guest (host stdio binaries): "
+        print("[firecode]   MCP unavailable in guest (host stdio binaries): "
               + ", ".join(dropped), file=sys.stderr)
     if kept:
-        print("[firellm]   MCP relayed over vsock: " + ", ".join(kept),
+        print("[firecode]   MCP relayed over vsock: " + ", ".join(kept),
               file=sys.stderr)
 
 d["hasCompletedOnboarding"] = True
@@ -477,7 +477,7 @@ PY
 	size=$(size_ro_dir "$stage")
 	# Built beside the real one and moved into place, so a run that is already
 	# using the old drive never sees a half-written file.
-	mkimage_from_dir "$stage" "$CFG_DRIVE.$BASHPID" firellm-cfg "$size"
+	mkimage_from_dir "$stage" "$CFG_DRIVE.$BASHPID" firecode-cfg "$size"
 	mv -f "$CFG_DRIVE.$BASHPID" "$CFG_DRIVE"
 	rm -rf "$stage"
 	echo "$want" >"$CFG_STAMP"
@@ -517,8 +517,8 @@ ensure_state_drive() {
 		local seed
 		seed=$(mktemp -d)
 		mkdir -p "$seed/upper" "$seed/work"
-		size=${FIRELLM_STATE_SIZE:-$((3 * 1024 * 1024 * 1024))}
-		mkimage_from_dir "$seed" "$img" firellm-state "$size"
+		size=${FIRECODE_STATE_SIZE:-$((3 * 1024 * 1024 * 1024))}
+		mkimage_from_dir "$seed" "$img" firecode-state "$size"
 		rm -rf "$seed"
 		log "new agent state drive for this project: $(basename "$img")"
 	fi
@@ -590,7 +590,7 @@ import_host_sessions() {
 		return 0
 	fi
 
-	mkimage_from_dir "$tmp" "$img.new" firellm-state "$size"
+	mkimage_from_dir "$tmp" "$img.new" firecode-state "$size"
 	mv -f "$img.new" "$img"
 	rm -rf "$tmp"
 	log "imported $n host session(s), resumable at their original paths"
@@ -616,7 +616,7 @@ ensure_layer() {
 		seed=$(mktemp -d)
 		mkdir -p "$seed/upper" "$seed/work"
 		mkimage_from_dir "$seed" "$img" "fl-layer" \
-			"${FIRELLM_LAYER_SIZE:-$((16 * 1024 * 1024 * 1024))}"
+			"${FIRECODE_LAYER_SIZE:-$((16 * 1024 * 1024 * 1024))}"
 		rm -rf "$seed"
 	fi
 	echo "$img"
@@ -634,7 +634,7 @@ snapshot_parts() {
 # directory into a guest, so this streams a tar over vsock instead.
 cmd_cp() {
 	local src=${1:-} dst=${2:-}
-	[[ -n $src && -n $dst ]] || die "usage: firellm cp <src> <dst>   (vm:/path for the guest side)"
+	[[ -n $src && -n $dst ]] || die "usage: firecode cp <src> <dst>   (vm:/path for the guest side)"
 
 	# Whichever VM is running right now. One at a time is the common case; be
 	# explicit about it rather than guessing between several.
@@ -693,7 +693,7 @@ cmd_snapshot() {
 		}
 		printf '%s\n' "$dir" >"$dest/project"
 		log "snapshot $name: $n drive(s), $(du -sh "$dest" | cut -f1) on disk"
-		echo "  restore with:  firellm snapshot restore $name"
+		echo "  restore with:  firecode snapshot restore $name"
 		;;
 	ls | list)
 		if ! compgen -G "$base/*" >/dev/null; then
@@ -709,7 +709,7 @@ cmd_snapshot() {
 		;;
 	restore)
 		local name=${1:-}
-		[[ -n $name ]] || die "usage: firellm snapshot restore <name>"
+		[[ -n $name ]] || die "usage: firecode snapshot restore <name>"
 		local src="$base/$name"
 		[[ -d $src ]] || die "no snapshot $name for $dir"
 		# Refuse while a run holds the project, or we would be swapping the
@@ -733,12 +733,12 @@ cmd_snapshot() {
 		;;
 	rm)
 		local name=${1:-}
-		[[ -n $name ]] || die "usage: firellm snapshot rm <name>"
+		[[ -n $name ]] || die "usage: firecode snapshot rm <name>"
 		[[ -d $base/$name ]] || die "no snapshot $name for $dir"
 		rm -rf "${base:?}/${name:?}"
 		log "removed snapshot $name"
 		;;
-	*) die "usage: firellm snapshot [take [name]|ls|restore <name>|rm <name>]" ;;
+	*) die "usage: firecode snapshot [take [name]|ls|restore <name>|rm <name>]" ;;
 	esac
 }
 
@@ -772,7 +772,7 @@ cmd_state() {
 			done < <(find "$tmp/projects" -name '*.jsonl' -printf '%T@ %p\n' |
 				sort -n | cut -d' ' -f2-)
 			echo
-			echo "resume with:  firellm claude --resume <id> 'next thing'"
+			echo "resume with:  firecode claude --resume <id> 'next thing'"
 		else
 			echo "no sessions recorded for $dir yet"
 		fi
@@ -787,7 +787,7 @@ cmd_state() {
 		log "removed this project's agent home, working tree and rootfs"
 		;;
 	*)
-		die "usage: firellm state [list|sessions [dir]|reset [dir]]"
+		die "usage: firecode state [list|sessions [dir]|reset [dir]]"
 		;;
 	esac
 }
@@ -815,8 +815,8 @@ alloc_net_slot() {
 			exec {fd}>&-
 			continue
 		fi
-		# The lock says no live firellm holds this slot, which is not the same
-		# as the tap being free: a VM outlives a firellm that was killed
+		# The lock says no live firecode holds this slot, which is not the same
+		# as the tap being free: a VM outlives a firecode that was killed
 		# rather than asked to stop, and it keeps the device open. A tap with
 		# a process attached has carrier; an idle one does not.
 		if [[ $(cat "/sys/class/net/fcllm$s/carrier" 2>/dev/null || echo 0) == 1 ]]; then
@@ -906,7 +906,7 @@ cmd_net_setup() {
 			done
 			return 0
 			;;
-		*) die "usage: firellm net-setup [--count N] [--teardown]" ;;
+		*) die "usage: firecode net-setup [--count N] [--teardown]" ;;
 		esac
 	done
 
@@ -921,7 +921,7 @@ cmd_net_setup() {
 	done
 	echo
 	echo "  $count VMs can now have a network without any further privileges."
-	echo "  Undo with: firellm net-setup --teardown"
+	echo "  Undo with: firecode net-setup --teardown"
 }
 
 # ---------------------------------------------------------------- MCP relay
@@ -1148,7 +1148,7 @@ launch() {
 			;;
 		--)
 			shift
-			# With `firellm exec ... -- cmd args`, the command itself is the
+			# With `firecode exec ... -- cmd args`, the command itself is the
 			# first thing after the separator.
 			if [[ -z $AGENT && $# -gt 0 ]]; then
 				AGENT="$1"
@@ -1158,8 +1158,8 @@ launch() {
 			break
 			;;
 		*)
-			# `firellm exec` passes an empty agent so that the first thing
-			# that is not a firellm option becomes the command to run.
+			# `firecode exec` passes an empty agent so that the first thing
+			# that is not a firecode option becomes the command to run.
 			if [[ -z $AGENT ]]; then
 				AGENT="$1"
 			else
@@ -1210,7 +1210,7 @@ launch() {
 	local id
 	# BASHPID, not $$: in a subshell $$ is still the parent's pid, so two runs
 	# launched together from one shell would collide on the same run id.
-	id="firellm-$(date +%Y%m%d-%H%M%S)-$BASHPID"
+	id="firecode-$(date +%Y%m%d-%H%M%S)-$BASHPID"
 	RUN_DIR="$RUNS/$id"
 	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
 	mkdir -p "$RUN_DIR" "$JAIL_DIR"
@@ -1274,7 +1274,7 @@ launch() {
 		stage_project "$WORKDIR" "$src_stage"
 		src_size=$(size_for_dir "$src_stage" $((4 * 1024 * 1024 * 1024)))
 		log "packing $WORKDIR into a $((src_size / 1024 / 1024 / 1024))G drive"
-		mkimage_from_dir "$src_stage" "$src_drive" firellm-src "$src_size"
+		mkimage_from_dir "$src_stage" "$src_drive" firecode-src "$src_size"
 		rm -rf "$src_stage"
 	fi
 
@@ -1302,11 +1302,11 @@ launch() {
 	local ctl_stage="$RUN_DIR/ctl"
 	mkdir -p "$ctl_stage"
 	{
-		echo "FIRELLM_ID=$id"
-		echo "FIRELLM_MODE=$mode"
-		[[ $AGENT != shell ]] && echo "FIRELLM_AGENT=$AGENT"
-		echo "FIRELLM_TIMEOUT=$TIMEOUT"
-		echo "FIRELLM_RELAY_PORTS='$relay_ports'"
+		echo "FIRECODE_ID=$id"
+		echo "FIRECODE_MODE=$mode"
+		[[ $AGENT != shell ]] && echo "FIRECODE_AGENT=$AGENT"
+		echo "FIRECODE_TIMEOUT=$TIMEOUT"
+		echo "FIRECODE_RELAY_PORTS='$relay_ports'"
 		# The guest mirrors the host's layout: same user, same uid, same home,
 		# same project path. An absolute path in a resumed transcript, in a
 		# CLAUDE.md or in a tool call then means the same thing in both places,
@@ -1319,7 +1319,7 @@ launch() {
 			local rows cols
 			read -r rows cols < <(stty size 2>/dev/null || echo "")
 			[[ -n ${rows:-} && -n ${cols:-} && $rows != 0 && $cols != 0 ]] &&
-				printf 'FIRELLM_ROWS=%s\nFIRELLM_COLS=%s\n' "$rows" "$cols"
+				printf 'FIRECODE_ROWS=%s\nFIRECODE_COLS=%s\n' "$rows" "$cols"
 		fi
 		# What kind of terminal is really on the other end. The guest console
 		# is handed to it directly, so it is that terminal answering capability
@@ -1328,40 +1328,40 @@ launch() {
 		# Enter is the one you notice: a terminal speaking the kitty keyboard
 		# protocol reports it as CSI 13 u, arrows stay ordinary CSI, so the
 		# arrows work and Enter appears dead.
-		echo "FIRELLM_CONSOLE_PORT=$CONSOLE_PORT"
-		echo "FIRELLM_FILES_PORT=$FILES_PORT"
-		echo "FIRELLM_TERM='${TERM:-}'"
-		echo "FIRELLM_TERM_PROGRAM='${TERM_PROGRAM:-}'"
-		echo "FIRELLM_COLORTERM='${COLORTERM:-}'"
-		echo "FIRELLM_USER='$(id -un)'"
-		echo "FIRELLM_UID=$(id -u)"
-		echo "FIRELLM_GID=$(id -g)"
-		echo "FIRELLM_HOME='$HOME'"
-		echo "FIRELLM_PROJECT='$WORKDIR'"
-		echo "FIRELLM_EXTRA='${extra_spec[*]-}'"
-		# Read from the project, not from wherever firellm happens to live, so
+		echo "FIRECODE_CONSOLE_PORT=$CONSOLE_PORT"
+		echo "FIRECODE_FILES_PORT=$FILES_PORT"
+		echo "FIRECODE_TERM='${TERM:-}'"
+		echo "FIRECODE_TERM_PROGRAM='${TERM_PROGRAM:-}'"
+		echo "FIRECODE_COLORTERM='${COLORTERM:-}'"
+		echo "FIRECODE_USER='$(id -un)'"
+		echo "FIRECODE_UID=$(id -u)"
+		echo "FIRECODE_GID=$(id -g)"
+		echo "FIRECODE_HOME='$HOME'"
+		echo "FIRECODE_PROJECT='$WORKDIR'"
+		echo "FIRECODE_EXTRA='${extra_spec[*]-}'"
+		# Read from the project, not from wherever firecode happens to live, so
 		# a repo-local identity wins the same way it would on the host.
-		echo "FIRELLM_GIT_NAME='$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)'"
-		echo "FIRELLM_GIT_EMAIL='$(git -C "$WORKDIR" config --get user.email 2>/dev/null || true)'"
+		echo "FIRECODE_GIT_NAME='$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)'"
+		echo "FIRECODE_GIT_EMAIL='$(git -C "$WORKDIR" config --get user.email 2>/dev/null || true)'"
 		if [[ $NONET -eq 0 ]]; then
-			echo "FIRELLM_GUEST_IP=172.16.SLOT.2/30"
-			echo "FIRELLM_GATEWAY=172.16.SLOT.1"
-			echo "FIRELLM_DNS='1.1.1.1 8.8.8.8'"
+			echo "FIRECODE_GUEST_IP=172.16.SLOT.2/30"
+			echo "FIRECODE_GATEWAY=172.16.SLOT.1"
+			echo "FIRECODE_DNS='1.1.1.1 8.8.8.8'"
 		fi
 	} >"$ctl_stage/env"
-	cp -f "$GUEST/firellm-context.md" "$ctl_stage/context.md"
+	cp -f "$GUEST/firecode-context.md" "$ctl_stage/context.md"
 
 	# The guest scripts ride along on the control drive and take precedence
 	# over the copies baked into the image, so changing the harness does not
 	# mean rebuilding a 6G rootfs.
 	local g
-	for g in firellm-setup.sh agent-entrypoint.sh profile.sh keydump.sh \
+	for g in firecode-setup.sh agent-entrypoint.sh profile.sh keydump.sh \
 		console.sh fileserver.sh; do
 		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
 	done
 
 	if [[ $mode == auto ]]; then
-		# The presence of this file is what starts firellm-agent.service.
+		# The presence of this file is what starts firecode-agent.service.
 		if ((AUTO_FLAGS)); then
 			massage_args "$AGENT" ${agent_args+"${agent_args[@]}"} >"$ctl_stage/args"
 		else
@@ -1395,7 +1395,7 @@ launch() {
 	fi
 
 	local ctl_drive="$RUN_DIR/ctl.ext4"
-	mkimage_from_dir "$ctl_stage" "$ctl_drive" firellm-ctl "$(size_ro_dir "$ctl_stage")"
+	mkimage_from_dir "$ctl_stage" "$ctl_drive" firecode-ctl "$(size_ro_dir "$ctl_stage")"
 
 	# --- the root, as layers rather than a copy.
 	#
@@ -1505,7 +1505,7 @@ launch() {
 	done
 
 	local boot_args="console=ttyS0 reboot=k panic=1 pci=off"
-	boot_args="$boot_args firellm.lower=$dev_lower firellm.upper=$dev_upper"
+	boot_args="$boot_args firecode.lower=$dev_lower firecode.upper=$dev_upper"
 	((QUIET_BOOT)) && boot_args="$boot_args quiet loglevel=3 systemd.show_status=false"
 
 	local cid=$((3 + ${NET_SLOT:-0}))
@@ -1602,10 +1602,10 @@ EOF
 	log "VM exited (status $rc)"
 
 	if ((SYNC_BACK)); then
-		local out_dir="${WORKDIR}-${id#firellm-}"
+		local out_dir="${WORKDIR}-${id#firecode-}"
 		log "copying /src out to $out_dir"
 		extract_image "$src_drive" "$out_dir"
-		local st="$out_dir/.firellm-exit-status"
+		local st="$out_dir/.firecode-exit-status"
 		if [[ -f $st ]]; then
 			log "agent exit status: $(cat "$st")"
 			rm -f "$st"
@@ -1615,8 +1615,8 @@ EOF
 		echo "  diff:    diff -ru --exclude=.git '$WORKDIR' '$out_dir' | less"
 		[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
 		if ((STATE_PERSISTENT)); then
-			echo "  resume:  firellm $AGENT --continue 'and now also ...'"
-			echo "           firellm state sessions"
+			echo "  resume:  firecode $AGENT --continue 'and now also ...'"
+			echo "           firecode state sessions"
 		fi
 		echo
 	fi
@@ -1638,7 +1638,7 @@ extract_image() {
 
 cmd_extract() {
 	local id=${1:-}
-	[[ -n $id ]] || die "usage: firellm extract <run-id> [dest]"
+	[[ -n $id ]] || die "usage: firecode extract <run-id> [dest]"
 	local img="$RUNS/$id/src.ext4"
 	[[ -f $img ]] || die "no src drive for run $id (already cleaned up?)"
 	local dest=${2:-$RUNS/$id/src}
@@ -1702,12 +1702,12 @@ cmd_doctor() {
 			bad=$((bad + 1))
 		fi
 	}
-	echo "firellm doctor"
+	echo "firecode doctor"
 	check "kvm accessible (/dev/kvm)" "test -r /dev/kvm -a -w /dev/kvm"
 	check "firecracker installed" "test -x '$FC'"
 	check "jailer installed" "test -x '$JAILER'"
 	check "guest kernel present" "compgen -G '$IMAGES/vmlinux-*'"
-	check "guest rootfs built" "test -f '$IMAGES/agent-firellm.ext4'"
+	check "guest rootfs built" "test -f '$IMAGES/agent-firecode.ext4'"
 	check "docker usable (for prepare)" "docker info"
 	check "mkfs.ext4 present" "command -v mkfs.ext4 || test -x /usr/sbin/mkfs.ext4"
 	check "debugfs present" "command -v debugfs || test -x /usr/sbin/debugfs"
@@ -1717,7 +1717,7 @@ cmd_doctor() {
 	# The jailer specifically, not sudo in general: a correctly scoped rule
 	# grants this one binary, so `sudo -n true` failing proves nothing.
 	check "jailer runs without a password" "sudo -n '$JAILER' --version"
-	check "a tap is ready (firellm net-setup)" "ip link show fcllm1"
+	check "a tap is ready (firecode net-setup)" "ip link show fcllm1"
 	check "claude on host" "command -v claude"
 	echo
 	echo "  $ok ok, $bad failed"
@@ -1730,40 +1730,40 @@ cmd_doctor() {
 	if ! ip link show fcllm1 >/dev/null 2>&1; then
 		echo
 		echo "  Networking will need root on every run. To stop that:"
-		echo "      sudo $ROOT/bin/firellm net-setup --count 4"
+		echo "      sudo $ROOT/bin/firecode net-setup --count 4"
 	fi
 	((bad == 0))
 }
 
 usage() {
 	cat <<'EOF'
-firellm - run a coding agent in a Firecracker microVM
+firecode - run a coding agent in a Firecracker microVM
 
-  firellm setup                 fetch firecracker, jailer and a guest kernel
-  firellm prepare [--full]      build the guest rootfs (via docker, no root)
-  firellm net-setup [--count N] pre-create taps once, so runs need no root
-  firellm doctor                check the host is ready
+  firecode setup                 fetch firecracker, jailer and a guest kernel
+  firecode prepare [--full]      build the guest rootfs (via docker, no root)
+  firecode net-setup [--count N] pre-create taps once, so runs need no root
+  firecode doctor                check the host is ready
 
-  firellm claude [args...]      run claude in a VM over the current directory
-  firellm opencode [args...]    same, with opencode
-  firellm shell                 interactive root shell in a VM
-  firellm keys                  show what the guest receives for each keypress
-  firellm cp SRC DST            move files in or out of a running VM,
+  firecode claude [args...]      run claude in a VM over the current directory
+  firecode opencode [args...]    same, with opencode
+  firecode shell                 interactive root shell in a VM
+  firecode keys                  show what the guest receives for each keypress
+  firecode cp SRC DST            move files in or out of a running VM,
                                 with vm: naming the guest side
-  firellm exec CMD [args...]    run any command in a VM over this directory
+  firecode exec CMD [args...]    run any command in a VM over this directory
 
-  firellm list                  runs, and whether their drives still exist
-  firellm extract <id> [dest]   pull a run's /src back out
-  firellm gc [keep]             drop old run drives (default: keep 5)
+  firecode list                  runs, and whether their drives still exist
+  firecode extract <id> [dest]   pull a run's /src back out
+  firecode gc [keep]             drop old run drives (default: keep 5)
 
-  firellm snapshot [name]       capture this project's VM state
-  firellm snapshot ls           list snapshots
-  firellm snapshot restore NAME go back to one
-  firellm snapshot rm NAME      drop one
+  firecode snapshot [name]       capture this project's VM state
+  firecode snapshot ls           list snapshots
+  firecode snapshot restore NAME go back to one
+  firecode snapshot rm NAME      drop one
 
-  firellm state list            per-project agent state drives
-  firellm state sessions [dir]  session ids you can --resume
-  firellm state reset [dir]     forget this project's agent history
+  firecode state list            per-project agent state drives
+  firecode state sessions [dir]  session ids you can --resume
+  firecode state reset [dir]     forget this project's agent history
 
 options (before the agent's own arguments):
   --workdir DIR   project to put in /src            (default: .)
@@ -1801,18 +1801,18 @@ project directory is never written to.
 The agent's home directory is kept on a per-project drive that outlives the
 VM, so a later run can pick up where the last one stopped:
 
-  firellm claude "start the refactor"
-  firellm claude --continue "now do the tests too"
-  firellm state sessions
-  firellm claude --resume 3f9a1c2e "and update the docs"
+  firecode claude "start the refactor"
+  firecode claude --continue "now do the tests too"
+  firecode state sessions
+  firecode claude --resume 3f9a1c2e "and update the docs"
 
 examples:
-  firellm claude "add tests for the parser"
-  firellm claude --timeout 3600 -- -p "fix the failing build" --model opus
-  firellm opencode "fix the tests"
-  firellm claude --workdir ~/Projects/foo "update the readme"
-  firellm claude --add-dir ~/Projects "match the API used in the sibling repo"
-  firellm shell
+  firecode claude "add tests for the parser"
+  firecode claude --timeout 3600 -- -p "fix the failing build" --model opus
+  firecode opencode "fix the tests"
+  firecode claude --workdir ~/Projects/foo "update the readme"
+  firecode claude --add-dir ~/Projects "match the API used in the sibling repo"
+  firecode shell
 EOF
 }
 
@@ -1855,7 +1855,7 @@ net-setup)
 	;;
 spawn-server)
 	shift
-	exec python3 "$ROOT/mcp/firellm-spawn.py" "$@"
+	exec python3 "$ROOT/mcp/firecode-spawn.py" "$@"
 	;;
 test)
 	shift
@@ -1880,13 +1880,13 @@ cp)
 	;;
 exec)
 	shift
-	[[ $# -gt 0 ]] || die "usage: firellm exec [options] <command> [args...]"
+	[[ $# -gt 0 ]] || die "usage: firecode exec [options] <command> [args...]"
 	launch "" "$@"
 	;;
 -h | --help | help | "")
 	usage
 	;;
 *)
-	die "unknown command: $1 (try: firellm help)"
+	die "unknown command: $1 (try: firecode help)"
 	;;
 esac

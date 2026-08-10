@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# firellm guest setup - runs inside the microVM, before the agent.
+# firecode guest setup - runs inside the microVM, before the agent.
 #
 # Reproduces the host's layout inside the guest: same user, same uid, same
 # home directory, project mounted at the path it has on the host. That is
@@ -10,16 +10,16 @@
 # rest of the setup, otherwise a missing optional drive kills the whole run.
 set -u
 
-CONFIG_MNT=/opt/firellm/config
-CTL_MNT=/opt/firellm/run
-STATE=/var/lib/firellm
+CONFIG_MNT=/opt/firecode/config
+CTL_MNT=/opt/firecode/run
+STATE=/var/lib/firecode
 
 # systemd starts this with an empty environment, and git refuses to do
 # anything at all without HOME.
 export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-log() { echo "[firellm] $*"; }
+log() { echo "[firecode] $*"; }
 
 wait_for_label() {
 	local label=$1 i
@@ -36,7 +36,7 @@ wait_for_label() {
 # directory it does not own, and builds write next to their source all the time.
 mkdir_owned() {
 	local path=$1 part="" seg
-	local uid=${FIRELLM_UID:-0} gid=${FIRELLM_GID:-0}
+	local uid=${FIRECODE_UID:-0} gid=${FIRECODE_GID:-0}
 	local IFS=/
 	for seg in $path; do
 		[[ -z $seg ]] && continue
@@ -72,56 +72,56 @@ mount_label() {
 # Recreate the host's account, so paths under it and file ownership both line
 # up. The agent runs as this user, not as root.
 setup_user() {
-	[[ -n ${FIRELLM_USER:-} && -n ${FIRELLM_UID:-} ]] || return 0
+	[[ -n ${FIRECODE_USER:-} && -n ${FIRECODE_UID:-} ]] || return 0
 
 	# The base image ships its own "ubuntu" account on uid/gid 1000, which is
 	# exactly the id a first desktop user has. Whoever is sitting on the id
 	# has to go before the host's account can take it.
 	local squatter
 	# shellcheck disable=SC2153  # set in the env file sourced from the control drive
-	if ! getent group "$FIRELLM_USER" >/dev/null; then
-		squatter=$(getent group "$FIRELLM_GID" | cut -d: -f1)
+	if ! getent group "$FIRECODE_USER" >/dev/null; then
+		squatter=$(getent group "$FIRECODE_GID" | cut -d: -f1)
 		[[ -n $squatter ]] && groupdel -f "$squatter" 2>/dev/null
-		groupadd -g "$FIRELLM_GID" "$FIRELLM_USER" 2>/dev/null
+		groupadd -g "$FIRECODE_GID" "$FIRECODE_USER" 2>/dev/null
 	fi
-	if ! getent passwd "$FIRELLM_USER" >/dev/null; then
-		squatter=$(getent passwd "$FIRELLM_UID" | cut -d: -f1)
+	if ! getent passwd "$FIRECODE_USER" >/dev/null; then
+		squatter=$(getent passwd "$FIRECODE_UID" | cut -d: -f1)
 		[[ -n $squatter ]] && userdel -f "$squatter" 2>/dev/null
-		useradd -u "$FIRELLM_UID" -g "$FIRELLM_GID" -d "$FIRELLM_HOME" \
-			-s /bin/bash -M "$FIRELLM_USER" 2>/dev/null
+		useradd -u "$FIRECODE_UID" -g "$FIRECODE_GID" -d "$FIRECODE_HOME" \
+			-s /bin/bash -M "$FIRECODE_USER" 2>/dev/null
 	fi
-	if ! getent passwd "$FIRELLM_USER" >/dev/null; then
-		log "WARNING: could not create $FIRELLM_USER, falling back to root"
-		FIRELLM_USER=root
+	if ! getent passwd "$FIRECODE_USER" >/dev/null; then
+		log "WARNING: could not create $FIRECODE_USER, falling back to root"
+		FIRECODE_USER=root
 		return 0
 	fi
-	mkdir -p "$FIRELLM_HOME"
-	chown "$FIRELLM_UID:$FIRELLM_GID" "$FIRELLM_HOME"
+	mkdir -p "$FIRECODE_HOME"
+	chown "$FIRECODE_UID:$FIRECODE_GID" "$FIRECODE_HOME"
 
 	# There is nothing in here worth protecting from its own user, and an
 	# unattended agent cannot answer a password prompt.
-	echo "$FIRELLM_USER ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/firellm
-	chmod 0440 /etc/sudoers.d/firellm
-	log "user $FIRELLM_USER ($FIRELLM_UID:$FIRELLM_GID) home $FIRELLM_HOME"
+	echo "$FIRECODE_USER ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/firecode
+	chmod 0440 /etc/sudoers.d/firecode
+	log "user $FIRECODE_USER ($FIRECODE_UID:$FIRECODE_GID) home $FIRECODE_HOME"
 }
 
 setup_network() {
-	[[ -n ${FIRELLM_GUEST_IP:-} ]] || return 0
+	[[ -n ${FIRECODE_GUEST_IP:-} ]] || return 0
 	if ! ip link show eth0 >/dev/null 2>&1; then
 		log "no eth0, running without network"
 		return 0
 	fi
-	ip addr add "$FIRELLM_GUEST_IP" dev eth0 2>/dev/null
+	ip addr add "$FIRECODE_GUEST_IP" dev eth0 2>/dev/null
 	ip link set eth0 up
-	[[ -n ${FIRELLM_GATEWAY:-} ]] && ip route add default via "$FIRELLM_GATEWAY" 2>/dev/null
+	[[ -n ${FIRECODE_GATEWAY:-} ]] && ip route add default via "$FIRECODE_GATEWAY" 2>/dev/null
 	# systemd-resolved is masked in this image, so this is a plain file.
 	# Docker could not bake these in, so they are written here.
 	rm -f /etc/resolv.conf
 	local ns
-	for ns in ${FIRELLM_DNS:-1.1.1.1 8.8.8.8}; do
+	for ns in ${FIRECODE_DNS:-1.1.1.1 8.8.8.8}; do
 		echo "nameserver $ns" >>/etc/resolv.conf
 	done
-	log "network up: $FIRELLM_GUEST_IP via ${FIRELLM_GATEWAY:-none}"
+	log "network up: $FIRECODE_GUEST_IP via ${FIRECODE_GATEWAY:-none}"
 }
 
 # Services the host keeps on its loopback - MCP servers, a local llama-server,
@@ -130,7 +130,7 @@ setup_network() {
 # host-side socat forwards it to 127.0.0.1:N. So localhost:N in here is
 # localhost:N out there, and no configuration on either side has to change.
 setup_relays() {
-	local p ports=${FIRELLM_RELAY_PORTS:-}
+	local p ports=${FIRECODE_RELAY_PORTS:-}
 	[[ -n $ports ]] || return 0
 	if ! command -v socat >/dev/null 2>&1; then
 		log "WARNING: socat missing, host services will not be reachable"
@@ -138,7 +138,7 @@ setup_relays() {
 	fi
 	for p in $ports; do
 		# Transient units so the relays outlive this oneshot service.
-		if systemd-run --unit="firellm-relay-$p" --collect --quiet \
+		if systemd-run --unit="firecode-relay-$p" --collect --quiet \
 			socat "TCP-LISTEN:$p,bind=127.0.0.1,reuseaddr,fork" \
 			"VSOCK-CONNECT:2:$p" 2>/dev/null; then
 			log "localhost:$p reaches the host"
@@ -152,7 +152,7 @@ setup_relays() {
 # same absolute path it has on the host.
 mount_extras() {
 	local spec label target
-	for spec in ${FIRELLM_EXTRA:-}; do
+	for spec in ${FIRECODE_EXTRA:-}; do
 		label=${spec%%:*}
 		target=${spec#*:}
 		[[ -n $label && -n $target ]] || continue
@@ -160,39 +160,39 @@ mount_extras() {
 	done
 }
 
-# The project, writable, at its host path. /src is kept as a symlink because
-# it is a convenient thing to be able to type.
+# The project, writable, at the path it has on the host - and only there.
 mount_project() {
-	local target=${FIRELLM_PROJECT:-/src}
+	local target=${FIRECODE_PROJECT:-}
+	[[ -n $target ]] || return 0
 	mkdir_owned "$target"
-	mount_label firellm-src "$target" || return 0
+	mount_label firecode-src "$target" || return 0
 
 	# mkfs.ext4 -d takes ownership of everything it copies from the staging
 	# directory, but the filesystem's own root inode is made by mke2fs and
 	# belongs to root. Without this the agent cannot create a single file in
 	# the top level of its own project.
-	chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$target"
+	chown "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" "$target"
 
 	# Every ext4 filesystem gets a lost+found. In the top level of a project
 	# it is just a root-owned directory the agent has to stop and think about,
 	# and this drive is thrown away rather than fsck'd.
 	rm -rf "$target/lost+found"
-	if [[ $target != /src ]]; then
-		# The image ships /src as a directory; linking onto it would put the
-		# link inside it instead of replacing it.
-		[[ -d /src && ! -L /src ]] && rmdir /src 2>/dev/null
-		ln -sfn "$target" /src
-	fi
+	# Deliberately no /src symlink. A second name for the project is a second
+	# name the agent can put in a commit message or a path, where it means
+	# nothing outside this VM. The project is at its host path, and that is
+	# the only place it is.
+	[[ -L /src ]] && rm -f /src
+	[[ -d /src ]] && rmdir /src 2>/dev/null
 }
 
 # Give the agent's home directory the host's configuration, writable, and on
 # a drive that outlives the VM so sessions are still here on the next run.
 overlay_home() {
 	local name=$1
-	local lower="$CONFIG_MNT/$name" target="${FIRELLM_HOME:-/root}/.$name"
+	local lower="$CONFIG_MNT/$name" target="${FIRECODE_HOME:-/root}/.$name"
 	[[ -d $lower ]] || return 0
 	mkdir -p "$target" "$STATE/upper/$name" "$STATE/work/$name"
-	if mount -t overlay "firellm-$name" \
+	if mount -t overlay "firecode-$name" \
 		-o "lowerdir=$lower,upperdir=$STATE/upper/$name,workdir=$STATE/work/$name" \
 		"$target" 2>/dev/null; then
 		log "$target is a writable overlay kept between runs"
@@ -200,15 +200,15 @@ overlay_home() {
 		log "no overlayfs, copying $target instead"
 		cp -a "$lower/." "$target/" 2>/dev/null || true
 	fi
-	chown -R "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$target" 2>/dev/null || true
+	chown -R "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" "$target" 2>/dev/null || true
 }
 
 setup_git() {
-	local as=(runuser -u "${FIRELLM_USER:-root}" --)
-	[[ -n ${FIRELLM_GIT_NAME:-} ]] &&
-		"${as[@]}" git config --global user.name "$FIRELLM_GIT_NAME"
-	[[ -n ${FIRELLM_GIT_EMAIL:-} ]] &&
-		"${as[@]}" git config --global user.email "$FIRELLM_GIT_EMAIL"
+	local as=(runuser -u "${FIRECODE_USER:-root}" --)
+	[[ -n ${FIRECODE_GIT_NAME:-} ]] &&
+		"${as[@]}" git config --global user.name "$FIRECODE_GIT_NAME"
+	[[ -n ${FIRECODE_GIT_EMAIL:-} ]] &&
+		"${as[@]}" git config --global user.email "$FIRECODE_GIT_EMAIL"
 	# No signing key in here, and an unattended agent cannot answer a
 	# passphrase prompt.
 	"${as[@]}" git config --global commit.gpgsign false
@@ -220,15 +220,15 @@ setup_git() {
 main() {
 	mkdir -p "$STATE" "$CTL_MNT" "$CONFIG_MNT"
 
-	mount_label firellm-ctl "$CTL_MNT" -o ro
+	mount_label firecode-ctl "$CTL_MNT" -o ro
 
 	# The harness ships its own guest scripts on the control drive, so fixing
 	# one does not mean rebuilding the whole rootfs image. This baked copy is
 	# only the bootstrap that gets the control drive mounted.
-	if [[ -x $CTL_MNT/firellm-setup.sh && -z ${FIRELLM_REEXEC:-} ]]; then
-		export FIRELLM_REEXEC=1
+	if [[ -x $CTL_MNT/firecode-setup.sh && -z ${FIRECODE_REEXEC:-} ]]; then
+		export FIRECODE_REEXEC=1
 		log "using the harness scripts from the control drive"
-		exec "$CTL_MNT/firellm-setup.sh"
+		exec "$CTL_MNT/firecode-setup.sh"
 	fi
 
 	# shellcheck source=/dev/null
@@ -240,26 +240,26 @@ main() {
 	# mount point has to already exist.
 	mount_extras
 	mount_project
-	mount_label firellm-cfg "$CONFIG_MNT" -o ro
+	mount_label firecode-cfg "$CONFIG_MNT" -o ro
 
 	# Docker refuses to bake these into an image, so they are set here.
-	echo firellm >/etc/hostname
-	hostname firellm 2>/dev/null || true
-	printf '127.0.0.1 localhost firellm\n::1 localhost\n' >/etc/hosts
+	echo firecode >/etc/hostname
+	hostname firecode 2>/dev/null || true
+	printf '127.0.0.1 localhost firecode\n::1 localhost\n' >/etc/hosts
 
 	setup_network
 	setup_relays
 
 	# Must be mounted before the overlays: it holds their upper layers, which
 	# is what makes the agent's sessions survive the VM.
-	mount_label firellm-state "$STATE"
+	mount_label firecode-state "$STATE"
 
 	overlay_home claude
 	overlay_home opencode
 
 	# opencode keeps its credentials and its provider/MCP config outside
 	# ~/.opencode, so they have to be put back where it looks for them.
-	local home=${FIRELLM_HOME:-/root}
+	local home=${FIRECODE_HOME:-/root}
 	if [[ -f $CONFIG_MNT/opencode-share/auth.json ]]; then
 		mkdir -p "$home/.local/share/opencode"
 		cp -f "$CONFIG_MNT/opencode-share/auth.json" "$home/.local/share/opencode/auth.json"
@@ -269,20 +269,20 @@ main() {
 		mkdir -p "$home/.config/opencode"
 		cp -a "$CONFIG_MNT/opencode-config/." "$home/.config/opencode/"
 	fi
-	chown -R "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" \
+	chown -R "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" \
 		"$home/.local" "$home/.config" 2>/dev/null || true
 	if [[ -f $CONFIG_MNT/claude.json ]]; then
 		# Claude rewrites this file, so it must be a real copy, not a symlink
 		# onto the read-only drive.
-		local conf="${FIRELLM_HOME:-/root}/.claude.json"
+		local conf="${FIRECODE_HOME:-/root}/.claude.json"
 		cp -f "$CONFIG_MNT/claude.json" "$conf"
 		# Per-project state was stripped on the host - it named host paths for
 		# projects that are not in here. But the project *is* here, and without
 		# an entry marking it trusted, an interactive session opens on "is this
 		# a folder you trust?" instead of on the conversation. In a VM built
 		# from that very folder the question has one answer.
-		if [[ -n ${FIRELLM_PROJECT:-} ]] && command -v python3 >/dev/null 2>&1; then
-			python3 - "$conf" "$FIRELLM_PROJECT" <<'PY' 2>/dev/null || true
+		if [[ -n ${FIRECODE_PROJECT:-} ]] && command -v python3 >/dev/null 2>&1; then
+			python3 - "$conf" "$FIRECODE_PROJECT" <<'PY' 2>/dev/null || true
 import json, sys
 path, project = sys.argv[1], sys.argv[2]
 with open(path) as fh:
@@ -292,7 +292,7 @@ with open(path, "w") as fh:
     json.dump(d, fh, indent=2)
 PY
 		fi
-		chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$conf"
+		chown "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" "$conf"
 	fi
 
 	# The agent binaries live on the read-only config drive so they always
@@ -308,18 +308,18 @@ PY
 	setup_git
 
 	if [[ -f $CTL_MNT/context.md ]]; then
-		cp -f "$CTL_MNT/context.md" "${FIRELLM_HOME:-/root}/FIRELLM.md"
+		cp -f "$CTL_MNT/context.md" "${FIRECODE_HOME:-/root}/FIRECODE.md"
 	fi
 
 	# Interactive sessions come in over vsock with a pty of their own, rather
 	# than over the serial console, because firecracker's serial input rewrites
 	# CR to LF and a raw-mode TUI never sees Enter. socat hands each connection
 	# a pty and relays the bytes untouched.
-	if [[ ${FIRELLM_MODE:-} != auto && -x $CTL_MNT/console.sh ]]; then
-		if systemd-run --unit=firellm-console --collect --quiet \
-			socat "VSOCK-LISTEN:${FIRELLM_CONSOLE_PORT:-1024},fork,reuseaddr" \
+	if [[ ${FIRECODE_MODE:-} != auto && -x $CTL_MNT/console.sh ]]; then
+		if systemd-run --unit=firecode-console --collect --quiet \
+			socat "VSOCK-LISTEN:${FIRECODE_CONSOLE_PORT:-1024},fork,reuseaddr" \
 			"EXEC:$CTL_MNT/console.sh,pty,setsid,ctty,stderr" 2>/dev/null; then
-			log "console ready on vsock port ${FIRELLM_CONSOLE_PORT:-1024}"
+			log "console ready on vsock port ${FIRECODE_CONSOLE_PORT:-1024}"
 		else
 			log "WARNING: could not start the vsock console"
 		fi
@@ -328,23 +328,23 @@ PY
 	# File transfer in and out of a running VM. Firecracker cannot share a
 	# host directory, so this is the only live channel there is.
 	if [[ -x $CTL_MNT/fileserver.sh ]]; then
-		systemd-run --unit=firellm-files --collect --quiet \
-			socat "VSOCK-LISTEN:${FIRELLM_FILES_PORT:-1025},fork,reuseaddr" \
+		systemd-run --unit=firecode-files --collect --quiet \
+			socat "VSOCK-LISTEN:${FIRECODE_FILES_PORT:-1025},fork,reuseaddr" \
 			"EXEC:$CTL_MNT/fileserver.sh" 2>/dev/null ||
 			log "WARNING: could not start the file channel"
 	fi
 
-	# firellm-agent.service declares Conflicts=serial-getty@ttyS0.service so the
+	# firecode-agent.service declares Conflicts=serial-getty@ttyS0.service so the
 	# agent owns the console. systemd acts on that when the job is queued, not
 	# when the unit's condition is evaluated - so in interactive mode, where
 	# the agent is skipped for want of an args file, the getty is stopped for a
 	# unit that never runs and the console is left dead. Start it back.
-	if [[ ${FIRELLM_MODE:-} != auto ]]; then
+	if [[ ${FIRECODE_MODE:-} != auto ]]; then
 		systemctl start --no-block serial-getty@ttyS0.service 2>/dev/null ||
 			log "WARNING: could not start the console getty"
 	fi
 
-	log "setup complete (mode=${FIRELLM_MODE:-interactive} agent=${FIRELLM_AGENT:-none})"
+	log "setup complete (mode=${FIRECODE_MODE:-interactive} agent=${FIRECODE_AGENT:-none})"
 }
 
 main "$@"

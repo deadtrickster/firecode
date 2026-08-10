@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# firellm agent entrypoint - runs the requested agent inside the microVM.
-# Started by firellm-agent.service, which only runs when the host asked for
+# firecode agent entrypoint - runs the requested agent inside the microVM.
+# Started by firecode-agent.service, which only runs when the host asked for
 # an unattended run (that is, when the control drive carries an args file).
 set -u
 
-CTL_MNT=/opt/firellm/run
+CTL_MNT=/opt/firecode/run
 
-log() { echo "[firellm] $*"; }
+log() { echo "[firecode] $*"; }
 
 # Prefer the copy the harness shipped on the control drive, so a fix here
 # does not need the rootfs image rebuilt.
-if [[ -x $CTL_MNT/agent-entrypoint.sh && -z ${FIRELLM_REEXEC:-} ]]; then
-	export FIRELLM_REEXEC=1
+if [[ -x $CTL_MNT/agent-entrypoint.sh && -z ${FIRECODE_REEXEC:-} ]]; then
+	export FIRECODE_REEXEC=1
 	exec "$CTL_MNT/agent-entrypoint.sh"
 fi
 
 # shellcheck source=/dev/null
 [[ -f $CTL_MNT/env ]] && . "$CTL_MNT/env"
 
-AGENT=${FIRELLM_AGENT:-claude}
-RUN_USER=${FIRELLM_USER:-root}
-RUN_HOME=${FIRELLM_HOME:-/root}
-PROJECT=${FIRELLM_PROJECT:-/src}
+AGENT=${FIRECODE_AGENT:-claude}
+RUN_USER=${FIRECODE_USER:-root}
+RUN_HOME=${FIRECODE_HOME:-/root}
+PROJECT=${FIRECODE_PROJECT:-$PWD}
 
 declare -a ARGS=()
 if [[ -f $CTL_MNT/args ]]; then
@@ -30,9 +30,9 @@ fi
 
 if ! command -v "$AGENT" >/dev/null 2>&1; then
 	log "ERROR: $AGENT is not installed in the guest."
-	log "The config drive should carry it at /opt/firellm/config/bin/$AGENT."
+	log "The config drive should carry it at /opt/firecode/config/bin/$AGENT."
 	# shellcheck disable=SC2012  # human-readable diagnostic, not parsed
-	ls -la /opt/firellm/config/bin 2>&1 | sed 's/^/[firellm] /'
+	ls -la /opt/firecode/config/bin 2>&1 | sed 's/^/[firecode] /'
 	exit 127
 fi
 
@@ -53,14 +53,14 @@ declare -a ENV=(
 	"USER=$RUN_USER"
 	"LOGNAME=$RUN_USER"
 	"IS_SANDBOX=1"
-	"FIRELLM=1"
+	"FIRECODE=1"
 	"TERM=${TERM:-dumb}"
 	"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 )
 
 declare -a CMD=()
-if [[ -n ${FIRELLM_TIMEOUT:-} && ${FIRELLM_TIMEOUT} != 0 ]]; then
-	CMD=(timeout --signal=TERM --kill-after=30s "$FIRELLM_TIMEOUT")
+if [[ -n ${FIRECODE_TIMEOUT:-} && ${FIRECODE_TIMEOUT} != 0 ]]; then
+	CMD=(timeout --signal=TERM --kill-after=30s "$FIRECODE_TIMEOUT")
 fi
 CMD+=("$AGENT" "${ARGS[@]}")
 
@@ -72,11 +72,11 @@ else
 fi
 
 if ((rc == 124)); then
-	log "agent hit the ${FIRELLM_TIMEOUT} second timeout and was stopped"
+	log "agent hit the ${FIRECODE_TIMEOUT} second timeout and was stopped"
 fi
 
 echo
 log "agent exited with status $rc"
-echo "$rc" >"$PROJECT/.firellm-exit-status" 2>/dev/null || true
+echo "$rc" >"$PROJECT/.firecode-exit-status" 2>/dev/null || true
 sync
 exit "$rc"

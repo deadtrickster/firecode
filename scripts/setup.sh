@@ -67,4 +67,4 @@ echo "[setup] done."
 echo "  binaries: $VENDOR"
 echo "  images:   $IMAGES"
 echo
-echo "next:  firellm prepare"
+echo "next:  firecode prepare"

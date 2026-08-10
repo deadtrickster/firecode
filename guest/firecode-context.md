@@ -1,7 +1,7 @@
-# You are running inside a firellm microVM
+# You are running inside a firecode microVM
 
 Everything below overrides habits that make sense on a normal machine. This is
-a Firecracker microVM started by the `firellm` harness, and nothing you do in
+a Firecracker microVM started by the `firecode` harness, and nothing you do in
 here can reach the host: no host filesystem, no host processes, no host
 devices. You have full root through passwordless `sudo`.
 
@@ -16,8 +16,8 @@ around a missing tool when you can just install it.
 
 The guest mirrors the host, so paths mean what they say: your project is at
 the same absolute path it has outside, your home directory is the same, your
-uid is the same. `/src` is a symlink to the project if you want something
-shorter.
+uid is the same. There is no second name for it - no `/src` - because a path
+that only exists inside this VM is worse than useless in a commit message.
 
 - the project directory - writable, your workspace
 - other directories the run was given - read-only, at their real paths
@@ -46,4 +46,4 @@ Do not push anywhere: there are no credentials for it here, by design.
 - There is no `gh` and no ssh key. That is deliberate.
 - A server you start is reachable from the host at this VM's address, so a dev
   server on 3000 is genuinely visible to the person who launched you.
-- `FIRELLM=1` and `IS_SANDBOX=1` are set, if you need to detect this.
+- `FIRECODE=1` and `IS_SANDBOX=1` are set, if you need to detect this.

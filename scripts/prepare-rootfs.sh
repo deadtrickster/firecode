@@ -10,16 +10,16 @@ ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 IMAGES="$ROOT/images"
 GUEST="$ROOT/guest"
 
-IMAGE_TAG=firellm/rootfs:latest
-OUT="$IMAGES/agent-firellm.ext4"
-SIZE=${FIRELLM_ROOTFS_SIZE:-6G}
+IMAGE_TAG=firecode/rootfs:latest
+OUT="$IMAGES/agent-firecode.ext4"
+SIZE=${FIRECODE_ROOTFS_SIZE:-6G}
 TOOLCHAINS=lean
 FORCE=0
 NO_CACHE=""
 
 usage() {
 	cat <<'EOF'
-usage: firellm prepare [--full] [--force] [--no-cache] [--size 6G]
+usage: firecode prepare [--full] [--force] [--no-cache] [--size 6G]
 
   --full      also install rust, go, zig, clang/llvm and sbcl
               (much slower build, roughly 3x the image size)
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-if [[ $TOOLCHAINS == full && ${FIRELLM_ROOTFS_SIZE:-} == "" && $SIZE == 6G ]]; then
+if [[ $TOOLCHAINS == full && ${FIRECODE_ROOTFS_SIZE:-} == "" && $SIZE == 6G ]]; then
 	SIZE=12G
 fi
 
@@ -84,7 +84,7 @@ fi
 echo "[prepare] building container image ($TOOLCHAINS toolchains)"
 # shellcheck disable=SC2086  # NO_CACHE is a deliberate single optional flag
 docker build $NO_CACHE \
-	--build-arg "FIRELLM_TOOLCHAINS=$TOOLCHAINS" \
+	--build-arg "FIRECODE_TOOLCHAINS=$TOOLCHAINS" \
 	-t "$IMAGE_TAG" \
 	"$GUEST"
 
@@ -100,7 +100,7 @@ docker rm -f "$CID" >/dev/null
 echo "[prepare] converting to ext4 ($SIZE)"
 docker run --rm \
 	-v "$IMAGES:/out" \
-	--entrypoint /usr/local/sbin/firellm-mkimage \
+	--entrypoint /usr/local/sbin/firecode-mkimage \
 	"$IMAGE_TAG" \
 	"/out/$(basename "$TAR")" "/out/$(basename "$OUT")" \
 	"$SIZE" "$(id -u)" "$(id -g)"
@@ -109,4 +109,4 @@ echo
 echo "[prepare] rootfs ready:"
 ls -lh "$OUT"
 echo
-echo "next:  firellm claude -p 'what is in this repo?'"
+echo "next:  firecode claude -p 'what is in this repo?'"

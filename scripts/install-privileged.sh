@@ -2,7 +2,7 @@
 # install-privileged.sh - one-time root setup so jailed runs do not prompt.
 #
 # Building images and extracting results need no privileges. Networking needs
-# root once, and `firellm net-setup` is that once - it leaves persistent taps
+# root once, and `firecode net-setup` is that once - it leaves persistent taps
 # behind that belong to you. What is left is the jailer, which has to be root
 # to chroot and to drop privileges, and cannot be made one-time.
 #
@@ -12,7 +12,7 @@
 # single-user workstation, not a security boundary. The boundary is the
 # microVM, on the other side of this command.
 #
-# If you would rather not, skip it: `firellm --no-jail` needs nothing, and
+# If you would rather not, skip it: `firecode --no-jail` needs nothing, and
 # still gives you a real KVM guest. You lose the chroot, uid drop and pid
 # namespace around the VMM process.
 #
@@ -21,7 +21,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 JAILER="$ROOT/vendor/bin/jailer"
-SUDOERS=/etc/sudoers.d/firellm
+SUDOERS=/etc/sudoers.d/firecode
 
 TARGET_USER=${SUDO_USER:-${USER:-root}}
 UNINSTALL=0
@@ -55,16 +55,16 @@ if ((UNINSTALL)); then
 fi
 
 [[ -x $JAILER ]] || {
-	echo "jailer not found at $JAILER - run 'firellm setup' first" >&2
+	echo "jailer not found at $JAILER - run 'firecode setup' first" >&2
 	exit 1
 }
 
 umask 077
 cat >"$SUDOERS.tmp" <<EOF
-# Installed by firellm ($ROOT). Lets $TARGET_USER start jailed microVMs
+# Installed by firecode ($ROOT). Lets $TARGET_USER start jailed microVMs
 # without a password prompt.
 #
-# Networking is not here on purpose: 'firellm net-setup' does that once and
+# Networking is not here on purpose: 'firecode net-setup' does that once and
 # leaves taps owned by $TARGET_USER, so runs need nothing further.
 #
 # The jailer execs a binary as a uid of the caller's choosing, so treat this
@@ -86,4 +86,4 @@ chmod 0440 "$SUDOERS"
 
 echo "installed $SUDOERS for $TARGET_USER"
 echo
-echo "check it with:  firellm doctor"
+echo "check it with:  firecode doctor"

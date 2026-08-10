@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# firellm tests. No framework, no dependencies beyond what firellm needs.
+# firecode tests. No framework, no dependencies beyond what firecode needs.
 #
-#   firellm test           everything, boots VMs, a few minutes
-#   firellm test --quick   host-side only, no VM boots, seconds
-#   firellm test <name>    one test by name
+#   firecode test           everything, boots VMs, a few minutes
+#   firecode test --quick   host-side only, no VM boots, seconds
+#   firecode test <name>    one test by name
 #
 # VM tests run with --no-jail --no-net so they need no privileges.
 #
@@ -12,8 +12,8 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-FIRELLM="$ROOT/bin/firellm"
-WORK=$(mktemp -d /tmp/firellm-tests.XXXXXX)
+FIRECODE="$ROOT/bin/firecode"
+WORK=$(mktemp -d /tmp/firecode-tests.XXXXXX)
 
 QUICK=0
 ONLY=""
@@ -121,7 +121,7 @@ PY
 in_vm() {
 	local project=$1
 	shift
-	(cd "$project" && timeout 240 "$FIRELLM" exec --no-jail --no-net "$@" \
+	(cd "$project" && timeout 240 "$FIRECODE" exec --no-jail --no-net "$@" \
 		2>&1 | sed -n 's/.*agent-entrypoint\.sh\[[0-9]*\]: //p')
 }
 
@@ -143,7 +143,7 @@ test_host_transcripts_untouched() {
 	local project
 	project=$(make_project)
 	# Import for this very repo, which has real host sessions.
-	(cd "$ROOT" && "$FIRELLM" claude --import-sessions --no-jail --no-net \
+	(cd "$ROOT" && "$FIRECODE" claude --import-sessions --no-jail --no-net \
 		--workdir "$project" --timeout 1 -- --version >/dev/null 2>&1)
 
 	after=$(find "$real" -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)
@@ -180,19 +180,19 @@ test_denylist() {
 	printf '%s\n' "$WORK/secret" >"$deny"
 	mkdir -p "$WORK/secret/inner"
 
-	out=$(FIRELLM_DENY_FILE="$deny" "$FIRELLM" exec --workdir "$WORK/secret" true 2>&1)
+	out=$(FIRECODE_DENY_FILE="$deny" "$FIRECODE" exec --workdir "$WORK/secret" true 2>&1)
 	contains "denied as --workdir" "refusing" "$out"
 
-	out=$(FIRELLM_DENY_FILE="$deny" "$FIRELLM" exec --workdir "$WORK/secret/inner" true 2>&1)
+	out=$(FIRECODE_DENY_FILE="$deny" "$FIRECODE" exec --workdir "$WORK/secret/inner" true 2>&1)
 	contains "denied as a subdirectory of a listed path" "refusing" "$out"
 
-	out=$(FIRELLM_DENY_FILE="$deny" "$FIRELLM" exec --workdir "$project" \
+	out=$(FIRECODE_DENY_FILE="$deny" "$FIRECODE" exec --workdir "$project" \
 		--add-dir "$WORK/secret" true 2>&1)
 	contains "denied as --add-dir" "refusing" "$out"
 
 	# The built-in list stands on its own, with no deny file at all.
 	mkdir -p "$HOME/.aws"
-	out=$(FIRELLM_DENY_FILE=/nonexistent "$FIRELLM" exec --workdir "$HOME/.aws" true 2>&1)
+	out=$(FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec --workdir "$HOME/.aws" true 2>&1)
 	contains "credential directories refused without any config" "refusing" "$out"
 	rmdir "$HOME/.aws" 2>/dev/null
 }
@@ -247,7 +247,7 @@ test_session_import_resumable() {
 		return
 	fi
 	rm -rf "$ROOT/state/$(basename "$project")-"*
-	out=$(FIRELLM_CLAUDE_HOME="$fake" in_vm "$project" --import-sessions -- \
+	out=$(FIRECODE_CLAUDE_HOME="$fake" in_vm "$project" --import-sessions -- \
 		bash -c "echo \"S=\$(ls ~/.claude/projects/$slug/)\"; echo \"C=\$(head -1 ~/.claude/projects/$slug/aaaa1111-test.jsonl)\"")
 
 	contains "the transcript is in the guest under the same project key" \
@@ -268,7 +268,7 @@ test_results_come_back() {
 		ok "work is copied back out (skipped, needs a VM)"
 		return
 	fi
-	out=$(cd "$project" && timeout 240 "$FIRELLM" exec --no-jail --no-net -- \
+	out=$(cd "$project" && timeout 240 "$FIRECODE" exec --no-jail --no-net -- \
 		bash -c 'echo "from the vm" > NEWFILE.txt' 2>&1)
 	result=$(sed -n 's/^  result:  //p' <<<"$out" | head -1)
 
@@ -336,7 +336,7 @@ test_jailed() {
 		return
 	fi
 	project=$(make_project)
-	out=$(cd "$project" && timeout 240 "$FIRELLM" exec --no-net -- \
+	out=$(cd "$project" && timeout 240 "$FIRECODE" exec --no-net -- \
 		bash -c 'echo "U=$(id -un)"; echo "P=$(pwd)"; echo "F=$(ls)"' 2>&1 |
 		sed -n 's/.*agent-entrypoint\.sh\[[0-9]*\]: //p')
 	contains "boots under the jailer as the right user" "U=$(id -un)" "$out"
@@ -371,11 +371,11 @@ test_concurrent_runs() {
 	a="$WORK/concurrent-a.log"
 	b="$WORK/concurrent-b.log"
 
-	(cd "$project" && timeout 240 "$FIRELLM" exec --no-jail -- \
+	(cd "$project" && timeout 240 "$FIRECODE" exec --no-jail -- \
 		bash -c 'sleep 6; echo A-DONE' >"$a" 2>&1) &
 	local pid_a=$!
 	sleep 2
-	(cd "$project" && timeout 240 "$FIRELLM" exec --no-jail -- \
+	(cd "$project" && timeout 240 "$FIRECODE" exec --no-jail -- \
 		bash -c 'echo B-DONE' >"$b" 2>&1) &
 	local pid_b=$!
 
@@ -396,9 +396,9 @@ test_concurrent_runs() {
 		"not be resumable" "$(cat "$b")"
 }
 
-# `firellm shell` hands the guest console to a terminal, which a pipe is not,
+# `firecode shell` hands the guest console to a terminal, which a pipe is not,
 # so this is the only test that drives a real pty. It is where the console
-# was found dead: firellm-agent.service declared a conflict with the getty,
+# was found dead: firecode-agent.service declared a conflict with the getty,
 # and systemd acted on it even though the unit itself was skipped.
 test_interactive() {
 	local project out rc
@@ -407,7 +407,7 @@ test_interactive() {
 		ok "an interactive session (skipped, needs a VM)"
 		return
 	fi
-	out=$(timeout 300 python3 -u "$ROOT/tests/interactive.py" "$project" "$FIRELLM" 2>&1)
+	out=$(timeout 300 python3 -u "$ROOT/tests/interactive.py" "$project" "$FIRECODE" 2>&1)
 	rc=$?
 	printf '%s\n' "$out" | sed 's/^  /    /'
 	# interactive.py prints its own ok/FAIL lines; count them here.
@@ -427,14 +427,14 @@ test_prompt_required() {
 	local project out
 	project=$(make_project)
 
-	out=$("$FIRELLM" claude --workdir "$project" --resume abc123 2>&1)
+	out=$("$FIRECODE" claude --workdir "$project" --resume abc123 2>&1)
 	contains "a bare --resume is refused" "nothing for the agent to do" "$out"
 
-	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net --timeout 1 \
+	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --timeout 1 \
 		--resume abc123 "carry on" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	contains "--resume with a prompt is not refused" "carry on" "$out"
 
-	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net --timeout 1 \
+	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --timeout 1 \
 		--model opus "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	contains "a flag value is not mistaken for a prompt" "do a thing" "$out"
 }
@@ -444,12 +444,12 @@ test_arg_massaging() {
 	project=$(make_project)
 	# Unattended claude gets -p and permission bypass added, so it does not
 	# sit at a prompt nobody is watching.
-	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net \
+	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net \
 		--timeout 1 "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	contains "unattended claude gets --print" "-p" "$out"
 	contains "unattended claude gets permission bypass" "--dangerously-skip-permissions" "$out"
 
-	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net --no-auto-flags \
+	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --no-auto-flags \
 		--timeout 1 "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	if [[ $out != *"--dangerously-skip-permissions"* ]]; then
 		ok "--no-auto-flags leaves the command alone"
@@ -460,7 +460,7 @@ test_arg_massaging() {
 
 test_shellcheck() {
 	local f out=""
-	for f in "$ROOT/bin/firellm" "$ROOT"/scripts/*.sh "$ROOT"/guest/*.sh \
+	for f in "$ROOT/bin/firecode" "$ROOT"/scripts/*.sh "$ROOT"/guest/*.sh \
 		"$ROOT"/tests/*.sh; do
 		shellcheck "$f" >/dev/null 2>&1 || out="$out $(basename "$f")"
 	done
@@ -469,7 +469,7 @@ test_shellcheck() {
 	else
 		ok "shellcheck not installed (skipped)"
 	fi
-	if python3 -m py_compile "$ROOT/mcp/firellm-spawn.py" 2>/dev/null; then
+	if python3 -m py_compile "$ROOT/mcp/firecode-spawn.py" 2>/dev/null; then
 		ok "the spawn server parses"
 	else
 		no "the spawn server parses"
@@ -478,7 +478,7 @@ test_shellcheck() {
 
 # -------------------------------------------------------------------- main
 
-echo "firellm tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
+echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
 
 run_test shellcheck
 run_test denylist

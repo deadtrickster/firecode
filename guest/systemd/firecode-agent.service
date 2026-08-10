@@ -1,10 +1,10 @@
 [Unit]
-Description=firellm agent run
-Requires=firellm-mounts.service
-After=firellm-mounts.service
+Description=firecode agent run
+Requires=firecode-mounts.service
+After=firecode-mounts.service
 # Unattended runs only. In interactive mode the host writes no args file and
 # this unit is skipped, leaving the serial console to the autologin shell.
-ConditionPathExists=/opt/firellm/run/args
+ConditionPathExists=/opt/firecode/run/args
 #
 # Deliberately no Conflicts=serial-getty@ttyS0.service. systemd acts on a
 # conflict when the job is queued, not when the condition is evaluated, so it
@@ -14,7 +14,7 @@ ConditionPathExists=/opt/firellm/run/args
 [Service]
 Type=oneshot
 WorkingDirectory=/src
-ExecStart=/opt/firellm/agent-entrypoint.sh
+ExecStart=/opt/firecode/agent-entrypoint.sh
 StandardOutput=journal+console
 StandardError=journal+console
 TimeoutStartSec=infinity
