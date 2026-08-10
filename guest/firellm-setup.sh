@@ -256,6 +256,21 @@ main() {
 
 	overlay_home claude
 	overlay_home opencode
+
+	# opencode keeps its credentials and its provider/MCP config outside
+	# ~/.opencode, so they have to be put back where it looks for them.
+	local home=${FIRELLM_HOME:-/root}
+	if [[ -f $CONFIG_MNT/opencode-share/auth.json ]]; then
+		mkdir -p "$home/.local/share/opencode"
+		cp -f "$CONFIG_MNT/opencode-share/auth.json" "$home/.local/share/opencode/auth.json"
+		chmod 600 "$home/.local/share/opencode/auth.json"
+	fi
+	if [[ -d $CONFIG_MNT/opencode-config ]]; then
+		mkdir -p "$home/.config/opencode"
+		cp -a "$CONFIG_MNT/opencode-config/." "$home/.config/opencode/"
+	fi
+	chown -R "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" \
+		"$home/.local" "$home/.config" 2>/dev/null || true
 	if [[ -f $CONFIG_MNT/claude.json ]]; then
 		# Claude rewrites this file, so it must be a real copy, not a symlink
 		# onto the read-only drive.

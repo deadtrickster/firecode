@@ -72,7 +72,12 @@ declare -a _fl_env=(
 )
 
 declare -a _fl_cmd=(bash -i)
-if [[ ${FIRELLM_MODE:-} == interactive && -n ${FIRELLM_AGENT:-} ]]; then
+# `firellm keys` - show what the guest receives for each keypress.
+if [[ ${FIRELLM_AGENT:-} == keys ]]; then
+	_fl_cmd=(/opt/firellm/run/keydump.sh)
+fi
+if [[ ${FIRELLM_MODE:-} == interactive && -n ${FIRELLM_AGENT:-} &&
+	${FIRELLM_AGENT} != keys ]]; then
 	if command -v "$FIRELLM_AGENT" >/dev/null 2>&1; then
 		# Whatever was asked for on the host - --resume, a model, and so on.
 		declare -a _fl_args=()

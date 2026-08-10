@@ -25,6 +25,8 @@ JAILER="$VENDOR/jailer"
 CLAUDE_HOME="${FIRELLM_CLAUDE_HOME:-$HOME/.claude}"
 CLAUDE_CONF="${FIRELLM_CLAUDE_CONF:-$HOME/.claude.json}"
 OPENCODE_HOME="${FIRELLM_OPENCODE_HOME:-$HOME/.opencode}"
+OPENCODE_SHARE="${FIRELLM_OPENCODE_SHARE:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
+OPENCODE_CONF="${FIRELLM_OPENCODE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
 
 # Defaults. Claude Code alone wants ~1.5G, so 1G was never going to work.
 MEM=4096
@@ -65,6 +67,9 @@ SENSITIVE_HOME_DIRS=(
 # Your own list, one path or glob per line, # for comments. For work that
 # must never end up on a VM drive - client code, anything under NDA.
 DENY_FILE="${FIRELLM_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/never-share}"
+
+# Host loopback ports every run should be able to reach, one per line.
+PORTS_FILE="${FIRELLM_PORTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/host-ports}"
 
 refuse_if_sensitive() {
 	local path=$1 rel full line
@@ -308,6 +313,11 @@ config_fingerprint() {
 		bin=$(command -v "$p" 2>/dev/null || true)
 		[[ -n $bin ]] && parts+=("$p:$(stat -Lc '%Y:%s' "$bin" 2>/dev/null || echo 0)")
 	done
+	# Credentials rotate, so the drive has to notice.
+	for p in "$OPENCODE_SHARE/auth.json" "$OPENCODE_CONF/opencode.jsonc" \
+		"$OPENCODE_CONF/opencode.json"; do
+		[[ -e $p ]] && parts+=("$p:$(stat -Lc %Y "$p" 2>/dev/null || echo 0)")
+	done
 	printf '%s\n' ${parts+"${parts[@]}"} | sha256sum | cut -d' ' -f1
 }
 
@@ -362,6 +372,24 @@ build_config_drive() {
 		rsync -a --copy-unsafe-links \
 			--exclude=cache --exclude=.cache --exclude=log --exclude=logs \
 			"$OPENCODE_HOME"/ "$stage/opencode"/ 2>/dev/null || true
+	fi
+	# ~/.opencode is only the binary. The parts that decide whether it can
+	# talk to anything live elsewhere: credentials under the data directory,
+	# providers and MCP servers under the config directory. Without these it
+	# starts up with no provider at all.
+	if [[ -f $OPENCODE_SHARE/auth.json ]]; then
+		mkdir -p "$stage/opencode-share"
+		cp -f "$OPENCODE_SHARE/auth.json" "$stage/opencode-share/auth.json"
+		log "  opencode credentials: $(python3 -c 'import json,sys; print(", ".join(json.load(open(sys.argv[1]))))' "$OPENCODE_SHARE/auth.json" 2>/dev/null || echo "present")"
+	else
+		log "  opencode has no saved credentials on the host"
+	fi
+	if [[ -d $OPENCODE_CONF ]]; then
+		mkdir -p "$stage/opencode-config"
+		# node_modules here is 60M of plugin dependencies; the config itself
+		# is what decides providers and MCP servers.
+		rsync -a --copy-unsafe-links --exclude=node_modules \
+			"$OPENCODE_CONF"/ "$stage/opencode-config"/ 2>/dev/null || true
 	fi
 
 	# Hooks point at host binaries that do not exist in the guest; leaving
@@ -838,10 +866,12 @@ has_prompt() {
 
 RUN_DIR=""
 JAIL_DIR=""
+STTY_SAVED=""
 
 cleanup_run() {
 	local status=$?
 	trap - EXIT INT TERM
+	[[ -n $STTY_SAVED ]] && stty "$STTY_SAVED" 2>/dev/null
 	relays_down
 	net_down
 	if [[ $KEEP -eq 0 ]]; then
@@ -1035,6 +1065,17 @@ launch() {
 	local relay_ports
 	local -a mcp=()
 	((NO_MCP)) || read -r -a mcp <<<"$(discover_mcp_ports)"
+
+	# Ports you always want reachable - a local model server, say - without
+	# having to remember --host-port every time. One per line, # for comments.
+	if [[ -f $PORTS_FILE ]]; then
+		local line
+		while IFS= read -r line; do
+			line=${line%%#*}
+			line=${line//[[:space:]]/}
+			[[ $line =~ ^[0-9]+$ ]] && HOST_PORTS+=("$line")
+		done <"$PORTS_FILE"
+	fi
 	# The `|| true` is load-bearing: with nothing to forward, grep matches
 	# nothing and exits 1, which under `set -e` takes the whole run down.
 	relay_ports=$(printf '%s\n' ${mcp+"${mcp[@]}"} ${HOST_PORTS+"${HOST_PORTS[@]}"} |
@@ -1151,7 +1192,7 @@ launch() {
 	# over the copies baked into the image, so changing the harness does not
 	# mean rebuilding a 6G rootfs.
 	local g
-	for g in firellm-setup.sh agent-entrypoint.sh profile.sh; do
+	for g in firellm-setup.sh agent-entrypoint.sh profile.sh keydump.sh; do
 		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
 	done
 
@@ -1275,6 +1316,17 @@ EOF
 
 	log "booting ($VCPU vcpu, ${MEM}M)"
 	echo >&2
+
+	# Firecracker takes the terminal out of line mode but leaves ICRNL set, so
+	# the line discipline rewrites Enter from CR to LF before the guest sees a
+	# byte of it. A shell does not notice - LF is its line terminator anyway -
+	# but a full-screen application in raw mode is watching for CR, and Enter
+	# simply does nothing. Arrow keys are unaffected, which is what makes it
+	# look like the application rather than the terminal.
+	if [[ $mode == interactive && -t 0 ]]; then
+		STTY_SAVED=$(stty -g 2>/dev/null || true)
+		stty -icrnl -inlcr -igncr 2>/dev/null || true
+	fi
 
 	local rc=0
 	if [[ $mode == interactive ]]; then
@@ -1423,6 +1475,7 @@ firellm - run a coding agent in a Firecracker microVM
   firellm claude [args...]      run claude in a VM over the current directory
   firellm opencode [args...]    same, with opencode
   firellm shell                 interactive root shell in a VM
+  firellm keys                  show what the guest receives for each keypress
   firellm exec CMD [args...]    run any command in a VM over this directory
 
   firellm list                  runs, and whether their drives still exist
@@ -1531,6 +1584,10 @@ claude | opencode)
 shell)
 	shift
 	launch shell "$@"
+	;;
+keys)
+	shift
+	launch keys "$@"
 	;;
 exec)
 	shift
