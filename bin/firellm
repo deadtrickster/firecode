@@ -60,14 +60,32 @@ SENSITIVE_HOME_DIRS=(
 	.config/chromium
 )
 
+# Your own list, one path or glob per line, # for comments. For work that
+# must never end up on a VM drive - client code, anything under NDA.
+DENY_FILE="${FIRELLM_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/never-share}"
+
 refuse_if_sensitive() {
-	local path=$1 rel
+	local path=$1 rel full line
 	for rel in "${SENSITIVE_HOME_DIRS[@]}"; do
-		local full="$HOME/$rel"
+		full="$HOME/$rel"
 		if [[ $path == "$full" || $path == "$full"/* ]]; then
 			die "refusing to put $full in the guest - keys and credentials stay on the host"
 		fi
 	done
+
+	[[ -f $DENY_FILE ]] || return 0
+	while IFS= read -r line; do
+		line=${line%%#*}
+		line=${line#"${line%%[![:space:]]*}"}
+		line=${line%"${line##*[![:space:]]}"}
+		[[ -n $line ]] || continue
+		line=${line/#\~/$HOME}
+		# Match the entry itself, anything under it, and globs either way.
+		# shellcheck disable=SC2053  # unquoted on purpose, the entry is a pattern
+		if [[ $path == $line || $path == $line/* || $path == "$line" || $path == "$line"/* ]]; then
+			die "refusing $path - listed in $DENY_FILE"
+		fi
+	done <"$DENY_FILE"
 }
 
 log() { echo "[firellm] $*" >&2; }
@@ -199,6 +217,48 @@ stage_project() {
 	if ((${full:-0} > ${staged:-0} + 64 * 1024 * 1024)); then
 		log "left behind $(numfmt --to=iec $((full - staged))) of ignored files (--all-files to include them)"
 	fi
+}
+
+# Cheap stand-in for "has this tree changed": total apparent size and the
+# newest mtime in it. Wrong only if an edit keeps both identical.
+dir_fingerprint() {
+	local dir=$1 size newest
+	size=$(du -sb --apparent-size "$dir" 2>/dev/null | cut -f1)
+	newest=$(find "$dir" -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+	echo "${size:-0}:${newest:-0}"
+}
+
+# A read-only drive for a directory that has not changed is the same drive it
+# was last time, so build it once and keep it. Firecracker has no shared
+# filesystem device and this host's ext4 has no reflinks, so a cache is as
+# close to copy-on-write as this gets.
+cached_ro_image() {
+	local dir=$1 label=$2 idx=$3
+	local slug img stamp want
+	slug=$(project_slug "$dir")
+	img="$STATE_DIR/ro-$slug.ext4"
+	stamp="$STATE_DIR/ro-$slug.stamp"
+	mkdir -p "$STATE_DIR"
+	want=$(dir_fingerprint "$dir")
+
+	if [[ -f $img && -f $stamp && $(cat "$stamp") == "$want" ]]; then
+		echo "$img"
+		return 0
+	fi
+
+	local stage="$RUN_DIR/extra$idx"
+	# Same gitignore filtering as the project itself: a checkout's .venv or
+	# node_modules is usually most of it and never what you wanted.
+	stage_project "$dir" "$stage" >&2
+	local bytes
+	bytes=$(du -sb --apparent-size "$stage" 2>/dev/null | cut -f1)
+	if ((bytes > 32 * 1024 * 1024 * 1024)); then
+		die "--add-dir $dir is $((bytes / 1024 / 1024 / 1024))G - too big to put in a VM"
+	fi
+	mkimage_from_dir "$stage" "$img" "$label" "$(size_ro_dir "$stage")"
+	rm -rf "$stage"
+	echo "$want" >"$stamp"
+	echo "$img"
 }
 
 # Read-only drives never grow, so they only need their contents plus the
@@ -837,28 +897,21 @@ launch() {
 	# --- extra read-only context: sibling projects, notes, whatever. These
 	#     are copies, so the guest can read them and nothing goes back.
 	local -a extra_drives=() extra_spec=()
-	local n=0 d base
+	local n=0 d
 	for d in ${EXTRA_DIRS+"${EXTRA_DIRS[@]}"}; do
 		d=$(cd "$d" 2>/dev/null && pwd) || die "--add-dir: no such directory: $d"
 		refuse_if_sensitive "$d"
 		n=$((n + 1))
-		base=$(basename "$d")
-		local img="$RUN_DIR/extra$n.ext4" stage="$RUN_DIR/extra$n"
-		log "adding $d read-only at /mnt/$base"
-		# Same gitignore filtering as the project itself: a checkout's .venv
-		# or node_modules is usually most of it and never what you wanted.
-		stage_project "$d" "$stage"
-		local bytes
-		bytes=$(du -sb --apparent-size "$stage" 2>/dev/null | cut -f1)
-		if ((bytes > 32 * 1024 * 1024 * 1024)); then
-			die "--add-dir $d is $((bytes / 1024 / 1024 / 1024))G - too big to copy into a VM"
-		fi
-		mkimage_from_dir "$stage" "$img" "firellm-x$n" "$(size_ro_dir "$stage")"
-		rm -rf "$stage"
+		# Label derived from the path, not from the order it was given in, so
+		# a cached image is never relabelled out from under a running VM.
+		local label img
+		label="fl-$(printf '%s' "$d" | sha256sum | cut -c1-8)"
+		img=$(cached_ro_image "$d" "$label" "$n")
+		log "adding $d read-only at $d"
 		extra_drives+=("$img")
 		# Mounted where it lives on the host, not under /mnt, so references
 		# to it from anywhere still resolve.
-		extra_spec+=("firellm-x$n:$d")
+		extra_spec+=("$label:$d")
 	done
 
 	# --- control drive: this run's parameters, read-only in the guest
