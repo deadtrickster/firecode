@@ -247,6 +247,25 @@ from a directory, and `debugfs rdump` reads one back, neither of which needs a
 mount. The guest rootfs is built by exporting a Docker container, so `prepare`
 needs no privileges either.
 
+### What the agent is told
+
+Three things reach the model, and only these:
+
+- your host `~/.claude/CLAUDE.md`, unchanged - your own rules travel with it
+- the project's own `CLAUDE.md`, if it has one
+- a firellm section appended to the first, saying where it is: that it has
+  root and should stop asking, that the project leaves through a sibling
+  directory, that installs persist in the workspace layer, that stdio MCP
+  servers are absent while http ones are relayed, that there is no `gh` and no
+  ssh key
+
+That last one has to be appended to `CLAUDE.md` because that is a file the
+agent reads. It used to be written to `~/FIRELLM.md`, which nothing opens - so
+the agent had no idea it was in a VM, and behaved like it was on your laptop.
+
+`FIRELLM=1` and `IS_SANDBOX=1` are in the environment for anything that wants
+to detect the sandbox.
+
 ### Agents
 
 The `claude` and `opencode` binaries are not baked into the image. They are

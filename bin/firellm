@@ -402,6 +402,23 @@ build_config_drive() {
 			"$OPENCODE_CONF"/ "$stage/opencode-config"/ 2>/dev/null || true
 	fi
 
+	# What the agent is told about where it is.
+	#
+	# It has to go into the user-level CLAUDE.md, because that is a file the
+	# agent actually reads. A briefing dropped somewhere else in the home
+	# directory is just a file nobody opens - which is what it was, so the
+	# agent had no idea it was in a VM at all: not that it can install
+	# whatever it likes, not that its work leaves through a sibling
+	# directory, not that half the MCP servers it expects are absent.
+	if [[ -f $GUEST/firellm-context.md ]]; then
+		{
+			[[ -f $stage/claude/CLAUDE.md ]] && cat "$stage/claude/CLAUDE.md"
+			echo
+			cat "$GUEST/firellm-context.md"
+		} >"$stage/claude/CLAUDE.md.new"
+		mv -f "$stage/claude/CLAUDE.md.new" "$stage/claude/CLAUDE.md"
+	fi
+
 	# Hooks point at host binaries that do not exist in the guest; leaving
 	# them in produces a failed hook on every single tool call.
 	if [[ -f $stage/claude/settings.json ]]; then
