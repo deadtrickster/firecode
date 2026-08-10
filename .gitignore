@@ -12,3 +12,4 @@ vmlinux-*
 *.socket
 *.pid
 *.img
+spawn.json

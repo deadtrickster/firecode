@@ -266,7 +266,10 @@ cached_ro_image() {
 	if ((bytes > 32 * 1024 * 1024 * 1024)); then
 		die "--add-dir $dir is $((bytes / 1024 / 1024 / 1024))G - too big to put in a VM"
 	fi
-	mkimage_from_dir "$stage" "$img" "$label" "$(size_ro_dir "$stage")"
+	# Same reasoning as the config drive: build beside it, then move, so a
+	# concurrent run never attaches a partly written image.
+	mkimage_from_dir "$stage" "$img.$BASHPID" "$label" "$(size_ro_dir "$stage")"
+	mv -f "$img.$BASHPID" "$img"
 	rm -rf "$stage"
 	echo "$want" >"$stamp"
 	echo "$img"
@@ -313,9 +316,22 @@ build_config_drive() {
 		return 0
 	fi
 
+	# One drive, shared by every run. Two starting at once would both decide
+	# it was stale and the second would delete the first's staging directory
+	# mid-mkfs. Wait rather than race, then look again - the other one may
+	# have just built exactly what we wanted.
+	mkdir -p "$IMAGES"
+	local lock_fd
+	exec {lock_fd}>"$IMAGES/.roconfig.lock"
+	flock "$lock_fd"
+	if [[ -f $CFG_DRIVE && -f $CFG_STAMP ]] && [[ $(cat "$CFG_STAMP") == "$want" ]]; then
+		exec {lock_fd}>&-
+		return 0
+	fi
+
 	log "building the read-only config drive (host agent config + binaries)"
-	local stage="$IMAGES/.cfgstage"
-	rm -rf "$stage"
+	local stage
+	stage=$(mktemp -d "$IMAGES/.cfgstage.XXXXXX")
 	mkdir -p "$stage/bin" "$stage/claude"
 
 	local a bin
@@ -402,11 +418,14 @@ PY
 
 	local size
 	size=$(size_ro_dir "$stage")
-	mkimage_from_dir "$stage" "$CFG_DRIVE.new" firellm-cfg "$size"
-	mv -f "$CFG_DRIVE.new" "$CFG_DRIVE"
+	# Built beside the real one and moved into place, so a run that is already
+	# using the old drive never sees a half-written file.
+	mkimage_from_dir "$stage" "$CFG_DRIVE.$BASHPID" firellm-cfg "$size"
+	mv -f "$CFG_DRIVE.$BASHPID" "$CFG_DRIVE"
 	rm -rf "$stage"
 	echo "$want" >"$CFG_STAMP"
 	log "config drive: $(du -h --apparent-size "$CFG_DRIVE" | cut -f1)"
+	exec {lock_fd}>&-
 }
 
 # ---------------------------------------------------------------- state
@@ -418,6 +437,7 @@ PY
 
 STATE_FD=""
 STATE_PERSISTENT=0
+STATE_DRIVE=""
 SLUG=""
 
 project_slug() {
@@ -426,7 +446,9 @@ project_slug() {
 	echo "$(basename "$dir" | tr -c 'A-Za-z0-9._-' '-')-$hash"
 }
 
-# Prints the path of the state drive to attach.
+# Sets STATE_DRIVE, and STATE_PERSISTENT if this run holds the project lock.
+# Same reason as alloc_net_slot: it cannot print its answer, because the
+# subshell of a command substitution would drop both the lock and the flag.
 ensure_state_drive() {
 	local workdir=$1 run_dir=$2 img size
 	SLUG=$(project_slug "$workdir")
@@ -449,12 +471,12 @@ ensure_state_drive() {
 	exec {STATE_FD}>"$STATE_DIR/$slug.lock"
 	if flock -n "$STATE_FD"; then
 		STATE_PERSISTENT=1
-		echo "$img"
+		STATE_DRIVE=$img
 	else
 		log "WARNING: another run holds this project's state drive."
 		log "         using a private copy - this session will not be resumable."
 		cp --sparse=always "$img" "$run_dir/state.ext4"
-		echo "$run_dir/state.ext4"
+		STATE_DRIVE="$run_dir/state.ext4"
 	fi
 }
 
@@ -576,6 +598,10 @@ NET_FD=""
 # Each VM gets its own tap and its own /30, so several can run at once. A slot
 # is held with a lock file rather than by looking at what exists, because a
 # persistent tap left behind by net-setup exists whether or not it is in use.
+#
+# Sets NET_SLOT and NET_FD rather than printing. It cannot print: a command
+# substitution runs in a subshell, so the descriptor holding the lock would be
+# closed the moment it returned, and every VM would take the same slot.
 alloc_net_slot() {
 	local s fd
 	mkdir -p "$STATE_DIR/net"
@@ -583,7 +609,7 @@ alloc_net_slot() {
 		exec {fd}>"$STATE_DIR/net/$s.lock"
 		if flock -n "$fd"; then
 			NET_FD=$fd
-			echo "$s"
+			NET_SLOT=$s
 			return 0
 		fi
 		exec {fd}>&-
@@ -615,7 +641,7 @@ net_create_tap() {
 }
 
 net_up() {
-	NET_SLOT=$(alloc_net_slot) || die "no free network slot (250 VMs already running?)"
+	alloc_net_slot || die "no free network slot (250 VMs already running?)"
 	TAP_DEV="fcllm$NET_SLOT"
 
 	if ip link show "$TAP_DEV" >/dev/null 2>&1; then
@@ -914,16 +940,23 @@ launch() {
 	# not there. So --continue/--resume carries the working tree forward too.
 	if [[ $RESUME_TREE == auto ]]; then
 		RESUME_TREE=0
-		local a
-		for a in ${agent_args+"${agent_args[@]}"}; do
-			case "$a" in
-			-c | --continue | -r | --resume) RESUME_TREE=1 ;;
-			esac
-		done
+		# Only for the agents whose -c and -r actually mean continue and
+		# resume. Guessing from any command's flags is wrong: `bash -c` is
+		# not a request to carry the last run's working tree forward.
+		if [[ $AGENT == claude || $AGENT == opencode ]]; then
+			local a
+			for a in ${agent_args+"${agent_args[@]}"}; do
+				case "$a" in
+				-c | --continue | -r | --resume) RESUME_TREE=1 ;;
+				esac
+			done
+		fi
 	fi
 
 	local id
-	id="firellm-$(date +%Y%m%d-%H%M%S)-$$"
+	# BASHPID, not $$: in a subshell $$ is still the parent's pid, so two runs
+	# launched together from one shell would collide on the same run id.
+	id="firellm-$(date +%Y%m%d-%H%M%S)-$BASHPID"
 	RUN_DIR="$RUNS/$id"
 	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
 	mkdir -p "$RUN_DIR" "$JAIL_DIR"
@@ -939,14 +972,16 @@ launch() {
 	local relay_ports
 	local -a mcp=()
 	((NO_MCP)) || read -r -a mcp <<<"$(discover_mcp_ports)"
+	# The `|| true` is load-bearing: with nothing to forward, grep matches
+	# nothing and exits 1, which under `set -e` takes the whole run down.
 	relay_ports=$(printf '%s\n' ${mcp+"${mcp[@]}"} ${HOST_PORTS+"${HOST_PORTS[@]}"} |
-		grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
+		grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)
 	relay_ports=${relay_ports% }
 
 	# --- per-project agent state, so --continue and --resume have something
 	#     to continue from. Taken first: it decides where the src drive lives.
-	local state_drive
-	state_drive=$(ensure_state_drive "$WORKDIR" "$RUN_DIR")
+	ensure_state_drive "$WORKDIR" "$RUN_DIR"
+	local state_drive=$STATE_DRIVE
 
 	# Continuing a conversation that only exists on the host means bringing
 	# the transcript in. Done once per project unless asked for again.

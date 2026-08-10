@@ -341,6 +341,58 @@ test_jailed() {
 	contains "the project files are there" "README.md" "$out"
 }
 
+# A run with nothing at all to forward: no MCP, no --host-port. Used to take
+# the whole run down without printing anything.
+test_no_relays() {
+	local project out
+	project=$(make_project)
+	if ((QUICK)); then
+		ok "a run with no relays at all (skipped, needs a VM)"
+		return
+	fi
+	out=$(in_vm "$project" --no-mcp -- bash -c 'echo "ALIVE=yes"')
+	contains "a run with nothing to forward still boots" "ALIVE=yes" "$out"
+}
+
+# Two runs at once on the same project. They must take different network
+# slots, and only one may hold the state drive. Both used to grab slot 1 and
+# the second died on "Resource busy", because the lock was taken inside a
+# command substitution and released with its subshell.
+test_concurrent_runs() {
+	local project a b rc_a rc_b
+	project=$(make_project)
+	if ((QUICK)); then
+		ok "two runs at once (skipped, needs a VM)"
+		return
+	fi
+	a="$WORK/concurrent-a.log"
+	b="$WORK/concurrent-b.log"
+
+	(cd "$project" && timeout 240 "$FIRELLM" exec --no-jail -- \
+		bash -c 'sleep 6; echo A-DONE' >"$a" 2>&1) &
+	local pid_a=$!
+	sleep 2
+	(cd "$project" && timeout 240 "$FIRELLM" exec --no-jail -- \
+		bash -c 'echo B-DONE' >"$b" 2>&1) &
+	local pid_b=$!
+
+	wait "$pid_a"
+	rc_a=$?
+	wait "$pid_b"
+	rc_b=$?
+
+	check "the first concurrent run succeeds" "0" "$rc_a"
+	check "the second concurrent run succeeds" "0" "$rc_b"
+	contains "the first one really ran" "A-DONE" "$(cat "$a")"
+	contains "the second one really ran" "B-DONE" "$(cat "$b")"
+
+	local taps
+	taps=$(grep -ho 'fcllm[0-9]*' "$a" "$b" | sort -u | wc -l)
+	check "they used different tap devices" "2" "$taps"
+	contains "the second one is told its session is not resumable" \
+		"not be resumable" "$(cat "$b")"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -392,6 +444,8 @@ run_test paths_mirror_host
 run_test state_persists
 run_test session_import_resumable
 run_test results_come_back
+run_test no_relays
+run_test concurrent_runs
 run_test ro_image_cached
 run_test jailed
 
