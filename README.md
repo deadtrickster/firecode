@@ -172,6 +172,13 @@ Files and directories, in either direction, while the VM is running. Ordinary
 runs still copy the whole project out to a sibling directory when they finish;
 this is for when you want something sooner, or want to hand something in.
 
+Coming out, the archive is written by the guest, and the guest is the thing
+being contained - so it is not handed to `tar` and hoped for. Extraction goes
+through Python's `data` filter, which refuses `..`, absolute paths, links that
+point outside the destination, device files and setuid bits by specification
+rather than by whichever tar is installed. A byte limit covers the guest that
+simply never stops sending (`--limit`, 4G by default).
+
 ## Snapshots
 
 A project's VM state is three drives: the agent's home (sessions), the working

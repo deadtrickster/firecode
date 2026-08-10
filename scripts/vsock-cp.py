@@ -6,7 +6,7 @@ and no 9p, on purpose - so the only live channel is vsock. This streams a tar
 through it, in either direction.
 
 usage:
-  vsock-cp.py <uds> <port> get <guest-path> <host-path>
+  vsock-cp.py <uds> <port> get <guest-path> <host-path> [--limit MB]
   vsock-cp.py <uds> <port> put <host-path> <guest-path>
 """
 
@@ -14,6 +14,8 @@ import os
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 
 BUF = 65536
 
@@ -35,23 +37,40 @@ def connect(uds_path, port):
     return sock
 
 
-def get(sock, guest_path, host_path):
+def get(sock, guest_path, host_path, limit):
+    """Unpack what the guest sends. The guest is not trusted, so this does not
+    hand the stream to tar and hope: an archive from in there can name
+    ../../.ssh, carry a symlink pointing out of the destination, set a setuid
+    bit, or simply never end. Python's "data" filter rejects the first three,
+    and the byte limit deals with the fourth."""
     sock.sendall(f"GET {guest_path}\n".encode())
     os.makedirs(host_path, exist_ok=True)
-    tar = subprocess.Popen(["tar", "-C", host_path, "-xf", "-"],
-                           stdin=subprocess.PIPE)
+
+    # Buffered to a file first: extraction filters need to seek, and a stream
+    # that never ends should hit the limit before it hits the disk.
     n = 0
-    while True:
-        data = sock.recv(BUF)
-        if not data:
-            break
-        tar.stdin.write(data)
-        n += len(data)
-    tar.stdin.close()
-    if tar.wait() != 0:
-        raise SystemExit("unpacking what the guest sent failed")
-    if n == 0:
-        raise SystemExit(f"the guest has nothing at {guest_path}")
+    with tempfile.TemporaryFile() as spool:
+        while True:
+            data = sock.recv(BUF)
+            if not data:
+                break
+            n += len(data)
+            if n > limit:
+                raise SystemExit(
+                    f"the guest sent more than {limit // (1024 * 1024)}M - "
+                    "refusing it (raise with --limit)")
+            spool.write(data)
+        if n == 0:
+            raise SystemExit(f"the guest has nothing at {guest_path}")
+        spool.seek(0)
+        with tarfile.open(fileobj=spool, mode="r|*") as tar:
+            try:
+                tar.extractall(host_path, filter="data")
+            except tarfile.OutsideDestinationError as exc:
+                raise SystemExit(f"refused: the archive tried to escape - {exc}")
+            except (tarfile.AbsolutePathError, tarfile.LinkOutsideDestinationError,
+                    tarfile.SpecialFileError) as exc:
+                raise SystemExit(f"refused: {exc}")
     print(f"{n // 1024}K from {guest_path} into {host_path}")
 
 
@@ -83,10 +102,13 @@ def main(argv):
         print(__doc__)
         return 2
     uds, port, verb, a, b = argv[0], int(argv[1]), argv[2], argv[3], argv[4]
+    limit = 4096
+    if "--limit" in argv:
+        limit = int(argv[argv.index("--limit") + 1])
     sock = connect(uds, port)
     try:
         if verb == "get":
-            get(sock, a, b)
+            get(sock, a, b, limit * 1024 * 1024)
         elif verb == "put":
             put(sock, a, b)
         else:
