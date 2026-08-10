@@ -1,6 +1,7 @@
 # firellm ignores
 images/
 runs/
+state/
 vendor/
 .jail/
 
