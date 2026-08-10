@@ -315,7 +315,10 @@ PY
 	# than over the serial console, because firecracker's serial input rewrites
 	# CR to LF and a raw-mode TUI never sees Enter. socat hands each connection
 	# a pty and relays the bytes untouched.
-	if [[ ${FIRECODE_MODE:-} != auto && -x $CTL_MNT/console.sh ]]; then
+	# Always, not just for interactive runs: socat forks a pty per connection,
+	# so this is also how you get a second shell inside a VM that is busy
+	# doing something else - to try what it just built, or watch it work.
+	if [[ -x $CTL_MNT/console.sh ]]; then
 		if systemd-run --unit=firecode-console --collect --quiet \
 			socat "VSOCK-LISTEN:${FIRECODE_CONSOLE_PORT:-1024},fork,reuseaddr" \
 			"EXEC:$CTL_MNT/console.sh,pty,setsid,ctty,stderr" 2>/dev/null; then

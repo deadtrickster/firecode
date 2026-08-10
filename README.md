@@ -94,6 +94,17 @@ firecode list            # sessions and runs
 Because the session owns the VM rather than your terminal, closing the terminal
 no longer leaves one running. `--no-tmux` opts out.
 
+To get a shell **inside a VM that is already running** - to try the thing the
+agent just built, or watch it work - `firecode enter`. The guest serves a pty
+per connection, so it does not disturb whatever is on the first one, and
+leaving does not stop the VM.
+
+```sh
+firecode enter                    # second shell in the running VM
+./impersonate-cs/publish/dash     # run what it built
+# then open http://172.16.1.2:8080 in your browser
+```
+
 ## The layers
 
 The guest root is not a disk, it is a stack, assembled by an initramfs before

@@ -646,6 +646,24 @@ session_name() {
 	echo "firecode/${n//./_}"
 }
 
+# A second shell inside a VM that is already running - to try the thing it
+# just built, or watch what it is doing. The guest serves a pty per connection,
+# so this does not disturb whatever is on the first one.
+cmd_enter() {
+	local -a socks=()
+	local d
+	for d in "$JAIL_BASE"/firecracker/*/root; do
+		[[ -S $d/firecracker-vsock.sock ]] || continue
+		socat -u /dev/null "UNIX-CONNECT:$d/firecracker-vsock.sock" 2>/dev/null &&
+			socks+=("$d/firecracker-vsock.sock")
+	done
+	((${#socks[@]} > 0)) || die "no VM is running"
+	((${#socks[@]} == 1)) || die "${#socks[@]} VMs are running - stop all but one"
+
+	log "entering the running VM (exit leaves it running)"
+	exec python3 "$SCRIPTS/vsock-console.py" "${socks[0]}" "$CONSOLE_PORT"
+}
+
 # Sessions are named after the project, so this needs no arguments in the
 # usual case: you are standing in the project you want.
 cmd_attach() {
@@ -1829,6 +1847,7 @@ firecode - run a coding agent in a Firecracker microVM
   firecode exec CMD [args...]    run any command in a VM over this directory
 
   firecode attach [project]      reattach to a running session
+  firecode enter                 a second shell inside the VM running now
   firecode list                  sessions, runs, and whether drives still exist
   firecode extract <id> [dest]   pull a run's /src back out
   firecode gc [keep]             drop old run drives (default: keep 5)
@@ -1959,6 +1978,10 @@ cp)
 attach)
 	shift
 	cmd_attach "$@"
+	;;
+enter)
+	shift
+	cmd_enter "$@"
 	;;
 exec)
 	shift
