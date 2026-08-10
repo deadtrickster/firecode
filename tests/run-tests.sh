@@ -328,8 +328,11 @@ test_jailed() {
 		ok "jailed boot (skipped, needs a VM)"
 		return
 	fi
-	if ! sudo -n true 2>/dev/null; then
-		ok "jailed boot (skipped, needs passwordless sudo for the jailer)"
+	# Probe the jailer itself, not sudo in general. A correctly scoped
+	# sudoers rule grants this one binary and nothing else, so `sudo -n true`
+	# failing says nothing about whether a jailed run can start.
+	if ! sudo -n "$ROOT/vendor/bin/jailer" --version >/dev/null 2>&1; then
+		ok "jailed boot (skipped, the jailer would prompt for a password)"
 		return
 	fi
 	project=$(make_project)

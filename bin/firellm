@@ -1288,14 +1288,23 @@ cmd_doctor() {
 	check "socat present (MCP relay)" "command -v socat"
 	check "rsync present" "command -v rsync"
 	check "iptables present" "command -v iptables || test -x /usr/sbin/iptables"
-	check "sudo without a password" "sudo -n true"
+	# The jailer specifically, not sudo in general: a correctly scoped rule
+	# grants this one binary, so `sudo -n true` failing proves nothing.
+	check "jailer runs without a password" "sudo -n '$JAILER' --version"
+	check "a tap is ready (firellm net-setup)" "ip link show fcllm1"
 	check "claude on host" "command -v claude"
 	echo
 	echo "  $ok ok, $bad failed"
-	if ! sudo -n true >/dev/null 2>&1; then
+	if ! sudo -n "$JAILER" --version >/dev/null 2>&1; then
 		echo
-		echo "  Runs will prompt for a password. For unattended use:"
+		echo "  Jailed runs will prompt for a password. To stop that:"
 		echo "      sudo $SCRIPTS/install-privileged.sh"
+		echo "  Or skip the jailer entirely with --no-jail."
+	fi
+	if ! ip link show fcllm1 >/dev/null 2>&1; then
+		echo
+		echo "  Networking will need root on every run. To stop that:"
+		echo "      sudo $ROOT/bin/firellm net-setup --count 4"
 	fi
 	((bad == 0))
 }
