@@ -428,7 +428,7 @@ test_prompt_required() {
 	project=$(make_project)
 
 	out=$("$FIRELLM" claude --workdir "$project" --resume abc123 2>&1)
-	contains "a bare --resume is refused" "no prompt" "$out"
+	contains "a bare --resume is refused" "nothing for the agent to do" "$out"
 
 	out=$("$FIRELLM" claude --workdir "$project" --no-jail --no-net --timeout 1 \
 		--resume abc123 "carry on" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
