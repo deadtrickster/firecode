@@ -20,7 +20,7 @@ ARG FIRELLM_TOOLCHAINS=lean
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	systemd systemd-sysv udev dbus-daemon \
 	e2fsprogs util-linux iproute2 iputils-ping netbase \
-	ca-certificates curl wget gnupg socat \
+	ca-certificates curl wget gnupg socat sudo passwd \
 	locales tzdata \
 	&& rm -rf /var/lib/apt/lists/*
 

@@ -15,52 +15,65 @@ fi
 # shellcheck source=/dev/null
 [[ -f /opt/firellm/run/env ]] && . /opt/firellm/run/env
 
-export IS_SANDBOX=1
-export FIRELLM=1
-export HOME=/root
-export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-export TERM=${TERM:-xterm-256color}
-
-[[ -d /src ]] && cd /src || true
+FIRELLM_USER=${FIRELLM_USER:-root}
+FIRELLM_HOME=${FIRELLM_HOME:-/root}
+FIRELLM_PROJECT=${FIRELLM_PROJECT:-/src}
 
 # A Firecracker guest cannot power itself off - there is no ACPI power button
 # to press from in here. A reset is what makes the VMM exit, and systemd
-# still unmounts /src properly on the way.
+# still unmounts the project drive properly on the way.
 firellm_finish() {
 	echo
-	echo "  shutting down, /src is being copied back out ..."
+	echo "  shutting down, the project is being copied back out ..."
 	sync
 	systemctl reboot
 }
-alias poweroff='firellm_finish'
-alias shutdown='firellm_finish'
 
 cat <<BANNER
 
   firellm microVM  (${FIRELLM_ID:-unknown})
 
-  /src                  your project, writable, copied back out on shutdown
-  ~/.claude ~/.opencode host config, writable, kept between runs
-  /root/FIRELLM.md      what this environment is
+  $FIRELLM_PROJECT
+      your project, writable, copied back out on shutdown. Same path as on
+      the host, and /src points at it.
+  ~/.claude ~/.opencode
+      your host config, writable, kept between runs
 
-  Nothing in here can reach the host filesystem. Type exit (or poweroff)
-  when you are done and the work in /src is copied back.
+  You are $FIRELLM_USER, with passwordless sudo. Nothing in here can reach
+  the host filesystem. Type exit when you are done.
 
 BANNER
 
+declare -a _fl_env=(
+	"HOME=$FIRELLM_HOME"
+	"USER=$FIRELLM_USER"
+	"LOGNAME=$FIRELLM_USER"
+	"IS_SANDBOX=1"
+	"FIRELLM=1"
+	"TERM=${TERM:-xterm-256color}"
+	"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+)
+
+declare -a _fl_cmd=(bash -i)
 if [[ ${FIRELLM_MODE:-} == interactive && -n ${FIRELLM_AGENT:-} ]]; then
 	if command -v "$FIRELLM_AGENT" >/dev/null 2>&1; then
 		echo "  starting $FIRELLM_AGENT ..."
 		echo
-		# Not exec: when the agent exits we still want to shut the VM down
-		# rather than drop back to a login prompt nobody is watching.
-		"$FIRELLM_AGENT"
-		firellm_finish
+		_fl_cmd=("$FIRELLM_AGENT")
 	else
 		echo "  WARNING: $FIRELLM_AGENT is not installed in this guest."
 		echo
 	fi
 fi
 
-# Typing exit, or Ctrl-D, ends the run.
-trap firellm_finish EXIT
+cd "$FIRELLM_PROJECT" 2>/dev/null || cd "$FIRELLM_HOME" || true
+
+# Not exec: when the shell or the agent exits we still want to shut the VM
+# down rather than drop back to a login prompt nobody is watching.
+if [[ $FIRELLM_USER == root ]]; then
+	env "${_fl_env[@]}" "${_fl_cmd[@]}"
+else
+	runuser -u "$FIRELLM_USER" -- env "${_fl_env[@]}" "${_fl_cmd[@]}"
+fi
+
+firellm_finish

@@ -140,11 +140,11 @@ device order:
 | label | mount | contents |
 | --- | --- | --- |
 | `firellm-root` | `/` | per-run sparse copy of the guest image, thrown away after |
-| `firellm-src` | `/src` | your project, writable, copied back out |
+| `firellm-src` | the project's host path | your project, writable, copied back out |
 | `firellm-cfg` | `/opt/firellm/config` | read-only: agent binaries and host config |
 | `firellm-ctl` | `/opt/firellm/run` | read-only: this run's parameters and guest scripts |
 | `firellm-state` | `/var/lib/firellm` | per-project agent home, survives the VM |
-| `firellm-x*` | `/mnt/<name>` | read-only: whatever `--add-dir` asked for |
+| `firellm-x*` | their host paths | read-only: whatever `--add-dir` asked for |
 
 Inside the guest, `firellm-mounts.service` mounts those, brings up the network,
 starts the MCP relays and layers `~/.claude` and `~/.opencode` as writable

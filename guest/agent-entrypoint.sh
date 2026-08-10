@@ -19,6 +19,9 @@ fi
 [[ -f $CTL_MNT/env ]] && . "$CTL_MNT/env"
 
 AGENT=${FIRELLM_AGENT:-claude}
+RUN_USER=${FIRELLM_USER:-root}
+RUN_HOME=${FIRELLM_HOME:-/root}
+PROJECT=${FIRELLM_PROJECT:-/src}
 
 declare -a ARGS=()
 if [[ -f $CTL_MNT/args ]]; then
@@ -33,33 +36,42 @@ if ! command -v "$AGENT" >/dev/null 2>&1; then
 	exit 127
 fi
 
-cd /src 2>/dev/null || cd /root || exit 1
+cd "$PROJECT" 2>/dev/null || cd "$RUN_HOME" || exit 1
+
+log "running as $RUN_USER in $(pwd): $AGENT ${ARGS[*]}"
+echo
 
 # Claude Code refuses --dangerously-skip-permissions as root unless it is
 # told it is in a sandbox. It is: that is the entire point of this harness.
-export IS_SANDBOX=1
-export FIRELLM=1
-export HOME=/root
-export TERM=${TERM:-dumb}
-export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+declare -a ENV=(
+	"HOME=$RUN_HOME"
+	"USER=$RUN_USER"
+	"LOGNAME=$RUN_USER"
+	"IS_SANDBOX=1"
+	"FIRELLM=1"
+	"TERM=${TERM:-dumb}"
+	"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+)
 
-log "running: $AGENT ${ARGS[*]}"
-log "cwd: $(pwd)"
-echo
+declare -a CMD=()
+if [[ -n ${FIRELLM_TIMEOUT:-} && ${FIRELLM_TIMEOUT} != 0 ]]; then
+	CMD=(timeout --signal=TERM --kill-after=30s "$FIRELLM_TIMEOUT")
+fi
+CMD+=("$AGENT" "${ARGS[@]}")
 
 rc=0
-if [[ -n ${FIRELLM_TIMEOUT:-} && ${FIRELLM_TIMEOUT} != 0 ]]; then
-	timeout --signal=TERM --kill-after=30s "$FIRELLM_TIMEOUT" \
-		"$AGENT" "${ARGS[@]}" </dev/null || rc=$?
-	if ((rc == 124)); then
-		log "agent hit the ${FIRELLM_TIMEOUT} timeout and was stopped"
-	fi
+if [[ $RUN_USER == root ]]; then
+	env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
 else
-	"$AGENT" "${ARGS[@]}" </dev/null || rc=$?
+	runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
+fi
+
+if ((rc == 124)); then
+	log "agent hit the ${FIRELLM_TIMEOUT} second timeout and was stopped"
 fi
 
 echo
 log "agent exited with status $rc"
-echo "$rc" >/src/.firellm-exit-status 2>/dev/null || true
+echo "$rc" >"$PROJECT/.firellm-exit-status" 2>/dev/null || true
 sync
 exit "$rc"

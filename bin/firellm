@@ -40,6 +40,7 @@ SYNC_BACK=1
 RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
+NO_MCP=0
 declare -a EXTRA_DIRS=()
 declare -a HOST_PORTS=()
 declare -a EXCLUDES=()
@@ -387,18 +388,20 @@ ensure_state_drive() {
 }
 
 # Claude Code keys a project's transcripts by its working directory, with
-# every non-alphanumeric character turned into a dash. The guest works in
-# /src, so a host session has to be re-keyed to "-src" to be resumable there.
+# every non-alphanumeric character turned into a dash. The guest works at the
+# same path the host does, so the key is the same on both sides.
 claude_project_slug() {
 	printf '%s' "$1" | tr -c 'A-Za-z0-9' '-'
 }
 
-# Copies this project's host transcripts into the guest's agent home, with
-# every reference to the host path rewritten to /src. Only touches the state
-# drive; the host's own sessions are read and never modified.
+# Copies this project's host transcripts into the guest's agent home. Verbatim
+# - the guest sees the project at the same absolute path, so every path in the
+# transcript already points at the right thing. Only the state drive is
+# touched; the host's own sessions are read and never modified.
 import_host_sessions() {
-	local workdir=$1 img=$2 only=${3:-} host_dir
-	host_dir="$CLAUDE_HOME/projects/$(claude_project_slug "$workdir")"
+	local workdir=$1 img=$2 only=${3:-} host_dir slug
+	slug=$(claude_project_slug "$workdir")
+	host_dir="$CLAUDE_HOME/projects/$slug"
 
 	if [[ ! -d $host_dir ]]; then
 		log "no host sessions recorded for $workdir, nothing to import"
@@ -417,54 +420,21 @@ import_host_sessions() {
 	# into a mounted image would need root; this does not.
 	sbin debugfs -R "rdump / $tmp" "$img" >/dev/null 2>&1 || true
 	rm -rf "$tmp/lost+found"
-	mkdir -p "$tmp/upper/claude/projects/-src"
 
-	local n
-	n=$(
-		python3 - "$host_dir" "$tmp/upper/claude/projects/-src" "$workdir" "$only" <<'PY'
-import json, os, sys
+	local dst="$tmp/upper/claude/projects/$slug"
+	mkdir -p "$dst"
 
-src_dir, dst_dir, workdir, only = sys.argv[1:5]
-workdir = workdir.rstrip("/")
+	local n=0 f
+	for f in "$host_dir"/*.jsonl; do
+		[[ -f $f ]] || continue
+		if [[ -n $only && $(basename "$f") != "$only"* ]]; then
+			continue
+		fi
+		cp -f "$f" "$dst/"
+		n=$((n + 1))
+	done
 
-def retarget(o):
-    if isinstance(o, str):
-        # Not just the cwd fields: the transcript is full of the host path
-        # inside prose, tool arguments and diffs, and all of it has to line
-        # up with where the project actually is in the guest.
-        return o.replace(workdir, "/src") if workdir in o else o
-    if isinstance(o, dict):
-        return {k: retarget(v) for k, v in o.items()}
-    if isinstance(o, list):
-        return [retarget(v) for v in o]
-    return o
-
-count = 0
-for name in sorted(os.listdir(src_dir)):
-    if not name.endswith(".jsonl"):
-        continue
-    if only and not name.startswith(only):
-        continue
-    out_lines = []
-    with open(os.path.join(src_dir, name)) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out_lines.append(json.dumps(retarget(json.loads(line))))
-            except Exception:
-                # A line we cannot parse is better kept verbatim than dropped.
-                out_lines.append(line)
-    with open(os.path.join(dst_dir, name), "w") as fh:
-        fh.write("\n".join(out_lines) + "\n")
-    count += 1
-
-print(count)
-PY
-	)
-
-	if [[ ${n:-0} -eq 0 ]]; then
+	if ((n == 0)); then
 		log "no matching sessions to import"
 		rm -rf "$tmp"
 		return 0
@@ -473,7 +443,7 @@ PY
 	mkimage_from_dir "$tmp" "$img.new" firellm-state "$size"
 	mv -f "$img.new" "$img"
 	rm -rf "$tmp"
-	log "imported $n host session(s) into the VM, paths rewritten to /src"
+	log "imported $n host session(s), resumable at their original paths"
 }
 
 cmd_state() {
@@ -736,6 +706,10 @@ launch() {
 			USE_GITIGNORE=0
 			shift
 			;;
+		--no-mcp)
+			NO_MCP=1
+			shift
+			;;
 		--import-sessions)
 			IMPORT_SESSIONS=1
 			shift
@@ -820,7 +794,7 @@ launch() {
 	# (a local llama-server or any other OpenAI-compatible endpoint).
 	local relay_ports
 	local -a mcp=()
-	read -r -a mcp <<<"$(discover_mcp_ports)"
+	((NO_MCP)) || read -r -a mcp <<<"$(discover_mcp_ports)"
 	relay_ports=$(printf '%s\n' ${mcp+"${mcp[@]}"} ${HOST_PORTS+"${HOST_PORTS[@]}"} |
 		grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
 	relay_ports=${relay_ports% }
@@ -869,16 +843,22 @@ launch() {
 		refuse_if_sensitive "$d"
 		n=$((n + 1))
 		base=$(basename "$d")
+		local img="$RUN_DIR/extra$n.ext4" stage="$RUN_DIR/extra$n"
+		log "adding $d read-only at /mnt/$base"
+		# Same gitignore filtering as the project itself: a checkout's .venv
+		# or node_modules is usually most of it and never what you wanted.
+		stage_project "$d" "$stage"
 		local bytes
-		bytes=$(du -sb --apparent-size "$d" 2>/dev/null | cut -f1)
+		bytes=$(du -sb --apparent-size "$stage" 2>/dev/null | cut -f1)
 		if ((bytes > 32 * 1024 * 1024 * 1024)); then
 			die "--add-dir $d is $((bytes / 1024 / 1024 / 1024))G - too big to copy into a VM"
 		fi
-		local img="$RUN_DIR/extra$n.ext4"
-		log "adding $d read-only at /mnt/$base"
-		mkimage_from_dir "$d" "$img" "firellm-x$n" "$(size_ro_dir "$d")"
+		mkimage_from_dir "$stage" "$img" "firellm-x$n" "$(size_ro_dir "$stage")"
+		rm -rf "$stage"
 		extra_drives+=("$img")
-		extra_spec+=("firellm-x$n:/mnt/$base")
+		# Mounted where it lives on the host, not under /mnt, so references
+		# to it from anywhere still resolve.
+		extra_spec+=("firellm-x$n:$d")
 	done
 
 	# --- control drive: this run's parameters, read-only in the guest
@@ -890,6 +870,15 @@ launch() {
 		[[ $AGENT != shell ]] && echo "FIRELLM_AGENT=$AGENT"
 		echo "FIRELLM_TIMEOUT=$TIMEOUT"
 		echo "FIRELLM_RELAY_PORTS='$relay_ports'"
+		# The guest mirrors the host's layout: same user, same uid, same home,
+		# same project path. An absolute path in a resumed transcript, in a
+		# CLAUDE.md or in a tool call then means the same thing in both places,
+		# and nothing has to be rewritten on the way in or out.
+		echo "FIRELLM_USER='$(id -un)'"
+		echo "FIRELLM_UID=$(id -u)"
+		echo "FIRELLM_GID=$(id -g)"
+		echo "FIRELLM_HOME='$HOME'"
+		echo "FIRELLM_PROJECT='$WORKDIR'"
 		echo "FIRELLM_EXTRA='${extra_spec[*]-}'"
 		# Read from the project, not from wherever firellm happens to live, so
 		# a repo-local identity wins the same way it would on the host.

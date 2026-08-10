@@ -1,32 +1,35 @@
 # You are running inside a firellm microVM
 
-This is a Firecracker microVM, started by the `firellm` harness under the
-Firecracker jailer. Nothing you do in here can reach the host: no host
-filesystem, no host processes, no host devices. You have full root.
+This is a Firecracker microVM, started by the `firellm` harness. Nothing you do
+in here can reach the host: no host filesystem, no host processes, no host
+devices. You are the same user you are on the host, with passwordless sudo.
 
 That is deliberate. Work without asking for permission to touch files, install
 packages, run builds or delete things. The blast radius is this VM.
 
 ## Layout
 
-- `/src` - the project, writable. This is your workspace.
-- `/mnt/*` - extra directories the run was given for reference, read-only.
-- `~/.claude`, `~/.opencode` - the host's agent config, as a writable overlay.
-  This one is on a drive that outlives the VM, so your session history is
-  still here on the next run.
-- `/opt/firellm/config` - read-only drive the above is layered on.
-- `/opt/firellm/run` - read-only drive with this run's parameters.
-- `/root/FIRELLM.md` - this file.
+The guest mirrors the host. Your project is at **the same absolute path** it
+has on the host, your home directory is the same, your uid is the same. Paths
+you remember from a previous session still mean what they meant. `/src` is a
+symlink to the project if you want something shorter to type.
+
+- the project directory - writable, this is your workspace
+- other directories the run was given for reference - read-only, also at their
+  original paths
+- `~/.claude`, `~/.opencode` - your config, writable, on a drive that outlives
+  the VM. Your session history is still here on the next run.
+- `~/FIRELLM.md` - this file.
 
 ## What happens to your work
 
-When you exit, the host copies `/src` out to a **sibling directory** next to
-the original project (`<project>-firellm-<id>`). The original tree is never
-written to. So:
+When you exit, the host copies the project out to a **sibling directory** next
+to the original (`<project>-<timestamp>`). The original tree is never written
+to. So:
 
 - Commit or leave your changes in the working tree, either is fine.
-- Do not try to push anywhere unless you were asked to.
-- Anything outside `/src` is thrown away with the VM.
+- Do not push anywhere unless you were asked to.
+- Anything outside the project directory is thrown away with the VM.
 
 ## Environment
 
@@ -38,11 +41,11 @@ written to. So:
   OpenAI-compatible model server. MCP servers configured as local `stdio`
   commands on the host are *not* available here - their binaries live on the
   host filesystem.
-- Git identity is inherited from the host's `git config`. Commit signing is
-  off, since there is no key in here and nothing can answer a passphrase.
+- Git identity is inherited from the host. Commit signing is off, since there
+  is no key in here and nothing can answer a passphrase.
 
 ## Tools
 
 Debian/Ubuntu userland with git, build-essential, python3, node, bun, mise,
 ripgrep, fd, jq, tmux, vim. If the image was built with `--full`, also rust,
-go, zig, clang/llvm and sbcl. `apt-get install` works if you need more.
+go, zig, clang/llvm and sbcl. `sudo apt-get install` works if you need more.

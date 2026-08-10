@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # firellm guest setup - runs inside the microVM, before the agent.
 #
-# Mounts the firellm drives, configures networking, relays the host's MCP
-# servers over vsock and lays out the agent's home directory. Started by
-# firellm-mounts.service, which is ordered before firellm-agent.service.
+# Reproduces the host's layout inside the guest: same user, same uid, same
+# home directory, project mounted at the path it has on the host. That is
+# what lets a session recorded on the host be resumed in here unchanged -
+# every absolute path in it still points at the right thing.
 #
 # Deliberately not "set -e": a failure in any one step must not stop the
 # rest of the setup, otherwise a missing optional drive kills the whole run.
@@ -11,7 +12,6 @@ set -u
 
 CONFIG_MNT=/opt/firellm/config
 CTL_MNT=/opt/firellm/run
-SRC_MNT=/src
 STATE=/var/lib/firellm
 
 # systemd starts this with an empty environment, and git refuses to do
@@ -33,7 +33,7 @@ wait_for_label() {
 mount_label() {
 	local label=$1 target=$2
 	shift 2
-	mkdir -p "$target"
+	mkdir -p "$target" 2>/dev/null
 	# The control drive is already mounted when this script re-execs itself
 	# from that very drive.
 	if mountpoint -q "$target"; then
@@ -51,22 +51,40 @@ mount_label() {
 	return 1
 }
 
-# Give ~/.<name> the contents of the read-only config drive, but writable.
-# The agents rewrite their own config and history constantly, so a plain
-# bind mount of the read-only drive is not enough.
-overlay_home() {
-	local name=$1
-	local lower="$CONFIG_MNT/$name" target="/root/.$name"
-	[[ -d $lower ]] || return 0
-	mkdir -p "$target" "$STATE/upper/$name" "$STATE/work/$name"
-	if mount -t overlay "firellm-$name" \
-		-o "lowerdir=$lower,upperdir=$STATE/upper/$name,workdir=$STATE/work/$name" \
-		"$target" 2>/dev/null; then
-		log "$target is a writable overlay on the read-only config drive"
-	else
-		log "no overlayfs, copying ~/.$name instead"
-		cp -a "$lower/." "$target/" 2>/dev/null || true
+# Recreate the host's account, so paths under it and file ownership both line
+# up. The agent runs as this user, not as root.
+setup_user() {
+	[[ -n ${FIRELLM_USER:-} && -n ${FIRELLM_UID:-} ]] || return 0
+
+	# The base image ships its own "ubuntu" account on uid/gid 1000, which is
+	# exactly the id a first desktop user has. Whoever is sitting on the id
+	# has to go before the host's account can take it.
+	local squatter
+	# shellcheck disable=SC2153  # set in the env file sourced from the control drive
+	if ! getent group "$FIRELLM_USER" >/dev/null; then
+		squatter=$(getent group "$FIRELLM_GID" | cut -d: -f1)
+		[[ -n $squatter ]] && groupdel -f "$squatter" 2>/dev/null
+		groupadd -g "$FIRELLM_GID" "$FIRELLM_USER" 2>/dev/null
 	fi
+	if ! getent passwd "$FIRELLM_USER" >/dev/null; then
+		squatter=$(getent passwd "$FIRELLM_UID" | cut -d: -f1)
+		[[ -n $squatter ]] && userdel -f "$squatter" 2>/dev/null
+		useradd -u "$FIRELLM_UID" -g "$FIRELLM_GID" -d "$FIRELLM_HOME" \
+			-s /bin/bash -M "$FIRELLM_USER" 2>/dev/null
+	fi
+	if ! getent passwd "$FIRELLM_USER" >/dev/null; then
+		log "WARNING: could not create $FIRELLM_USER, falling back to root"
+		FIRELLM_USER=root
+		return 0
+	fi
+	mkdir -p "$FIRELLM_HOME"
+	chown "$FIRELLM_UID:$FIRELLM_GID" "$FIRELLM_HOME"
+
+	# There is nothing in here worth protecting from its own user, and an
+	# unattended agent cannot answer a password prompt.
+	echo "$FIRELLM_USER ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/firellm
+	chmod 0440 /etc/sudoers.d/firellm
+	log "user $FIRELLM_USER ($FIRELLM_UID:$FIRELLM_GID) home $FIRELLM_HOME"
 }
 
 setup_network() {
@@ -94,7 +112,7 @@ setup_network() {
 # host-side socat forwards it to 127.0.0.1:N. So localhost:N in here is
 # localhost:N out there, and no configuration on either side has to change.
 setup_relays() {
-	local p ports=${FIRELLM_RELAY_PORTS:-${FIRELLM_MCP_PORTS:-}}
+	local p ports=${FIRELLM_RELAY_PORTS:-}
 	[[ -n $ports ]] || return 0
 	if ! command -v socat >/dev/null 2>&1; then
 		log "WARNING: socat missing, host services will not be reachable"
@@ -112,8 +130,8 @@ setup_relays() {
 	done
 }
 
-# Extra host directories the run was given for context, as read-only copies.
-# Nothing written here goes anywhere - only /src is copied back out.
+# Extra directories the run was given for reference, read-only, each at the
+# same absolute path it has on the host.
 mount_extras() {
 	local spec label target
 	for spec in ${FIRELLM_EXTRA:-}; do
@@ -124,18 +142,54 @@ mount_extras() {
 	done
 }
 
+# The project, writable, at its host path. /src is kept as a symlink because
+# it is a convenient thing to be able to type.
+mount_project() {
+	local target=${FIRELLM_PROJECT:-/src}
+	mkdir -p "$target" 2>/dev/null
+	mount_label firellm-src "$target"
+	if [[ $target != /src ]]; then
+		# The image ships /src as a directory; linking onto it would put the
+		# link inside it instead of replacing it.
+		[[ -d /src && ! -L /src ]] && rmdir /src 2>/dev/null
+		ln -sfn "$target" /src
+	fi
+}
+
+# Give the agent's home directory the host's configuration, writable, and on
+# a drive that outlives the VM so sessions are still here on the next run.
+overlay_home() {
+	local name=$1
+	local lower="$CONFIG_MNT/$name" target="${FIRELLM_HOME:-/root}/.$name"
+	[[ -d $lower ]] || return 0
+	mkdir -p "$target" "$STATE/upper/$name" "$STATE/work/$name"
+	if mount -t overlay "firellm-$name" \
+		-o "lowerdir=$lower,upperdir=$STATE/upper/$name,workdir=$STATE/work/$name" \
+		"$target" 2>/dev/null; then
+		log "$target is a writable overlay kept between runs"
+	else
+		log "no overlayfs, copying $target instead"
+		cp -a "$lower/." "$target/" 2>/dev/null || true
+	fi
+	chown -R "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$target" 2>/dev/null || true
+}
+
 setup_git() {
-	[[ -n ${FIRELLM_GIT_NAME:-} ]] && git config --global user.name "$FIRELLM_GIT_NAME"
-	[[ -n ${FIRELLM_GIT_EMAIL:-} ]] && git config --global user.email "$FIRELLM_GIT_EMAIL"
-	# No signing key in here, and an unattended agent cannot answer a passphrase.
-	git config --global commit.gpgsign false
-	git config --global tag.gpgsign false
-	git config --global --add safe.directory '*'
+	local as=(runuser -u "${FIRELLM_USER:-root}" --)
+	[[ -n ${FIRELLM_GIT_NAME:-} ]] &&
+		"${as[@]}" git config --global user.name "$FIRELLM_GIT_NAME"
+	[[ -n ${FIRELLM_GIT_EMAIL:-} ]] &&
+		"${as[@]}" git config --global user.email "$FIRELLM_GIT_EMAIL"
+	# No signing key in here, and an unattended agent cannot answer a
+	# passphrase prompt.
+	"${as[@]}" git config --global commit.gpgsign false
+	"${as[@]}" git config --global tag.gpgsign false
+	"${as[@]}" git config --global --add safe.directory '*'
 	return 0
 }
 
 main() {
-	mkdir -p "$STATE" "$SRC_MNT" "$CTL_MNT" "$CONFIG_MNT"
+	mkdir -p "$STATE" "$CTL_MNT" "$CONFIG_MNT"
 
 	mount_label firellm-ctl "$CTL_MNT" -o ro
 
@@ -151,7 +205,12 @@ main() {
 	# shellcheck source=/dev/null
 	[[ -f $CTL_MNT/env ]] && . "$CTL_MNT/env"
 
-	mount_label firellm-src "$SRC_MNT"
+	setup_user
+
+	# Extras first: the project can sit inside one of them, and then its
+	# mount point has to already exist.
+	mount_extras
+	mount_project
 	mount_label firellm-cfg "$CONFIG_MNT" -o ro
 
 	# Docker refuses to bake these into an image, so they are set here.
@@ -161,7 +220,6 @@ main() {
 
 	setup_network
 	setup_relays
-	mount_extras
 
 	# Must be mounted before the overlays: it holds their upper layers, which
 	# is what makes the agent's sessions survive the VM.
@@ -172,7 +230,8 @@ main() {
 	if [[ -f $CONFIG_MNT/claude.json ]]; then
 		# Claude rewrites this file, so it must be a real copy, not a symlink
 		# onto the read-only drive.
-		cp -f "$CONFIG_MNT/claude.json" /root/.claude.json
+		cp -f "$CONFIG_MNT/claude.json" "${FIRELLM_HOME:-/root}/.claude.json"
+		chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "${FIRELLM_HOME:-/root}/.claude.json"
 	fi
 
 	# The agent binaries live on the read-only config drive so they always
@@ -188,7 +247,7 @@ main() {
 	setup_git
 
 	if [[ -f $CTL_MNT/context.md ]]; then
-		cp -f "$CTL_MNT/context.md" /root/FIRELLM.md
+		cp -f "$CTL_MNT/context.md" "${FIRELLM_HOME:-/root}/FIRELLM.md"
 	fi
 
 	log "setup complete (mode=${FIRELLM_MODE:-interactive} agent=${FIRELLM_AGENT:-none})"
