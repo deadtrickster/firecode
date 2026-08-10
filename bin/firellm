@@ -559,45 +559,118 @@ cmd_state() {
 
 NET_SLOT=""
 TAP_DEV=""
+NET_ADOPTED=0
+NET_FD=""
 
+# Each VM gets its own tap and its own /30, so several can run at once. A slot
+# is held with a lock file rather than by looking at what exists, because a
+# persistent tap left behind by net-setup exists whether or not it is in use.
 alloc_net_slot() {
-	local s
+	local s fd
+	mkdir -p "$STATE_DIR/net"
 	for ((s = 1; s <= 250; s++)); do
-		if ! ip link show "fcllm$s" >/dev/null 2>&1; then
+		exec {fd}>"$STATE_DIR/net/$s.lock"
+		if flock -n "$fd"; then
+			NET_FD=$fd
 			echo "$s"
 			return 0
 		fi
+		exec {fd}>&-
 	done
 	return 1
+}
+
+# One-time root setup for a tap. Made persistent and owned by the invoking
+# user, so afterwards firecracker can open it with no privileges at all.
+net_create_tap() {
+	local dev=$1 slot=$2 owner
+	# Under sudo, id -u is 0. The tap has to belong to whoever will actually
+	# run firecracker, or the whole point of making it persistent is lost.
+	owner=${SUDO_UID:-$(id -u)}
+	priv ip tuntap add dev "$dev" mode tap user "$owner"
+	priv ip addr add "172.16.$slot.1/30" dev "$dev"
+	priv ip link set "$dev" up
+	priv sysctl -qw net.ipv4.ip_forward=1
+
+	# Docker sets the FORWARD policy to DROP, so the masquerade rule alone is
+	# not enough: the traffic has to be allowed through the filter table too.
+	priv iptables -t nat -C POSTROUTING -s "172.16.$slot.0/30" ! -o "$dev" \
+		-j MASQUERADE 2>/dev/null ||
+		priv iptables -t nat -A POSTROUTING -s "172.16.$slot.0/30" ! -o "$dev" -j MASQUERADE
+	priv iptables -C FORWARD -i "$dev" -j ACCEPT 2>/dev/null ||
+		priv iptables -I FORWARD 1 -i "$dev" -j ACCEPT
+	priv iptables -C FORWARD -o "$dev" -j ACCEPT 2>/dev/null ||
+		priv iptables -I FORWARD 1 -o "$dev" -j ACCEPT
 }
 
 net_up() {
 	NET_SLOT=$(alloc_net_slot) || die "no free network slot (250 VMs already running?)"
 	TAP_DEV="fcllm$NET_SLOT"
-	local host_ip="172.16.$NET_SLOT.1"
 
-	log "network: $TAP_DEV, guest 172.16.$NET_SLOT.2 via $host_ip"
-	priv ip tuntap add dev "$TAP_DEV" mode tap user "$(id -u)"
-	priv ip addr add "$host_ip/30" dev "$TAP_DEV"
-	priv ip link set "$TAP_DEV" up
-	priv sysctl -qw net.ipv4.ip_forward=1
+	if ip link show "$TAP_DEV" >/dev/null 2>&1; then
+		# Left in place by net-setup. Nothing here needs root.
+		NET_ADOPTED=1
+		log "network: $TAP_DEV (already set up), guest 172.16.$NET_SLOT.2"
+		return 0
+	fi
 
-	# Docker sets the FORWARD policy to DROP, so the masquerade rule alone is
-	# not enough: the traffic has to be allowed through the filter table too.
-	priv iptables -t nat -A POSTROUTING -s "172.16.$NET_SLOT.0/30" \
-		! -o "$TAP_DEV" -j MASQUERADE
-	priv iptables -I FORWARD 1 -i "$TAP_DEV" -j ACCEPT
-	priv iptables -I FORWARD 1 -o "$TAP_DEV" -j ACCEPT
+	log "network: $TAP_DEV, guest 172.16.$NET_SLOT.2 via 172.16.$NET_SLOT.1"
+	net_create_tap "$TAP_DEV" "$NET_SLOT"
 }
 
 net_down() {
 	[[ -n $TAP_DEV ]] || return 0
-	priv iptables -t nat -D POSTROUTING -s "172.16.$NET_SLOT.0/30" \
-		! -o "$TAP_DEV" -j MASQUERADE 2>/dev/null || true
-	priv iptables -D FORWARD -i "$TAP_DEV" -j ACCEPT 2>/dev/null || true
-	priv iptables -D FORWARD -o "$TAP_DEV" -j ACCEPT 2>/dev/null || true
-	priv ip link del "$TAP_DEV" 2>/dev/null || true
+	if ((NET_ADOPTED == 0)); then
+		priv iptables -t nat -D POSTROUTING -s "172.16.$NET_SLOT.0/30" \
+			! -o "$TAP_DEV" -j MASQUERADE 2>/dev/null || true
+		priv iptables -D FORWARD -i "$TAP_DEV" -j ACCEPT 2>/dev/null || true
+		priv iptables -D FORWARD -o "$TAP_DEV" -j ACCEPT 2>/dev/null || true
+		priv ip link del "$TAP_DEV" 2>/dev/null || true
+	fi
 	TAP_DEV=""
+	[[ -n $NET_FD ]] && exec {NET_FD}>&- 2>/dev/null
+	NET_FD=""
+}
+
+# Pre-create taps so ordinary runs need no privileges for networking. One
+# sudo now instead of one per run.
+cmd_net_setup() {
+	local count=4 s dev
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--count)
+			count="$2"
+			shift 2
+			;;
+		--teardown)
+			for ((s = 1; s <= 250; s++)); do
+				dev="fcllm$s"
+				ip link show "$dev" >/dev/null 2>&1 || continue
+				priv iptables -t nat -D POSTROUTING -s "172.16.$s.0/30" \
+					! -o "$dev" -j MASQUERADE 2>/dev/null || true
+				priv iptables -D FORWARD -i "$dev" -j ACCEPT 2>/dev/null || true
+				priv iptables -D FORWARD -o "$dev" -j ACCEPT 2>/dev/null || true
+				priv ip link del "$dev" 2>/dev/null || true
+				log "removed $dev"
+			done
+			return 0
+			;;
+		*) die "usage: firellm net-setup [--count N] [--teardown]" ;;
+		esac
+	done
+
+	for ((s = 1; s <= count; s++)); do
+		dev="fcllm$s"
+		if ip link show "$dev" >/dev/null 2>&1; then
+			log "$dev already there"
+			continue
+		fi
+		net_create_tap "$dev" "$s"
+		log "$dev up, for a guest on 172.16.$s.2"
+	done
+	echo
+	echo "  $count VMs can now have a network without any further privileges."
+	echo "  Undo with: firellm net-setup --teardown"
 }
 
 # ---------------------------------------------------------------- MCP relay
@@ -1188,6 +1261,7 @@ firellm - run a coding agent in a Firecracker microVM
 
   firellm setup                 fetch firecracker, jailer and a guest kernel
   firellm prepare [--full]      build the guest rootfs (via docker, no root)
+  firellm net-setup [--count N] pre-create taps once, so runs need no root
   firellm doctor                check the host is ready
 
   firellm claude [args...]      run claude in a VM over the current directory
@@ -1280,6 +1354,10 @@ gc)
 state)
 	shift
 	cmd_state "$@"
+	;;
+net-setup)
+	shift
+	cmd_net_setup "$@"
 	;;
 spawn-server)
 	shift

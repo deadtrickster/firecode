@@ -30,10 +30,28 @@ wait_for_label() {
 	return 1
 }
 
+# mkdir -p, but every directory this actually creates belongs to the run user.
+# Mount points for a project at, say, /tmp/scratch/thing mean inventing the
+# parents, and a root-owned parent is not a detail: Claude Code refuses a temp
+# directory it does not own, and builds write next to their source all the time.
+mkdir_owned() {
+	local path=$1 part="" seg
+	local uid=${FIRELLM_UID:-0} gid=${FIRELLM_GID:-0}
+	local IFS=/
+	for seg in $path; do
+		[[ -z $seg ]] && continue
+		part="$part/$seg"
+		if [[ ! -d $part ]]; then
+			mkdir "$part" 2>/dev/null || return 1
+			chown "$uid:$gid" "$part" 2>/dev/null
+		fi
+	done
+}
+
 mount_label() {
 	local label=$1 target=$2
 	shift 2
-	mkdir -p "$target" 2>/dev/null
+	mkdir_owned "$target"
 	# The control drive is already mounted when this script re-execs itself
 	# from that very drive.
 	if mountpoint -q "$target"; then
@@ -146,7 +164,7 @@ mount_extras() {
 # it is a convenient thing to be able to type.
 mount_project() {
 	local target=${FIRELLM_PROJECT:-/src}
-	mkdir -p "$target" 2>/dev/null
+	mkdir_owned "$target"
 	mount_label firellm-src "$target" || return 0
 
 	# mkfs.ext4 -d takes ownership of everything it copies from the staging
@@ -154,6 +172,11 @@ mount_project() {
 	# belongs to root. Without this the agent cannot create a single file in
 	# the top level of its own project.
 	chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$target"
+
+	# Every ext4 filesystem gets a lost+found. In the top level of a project
+	# it is just a root-owned directory the agent has to stop and think about,
+	# and this drive is thrown away rather than fsck'd.
+	rm -rf "$target/lost+found"
 	if [[ $target != /src ]]; then
 		# The image ships /src as a directory; linking onto it would put the
 		# link inside it instead of replacing it.
