@@ -573,6 +573,98 @@ import_host_sessions() {
 	log "imported $n host session(s), resumable at their original paths"
 }
 
+# A project's whole persistent state, as three drives.
+snapshot_parts() {
+	local slug=$1
+	echo "$STATE_DIR/$slug.ext4:agent"
+	echo "$STATE_DIR/$slug-src.ext4:src"
+	echo "$STATE_DIR/$slug-root.ext4:root"
+}
+
+cmd_snapshot() {
+	local sub=${1:-take}
+	case "$sub" in
+	ls | list | rm | restore | take) shift ;;
+	*) sub=take ;;
+	esac
+
+	local dir=$PWD slug base
+	slug=$(project_slug "$(cd "$dir" && pwd)")
+	base="$STATE_DIR/snapshots/$slug"
+
+	case "$sub" in
+	take)
+		local name=${1:-}
+		[[ -n $name ]] || name=$(date +%Y%m%d-%H%M%S)
+		local dest="$base/$name"
+		[[ -e $dest ]] && die "snapshot $name already exists"
+		mkdir -p "$dest"
+
+		local part path label n=0
+		while IFS= read -r part; do
+			path=${part%:*}
+			label=${part##*:}
+			[[ -f $path ]] || continue
+			log "capturing $label"
+			cp --sparse=always "$path" "$dest/$label.ext4"
+			n=$((n + 1))
+		done < <(snapshot_parts "$slug")
+
+		((n > 0)) || {
+			rmdir "$dest" 2>/dev/null
+			die "nothing to snapshot yet - run something in this project first"
+		}
+		printf '%s\n' "$dir" >"$dest/project"
+		log "snapshot $name: $n drive(s), $(du -sh "$dest" | cut -f1) on disk"
+		echo "  restore with:  firellm snapshot restore $name"
+		;;
+	ls | list)
+		if ! compgen -G "$base/*" >/dev/null; then
+			echo "no snapshots for $dir"
+			return 0
+		fi
+		local d
+		for d in "$base"/*/; do
+			printf '%-24s %-6s %s\n' "$(basename "$d")" \
+				"$(du -sh "$d" 2>/dev/null | cut -f1)" \
+				"$(date -r "$d" '+%Y-%m-%d %H:%M')"
+		done
+		;;
+	restore)
+		local name=${1:-}
+		[[ -n $name ]] || die "usage: firellm snapshot restore <name>"
+		local src="$base/$name"
+		[[ -d $src ]] || die "no snapshot $name for $dir"
+		# Refuse while a run holds the project, or we would be swapping the
+		# drives out from under a live VM.
+		mkdir -p "$STATE_DIR"
+		local fd
+		exec {fd}>"$STATE_DIR/$slug.lock"
+		flock -n "$fd" || die "a run is using this project right now"
+
+		local part path label
+		while IFS= read -r part; do
+			path=${part%:*}
+			label=${part##*:}
+			[[ -f $src/$label.ext4 ]] || continue
+			cp --sparse=always "$src/$label.ext4" "$path.restoring"
+			mv -f "$path.restoring" "$path"
+			log "restored $label"
+		done < <(snapshot_parts "$slug")
+		exec {fd}>&-
+		log "restored snapshot $name - the next run continues from there"
+		;;
+	rm)
+		local name=${1:-}
+		[[ -n $name ]] || die "usage: firellm snapshot rm <name>"
+		[[ -d $base/$name ]] || die "no snapshot $name for $dir"
+		rm -rf "${base:?}/${name:?}"
+		log "removed snapshot $name"
+		;;
+	*) die "usage: firellm snapshot [take [name]|ls|restore <name>|rm <name>]" ;;
+	esac
+}
+
 cmd_state() {
 	local sub=${1:-list}
 	shift || true
@@ -1038,6 +1130,12 @@ launch() {
 		fi
 	fi
 
+	# Resuming means resuming the whole thing. The conversation without the
+	# tree it was talking about is worse than useless - the agent is told it
+	# made changes that are not there - and without the packages it installed
+	# it starts by installing them again.
+	((RESUME_TREE)) && KEEP_ROOT=1
+
 	local id
 	# BASHPID, not $$: in a subshell $$ is still the parent's pid, so two runs
 	# launched together from one shell would collide on the same run id.
@@ -1497,6 +1595,11 @@ firellm - run a coding agent in a Firecracker microVM
   firellm extract <id> [dest]   pull a run's /src back out
   firellm gc [keep]             drop old run drives (default: keep 5)
 
+  firellm snapshot [name]       capture this project's VM state
+  firellm snapshot ls           list snapshots
+  firellm snapshot restore NAME go back to one
+  firellm snapshot rm NAME      drop one
+
   firellm state list            per-project agent state drives
   firellm state sessions [dir]  session ids you can --resume
   firellm state reset [dir]     forget this project's agent history
@@ -1580,6 +1683,10 @@ gc)
 state)
 	shift
 	cmd_state "$@"
+	;;
+snapshot | snap)
+	shift
+	cmd_snapshot "$@"
 	;;
 net-setup)
 	shift

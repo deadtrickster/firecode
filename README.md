@@ -143,6 +143,26 @@ firellm claude --add-dir ~/Projects "match the API the sibling repo uses"
 Those are copies. The guest can read them; nothing written there goes back out.
 The only thing that ever comes back is `/src`.
 
+## Snapshots
+
+A project's VM state is three drives: the agent's home (sessions), the working
+tree, and the rootfs. `snapshot` captures all three together.
+
+```sh
+firellm snapshot before-the-refactor
+firellm snapshot ls
+firellm snapshot restore before-the-refactor
+firellm snapshot rm before-the-refactor
+```
+
+Restoring puts the next run back exactly where the snapshot was taken: same
+conversation, same working tree, same installed packages. They are sparse
+copies, so a snapshot of a 13G set of drives is more like 1.4G on disk.
+
+This is disk state, not a paused VM. Firecracker can snapshot memory too, but
+that only helps for a VM that is still running - and a session you ended with
+Ctrl-C is not.
+
 ## Keeping what the agent installs
 
 The guest rootfs is thrown away after every run, so an SDK or a set of apt
