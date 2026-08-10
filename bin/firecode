@@ -864,9 +864,31 @@ NET_FD=""
 # substitution runs in a subshell, so the descriptor holding the lock would be
 # closed the moment it returned, and every VM would take the same slot.
 alloc_net_slot() {
-	local s fd
+	local s fd i
 	mkdir -p "$STATE_DIR/net"
+
+	# Try this project's own slot first, derived from its path, so a given
+	# project keeps the same guest address run after run and a dashboard it
+	# serves stays at a URL you can bookmark. Chosen from the taps that
+	# already exist, since any other slot would need root to create one.
+	local preferred=1
+	local -a ready=()
 	for ((s = 1; s <= 250; s++)); do
+		[[ -e /sys/class/net/fccode$s ]] && ready+=("$s")
+	done
+	if [[ -n ${SLUG:-} && ${#ready[@]} -gt 0 ]]; then
+		local h
+		h=$((0x$(printf '%s' "$SLUG" | sha256sum | cut -c1-4)))
+		preferred=${ready[$((h % ${#ready[@]}))]}
+	fi
+
+	for ((i = 0; i <= 250; i++)); do
+		if ((i == 0)); then
+			s=$preferred
+		else
+			s=$i
+			((s == preferred)) && continue
+		fi
 		exec {fd}>"$STATE_DIR/net/$s.lock"
 		if ! flock -n "$fd"; then
 			exec {fd}>&-

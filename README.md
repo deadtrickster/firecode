@@ -195,7 +195,10 @@ binaries are on the host filesystem, which is the thing being kept out. They
 are dropped, and named when the config drive is built.
 
 **The guest, from the host.** Your host is the other end of the guest's link, so
-a dev server it starts is directly reachable - firecode prints the address:
+a dev server it starts is directly reachable. A project keeps the same address
+across runs - it is picked from the taps that exist by hashing the project path
+- so a dashboard stays at a URL you can bookmark. firecode prints it either
+way, and falls back to any free tap when that one is busy:
 
 ```
 [firecode] guest is 172.16.1.2 - a server it starts on PORT is at
