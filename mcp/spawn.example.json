@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Copy to <repo>/spawn.json and edit. Start it with: firellm spawn-server",
+    "Then give a guest access to it with: firellm claude --host-port 9770 ...",
+    "",
+    "Projects are named keys on purpose. The caller picks a name, never a",
+    "path, so an agent in a VM cannot ask for a directory you did not list."
+  ],
+
+  "projects": {
+    "firellm": "~/Projects/firellm"
+  },
+
+  "max_concurrent": 2,
+  "max_total": 20,
+  "default_timeout": 3600,
+
+  "host_ports": [18080],
+
+  "agent": "claude",
+  "extra_args": []
+}

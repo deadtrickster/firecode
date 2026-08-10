@@ -198,6 +198,52 @@ than it was configured with, whatever happens inside. `--cgroups` additionally
 caps the host-side VMM process through the jailer, which is mostly redundant
 and off by default because cgroup delegation is fiddly on systemd hosts.
 
+## Spawning more VMs
+
+Firecracker exposes no virtualization extensions to its guests, so a firellm
+VM can never run a firellm VM. What it can do is ask the host to start a
+*sibling*, through an MCP server that runs on the host and is reached over the
+same vsock relay as everything else:
+
+```sh
+cp mcp/spawn.example.json spawn.json    # list the projects that may be spawned for
+firellm spawn-server                    # host side, listens on 127.0.0.1:9770
+firellm claude --host-port 9770 "farm this out across the sub-projects"
+```
+
+Tools: `list_projects`, `spawn`, `status`, `output`, `cancel`.
+
+This inverts the trust direction, so it is deliberately narrow. Projects are
+named keys from the config, never paths from the caller - otherwise an agent
+could ask for any directory it liked and read it in a VM it controls. Children
+are started with `--no-mcp` and an empty `--mcp-config`, so they cannot reach
+the server and spawn in turn. Concurrency and total runs are capped.
+
+## Tests
+
+```sh
+firellm test           # everything, boots VMs, a few minutes
+firellm test --quick   # host-side only, seconds
+firellm test denylist  # one by name
+```
+
+They run with `--no-jail --no-net`, so no privileges are needed. What they pin
+down, in rough order of how much it would hurt to get wrong:
+
+- your host transcripts are byte-identical after an import, checked against the
+  real `~/.claude` because that is the thing that would hurt
+- a guest that deletes its entire project leaves the host tree untouched - and
+  the guest really can delete it, or the test proves nothing
+- the denylist refuses a path as `--workdir`, as a subdirectory of a listed
+  entry, and as `--add-dir`, and credential directories are refused with no
+  config at all
+- gitignored files stay out, git history comes along
+- the guest's project path, home and uid match the host's
+- the agent's home survives into the next run
+- an imported transcript lands under the same project key with its paths intact
+- work reaches the result directory and does not leak into the source tree
+- an unchanged reference tree is not re-imaged, a changed one is
+
 ## Housekeeping
 
 ```sh

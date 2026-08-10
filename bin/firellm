@@ -1281,6 +1281,14 @@ state)
 	shift
 	cmd_state "$@"
 	;;
+spawn-server)
+	shift
+	exec python3 "$ROOT/mcp/firellm-spawn.py" "$@"
+	;;
+test)
+	shift
+	exec "$ROOT/tests/run-tests.sh" "$@"
+	;;
 claude | opencode)
 	agent=$1
 	shift

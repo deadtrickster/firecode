@@ -147,7 +147,13 @@ mount_extras() {
 mount_project() {
 	local target=${FIRELLM_PROJECT:-/src}
 	mkdir -p "$target" 2>/dev/null
-	mount_label firellm-src "$target"
+	mount_label firellm-src "$target" || return 0
+
+	# mkfs.ext4 -d takes ownership of everything it copies from the staging
+	# directory, but the filesystem's own root inode is made by mke2fs and
+	# belongs to root. Without this the agent cannot create a single file in
+	# the top level of its own project.
+	chown "${FIRELLM_UID:-0}:${FIRELLM_GID:-0}" "$target"
 	if [[ $target != /src ]]; then
 		# The image ships /src as a directory; linking onto it would put the
 		# link inside it instead of replacing it.
