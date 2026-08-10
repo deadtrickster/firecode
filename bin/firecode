@@ -8,7 +8,8 @@ set -euo pipefail
 
 # Resolved, so this still finds the repo when it is reached through a symlink
 # in ~/bin rather than by its real path.
-ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
 IMAGES="$ROOT/images"
 GUEST="$ROOT/guest"
 SCRIPTS="$ROOT/scripts"
@@ -16,6 +17,9 @@ VENDOR="$ROOT/vendor/bin"
 RUNS="$ROOT/runs"
 STATE_DIR="$ROOT/state"
 JAIL_BASE="$ROOT/.jail"
+
+# The command as invoked, so a multiplexer session can re-run it verbatim.
+declare -a FIRECODE_ARGV=("$@")
 
 FC="$VENDOR/firecracker"
 JAILER="$VENDOR/jailer"
@@ -45,6 +49,7 @@ RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
 NO_MCP=0
+NO_TMUX=0
 FRESH_ROOT=0
 declare -a EXTRA_DIRS=()
 declare -a HOST_PORTS=()
@@ -632,6 +637,40 @@ snapshot_parts() {
 
 # Files in or out of a VM that is running now. Firecracker cannot mount a host
 # directory into a guest, so this streams a tar over vsock instead.
+# tmux will not keep a dot in a session name - it silently becomes an
+# underscore - so the name has to be built the same way on both sides or
+# attach never finds what launch created.
+session_name() {
+	local n=${1:-}
+	[[ -n $n ]] || n=$(basename "$PWD")
+	echo "firecode/${n//./_}"
+}
+
+# Sessions are named after the project, so this needs no arguments in the
+# usual case: you are standing in the project you want.
+cmd_attach() {
+	local sess
+	sess=$(session_name "${1:-}")
+	local mux=tmux
+	command -v byobu >/dev/null 2>&1 && mux=byobu
+	if ! tmux has-session -t "$sess" 2>/dev/null; then
+		echo "no session for ${1:-$(basename "$PWD")}. Running ones:"
+		cmd_sessions
+		return 1
+	fi
+	exec "$mux" attach -t "$sess"
+}
+
+cmd_sessions() {
+	local out
+	out=$(tmux ls 2>/dev/null | grep '^firecode/' || true)
+	if [[ -z $out ]]; then
+		echo "  (none)"
+		return 0
+	fi
+	printf '  %s\n' "$out"
+}
+
 cmd_cp() {
 	local src=${1:-} dst=${2:-}
 	[[ -n $src && -n $dst ]] || die "usage: firecode cp <src> <dst>   (vm:/path for the guest side)"
@@ -1124,6 +1163,10 @@ launch() {
 			USE_GITIGNORE=0
 			shift
 			;;
+		--no-tmux)
+			NO_TMUX=1
+			shift
+			;;
 		--fresh-root)
 			FRESH_ROOT=1
 			shift
@@ -1206,6 +1249,30 @@ launch() {
 				-c | --continue | -r | --resume) RESUME_TREE=1 ;;
 				esac
 			done
+		fi
+	fi
+
+	# An interactive session belongs in a multiplexer. It gives three things
+	# worth having: one session per project rather than two VMs racing for it,
+	# a name you can find it by, and the ability to detach - close the laptop,
+	# reattach over ssh, the VM never notices.
+	#
+	# byobu if it is there, since it is tmux underneath and keeps its status
+	# line; plain tmux otherwise. Already inside one, or asked not to, and this
+	# does nothing.
+	if [[ $mode == interactive ]] && ((NO_TMUX == 0)) &&
+		[[ -z ${TMUX:-} && -z ${FIRECODE_IN_MUX:-} && -t 0 ]]; then
+		local mux=""
+		command -v byobu >/dev/null 2>&1 && mux=byobu
+		[[ -z $mux ]] && command -v tmux >/dev/null 2>&1 && mux=tmux
+		if [[ -n $mux ]]; then
+			local sess
+			sess=$(session_name "$(basename "$WORKDIR")")
+			log "session $sess - detach with ctrl-a d, come back with: firecode attach"
+			# -A attaches to the session if it exists rather than starting a
+			# second one, which is what makes this a singleton per project.
+			exec env FIRECODE_IN_MUX=1 "$mux" new-session -A -s "$sess" -- \
+				"$SELF" ${FIRECODE_ARGV+"${FIRECODE_ARGV[@]}"}
 		fi
 	fi
 
@@ -1650,6 +1717,10 @@ cmd_extract() {
 }
 
 cmd_list() {
+	echo "sessions:"
+	cmd_sessions
+	echo
+	echo "runs:"
 	if [[ ! -d $RUNS ]]; then
 		echo "no runs yet"
 		return 0
@@ -1790,6 +1861,7 @@ options (before the agent's own arguments):
   --timeout SEC   kill the agent after SEC seconds  (default: none)
   --no-net        no network at all
   --no-jail       skip the jailer (still a real VM, less hardening, no root)
+  --no-tmux       do not wrap an interactive session in byobu/tmux
   --no-sync       do not copy /src back out
   --keep          keep the run's drives afterwards
   --cgroups       also cap the host-side process via jailer cgroups
@@ -1882,6 +1954,10 @@ keys)
 cp)
 	shift
 	cmd_cp "$@"
+	;;
+attach)
+	shift
+	cmd_attach "$@"
 	;;
 exec)
 	shift
