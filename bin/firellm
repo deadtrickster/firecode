@@ -45,6 +45,7 @@ RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
 NO_MCP=0
+KEEP_ROOT=0
 declare -a EXTRA_DIRS=()
 declare -a HOST_PORTS=()
 declare -a EXCLUDES=()
@@ -612,8 +613,9 @@ cmd_state() {
 		local dir=${1:-$PWD} img
 		img="$STATE_DIR/$(project_slug "$(cd "$dir" && pwd)").ext4"
 		[[ -f $img ]] || die "no state for $dir"
-		rm -f "$img"
-		log "removed $img - the next run starts with a clean agent home"
+		rm -f "$img" "${img%.ext4}-src.ext4" "${img%.ext4}-root.ext4" \
+			"${img%.ext4}.imported"
+		log "removed this project's agent home, working tree and rootfs"
 		;;
 	*)
 		die "usage: firellm state [list|sessions [dir]|reset [dir]]"
@@ -951,6 +953,10 @@ launch() {
 			USE_GITIGNORE=0
 			shift
 			;;
+		--keep-root)
+			KEEP_ROOT=1
+			shift
+			;;
 		--no-mcp)
 			NO_MCP=1
 			shift
@@ -1220,9 +1226,23 @@ launch() {
 	local ctl_drive="$RUN_DIR/ctl.ext4"
 	mkimage_from_dir "$ctl_stage" "$ctl_drive" firellm-ctl "$(size_ro_dir "$ctl_stage")"
 
-	# --- per-run copy of the rootfs, so the guest can wreck it freely
+	# --- the rootfs. A per-run copy by default, so the guest can wreck it
+	#     freely and start clean next time. Kept per project on request:
+	#     anything installed in there - a dotnet SDK, apt packages - is
+	#     otherwise downloaded again on every single run.
 	local root_drive="$RUN_DIR/root.ext4"
-	cp --sparse=always "$ROOTFS" "$root_drive"
+	if ((KEEP_ROOT)) && ((STATE_PERSISTENT)); then
+		root_drive="$STATE_DIR/$SLUG-root.ext4"
+		if [[ ! -f $root_drive ]]; then
+			log "new persistent rootfs for this project (installs will survive)"
+			cp --sparse=always "$ROOTFS" "$root_drive"
+		elif [[ $ROOTFS -nt $root_drive ]]; then
+			log "the base image is newer; keeping this project's rootfs anyway"
+			log "  (firellm state reset drops it and starts from the new base)"
+		fi
+	else
+		cp --sparse=always "$ROOTFS" "$root_drive"
+	fi
 
 	# --- jail: everything the VM touches has to live inside the chroot
 	local f
@@ -1485,6 +1505,8 @@ options (before the agent's own arguments):
   --workdir DIR   project to put in /src            (default: .)
   --exclude PAT   leave PAT out of /src, repeatable
   --all-files     include gitignored files too (they are left out by default)
+  --keep-root     keep this project's guest rootfs between runs, so packages
+                  the agent installs are still there next time
   --add-dir DIR   extra host dir, read-only at /mnt/<name>, repeatable
   --host-port N   make the host's localhost:N reachable at localhost:N in the
                   guest, over vsock; repeatable. For a local llama-server or

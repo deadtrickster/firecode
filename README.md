@@ -143,6 +143,24 @@ firellm claude --add-dir ~/Projects "match the API the sibling repo uses"
 Those are copies. The guest can read them; nothing written there goes back out.
 The only thing that ever comes back is `/src`.
 
+## Keeping what the agent installs
+
+The guest rootfs is thrown away after every run, so an SDK or a set of apt
+packages the agent installed has to be downloaded again next time. For a
+project that needs a toolchain the image does not carry:
+
+```sh
+firellm claude --keep-root "build and test it"
+```
+
+That keeps this project's rootfs between runs, so the second run starts with
+whatever the first one installed. `firellm state reset` throws it away again,
+and a run without the flag still gets a clean one.
+
+For something you want in every project, put it in the image instead - edit
+`guest/Dockerfile` and `firellm prepare --force`. `--full` already adds rust,
+go, zig, clang/llvm and sbcl.
+
 ## Commits
 
 Commits inside the VM use the `user.name` and `user.email` git reports for the
