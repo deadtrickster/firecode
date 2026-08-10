@@ -71,6 +71,13 @@ if [[ ${FIRELLM_MODE:-} == interactive && -n ${FIRELLM_AGENT:-} ]]; then
 	fi
 fi
 
+# The serial console reports 80x24 no matter what is on the other end, and
+# there is no SIGWINCH to correct it later. Take the size the host had.
+if [[ -n ${FIRELLM_ROWS:-} && -n ${FIRELLM_COLS:-} ]]; then
+	stty rows "$FIRELLM_ROWS" cols "$FIRELLM_COLS" 2>/dev/null || true
+	export LINES=$FIRELLM_ROWS COLUMNS=$FIRELLM_COLS
+fi
+
 cd "$FIRELLM_PROJECT" 2>/dev/null || cd "$FIRELLM_HOME" || true
 
 # Not exec: when the shell or the agent exits we still want to shut the VM

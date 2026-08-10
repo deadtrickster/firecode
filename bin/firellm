@@ -1109,6 +1109,16 @@ launch() {
 		# same project path. An absolute path in a resumed transcript, in a
 		# CLAUDE.md or in a tool call then means the same thing in both places,
 		# and nothing has to be rewritten on the way in or out.
+		# A serial console has no window size and no SIGWINCH, so the guest
+		# would sit at the 80x24 default whatever your terminal is - which a
+		# full-screen TUI renders into and then misplaces every keystroke.
+		# Taken once, at launch.
+		if [[ -t 0 ]]; then
+			local rows cols
+			read -r rows cols < <(stty size 2>/dev/null || echo "")
+			[[ -n ${rows:-} && -n ${cols:-} && $rows != 0 && $cols != 0 ]] &&
+				printf 'FIRELLM_ROWS=%s\nFIRELLM_COLS=%s\n' "$rows" "$cols"
+		fi
 		echo "FIRELLM_USER='$(id -un)'"
 		echo "FIRELLM_UID=$(id -u)"
 		echo "FIRELLM_GID=$(id -g)"
