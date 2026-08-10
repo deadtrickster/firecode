@@ -822,16 +822,21 @@ require_prompt() {
 
 	((left > 0)) && return 0
 
-	die "no prompt. \`claude -p\` needs something to do, and a bare --resume
-       fails with \"provide a prompt to continue the conversation\".
+	die "nothing for the agent to do.
 
-       Say what to do:
+       You gave arguments, so this is an unattended run, and firellm adds -p
+       to make it one - nobody is at a terminal to answer a prompt. Claude in
+       print mode with only --resume and no task exits straight away with
+       \"provide a prompt to continue the conversation\".
+
+       Say what it should do:
          firellm claude --resume <id> 'carry on with the next step'
 
-       Or drop into the session interactively instead:
+       Or take the session interactively, where no -p is added:
          firellm claude          (then /resume inside)
 
-       Or pass the command through untouched with --no-auto-flags."
+       Or send the command through exactly as written:
+         firellm claude --no-auto-flags --resume <id>"
 }
 
 # ---------------------------------------------------------------- launch
