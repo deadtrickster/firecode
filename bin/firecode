@@ -819,8 +819,8 @@ alloc_net_slot() {
 		# as the tap being free: a VM outlives a firecode that was killed
 		# rather than asked to stop, and it keeps the device open. A tap with
 		# a process attached has carrier; an idle one does not.
-		if [[ $(cat "/sys/class/net/fcllm$s/carrier" 2>/dev/null || echo 0) == 1 ]]; then
-			log "fcllm$s is still in use by something, trying the next slot"
+		if [[ $(cat "/sys/class/net/fccode$s/carrier" 2>/dev/null || echo 0) == 1 ]]; then
+			log "fccode$s is still in use by something, trying the next slot"
 			exec {fd}>&-
 			continue
 		fi
@@ -856,7 +856,7 @@ net_create_tap() {
 
 net_up() {
 	alloc_net_slot || die "no free network slot (250 VMs already running?)"
-	TAP_DEV="fcllm$NET_SLOT"
+	TAP_DEV="fccode$NET_SLOT"
 
 	if ip link show "$TAP_DEV" >/dev/null 2>&1; then
 		# Left in place by net-setup. Nothing here needs root.
@@ -894,8 +894,10 @@ cmd_net_setup() {
 			shift 2
 			;;
 		--teardown)
-			for ((s = 1; s <= 250; s++)); do
-				dev="fcllm$s"
+			# Both names: these were fcllmN before the rename, and a stale one
+			# still holds its address and its NAT rules.
+			for dev in $(for ((s = 1; s <= 250; s++)); do echo "fccode$s fcllm$s"; done); do
+				s=${dev//[!0-9]/}
 				ip link show "$dev" >/dev/null 2>&1 || continue
 				priv iptables -t nat -D POSTROUTING -s "172.16.$s.0/30" \
 					! -o "$dev" -j MASQUERADE 2>/dev/null || true
@@ -911,7 +913,7 @@ cmd_net_setup() {
 	done
 
 	for ((s = 1; s <= count; s++)); do
-		dev="fcllm$s"
+		dev="fccode$s"
 		if ip link show "$dev" >/dev/null 2>&1; then
 			log "$dev already there"
 			continue
@@ -1717,7 +1719,7 @@ cmd_doctor() {
 	# The jailer specifically, not sudo in general: a correctly scoped rule
 	# grants this one binary, so `sudo -n true` failing proves nothing.
 	check "jailer runs without a password" "sudo -n '$JAILER' --version"
-	check "a tap is ready (firecode net-setup)" "ip link show fcllm1"
+	check "a tap is ready (firecode net-setup)" "ip link show fccode1"
 	check "claude on host" "command -v claude"
 	echo
 	echo "  $ok ok, $bad failed"
@@ -1727,7 +1729,7 @@ cmd_doctor() {
 		echo "      sudo $SCRIPTS/install-privileged.sh"
 		echo "  Or skip the jailer entirely with --no-jail."
 	fi
-	if ! ip link show fcllm1 >/dev/null 2>&1; then
+	if ! ip link show fccode1 >/dev/null 2>&1; then
 		echo
 		echo "  Networking will need root on every run. To stop that:"
 		echo "      sudo $ROOT/bin/firecode net-setup --count 4"
