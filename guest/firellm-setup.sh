@@ -311,6 +311,20 @@ PY
 		cp -f "$CTL_MNT/context.md" "${FIRELLM_HOME:-/root}/FIRELLM.md"
 	fi
 
+	# Interactive sessions come in over vsock with a pty of their own, rather
+	# than over the serial console, because firecracker's serial input rewrites
+	# CR to LF and a raw-mode TUI never sees Enter. socat hands each connection
+	# a pty and relays the bytes untouched.
+	if [[ ${FIRELLM_MODE:-} != auto && -x $CTL_MNT/console.sh ]]; then
+		if systemd-run --unit=firellm-console --collect --quiet \
+			socat "VSOCK-LISTEN:${FIRELLM_CONSOLE_PORT:-1024},fork,reuseaddr" \
+			"EXEC:$CTL_MNT/console.sh,pty,setsid,ctty,stderr" 2>/dev/null; then
+			log "console ready on vsock port ${FIRELLM_CONSOLE_PORT:-1024}"
+		else
+			log "WARNING: could not start the vsock console"
+		fi
+	fi
+
 	# firellm-agent.service declares Conflicts=serial-getty@ttyS0.service so the
 	# agent owns the console. systemd acts on that when the job is queued, not
 	# when the unit's condition is evaluated - so in interactive mode, where

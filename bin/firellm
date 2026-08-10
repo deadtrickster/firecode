@@ -71,6 +71,9 @@ DENY_FILE="${FIRELLM_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/never-
 # Host loopback ports every run should be able to reach, one per line.
 PORTS_FILE="${FIRELLM_PORTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firellm/host-ports}"
 
+# Guest vsock port the interactive session listens on.
+CONSOLE_PORT=${FIRELLM_CONSOLE_PORT:-1024}
+
 refuse_if_sensitive() {
 	local path=$1 rel full line
 	for rel in "${SENSITIVE_HOME_DIRS[@]}"; do
@@ -1029,23 +1032,6 @@ launch() {
 		fi
 	fi
 
-	# Known issue, cause not pinned down. Firecracker wires the guest serial
-	# port to its own stdin and stdout - that is what the console is. Run the
-	# jailer under sudo with those on a terminal and firecracker stops right
-	# after opening its API socket: silently, exit 0, before it even reads the
-	# config. Unattended runs pipe their output through tee, never touch a
-	# terminal, and are unaffected. Wrapping it in script(1) to give it a
-	# private pty does not help, so sudo's use_pty is not the whole story.
-	#
-	# Giving up the jailer costs the chroot, the dropped uid and the pid
-	# namespace around the VMM process. The guest is still a KVM VM with its
-	# own kernel and no view of this filesystem, which is the boundary that
-	# was the point.
-	if [[ $mode == interactive ]] && ((NOJAIL == 0)); then
-		NOJAIL=1
-		log "interactive: not jailed - a jailed guest console dies on a terminal"
-	fi
-
 	local id
 	# BASHPID, not $$: in a subshell $$ is still the parent's pid, so two runs
 	# launched together from one shell would collide on the same run id.
@@ -1167,6 +1153,7 @@ launch() {
 		# Enter is the one you notice: a terminal speaking the kitty keyboard
 		# protocol reports it as CSI 13 u, arrows stay ordinary CSI, so the
 		# arrows work and Enter appears dead.
+		echo "FIRELLM_CONSOLE_PORT=$CONSOLE_PORT"
 		echo "FIRELLM_TERM='${TERM:-}'"
 		echo "FIRELLM_TERM_PROGRAM='${TERM_PROGRAM:-}'"
 		echo "FIRELLM_COLORTERM='${COLORTERM:-}'"
@@ -1192,7 +1179,7 @@ launch() {
 	# over the copies baked into the image, so changing the harness does not
 	# mean rebuilding a 6G rootfs.
 	local g
-	for g in firellm-setup.sh agent-entrypoint.sh profile.sh keydump.sh; do
+	for g in firellm-setup.sh agent-entrypoint.sh profile.sh keydump.sh console.sh; do
 		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
 	done
 
@@ -1317,22 +1304,30 @@ EOF
 	log "booting ($VCPU vcpu, ${MEM}M)"
 	echo >&2
 
-	# Firecracker takes the terminal out of line mode but leaves ICRNL set, so
-	# the line discipline rewrites Enter from CR to LF before the guest sees a
-	# byte of it. A shell does not notice - LF is its line terminator anyway -
-	# but a full-screen application in raw mode is watching for CR, and Enter
-	# simply does nothing. Arrow keys are unaffected, which is what makes it
-	# look like the application rather than the terminal.
-	if [[ $mode == interactive && -t 0 ]]; then
-		STTY_SAVED=$(stty -g 2>/dev/null || true)
-		stty -icrnl -inlcr -igncr 2>/dev/null || true
-	fi
-
 	local rc=0
 	if [[ $mode == interactive ]]; then
-		# No pipe: firecracker hands the guest serial port straight to this
-		# terminal, and a pipe would break the tty the agent's UI needs.
-		(cd "$JAIL_DIR" && "${cmd[@]}") || rc=$?
+		# The VM runs in the background with its serial console going to a
+		# log, and the session comes back over vsock with a pty of its own.
+		# Firecracker's serial input rewrites CR to LF, so a raw-mode TUI on
+		# that console never sees Enter. Keeping the VM off the terminal also
+		# means the jailer works here, which it does not when firecracker is
+		# attached to one.
+		(cd "$JAIL_DIR" && "${cmd[@]}") >"$RUN_DIR/console.log" 2>&1 &
+		local vm_pid=$!
+
+		echo >&2
+		python3 "$SCRIPTS/vsock-console.py" \
+			"$JAIL_DIR/firecracker-vsock.sock" "$CONSOLE_PORT" || rc=$?
+
+		# The guest reboots itself when the session ends, which is what makes
+		# the VMM exit. Give it a moment, then insist.
+		local waited=0
+		while kill -0 "$vm_pid" 2>/dev/null && ((waited < 60)); do
+			sleep 0.5
+			waited=$((waited + 1))
+		done
+		kill "$vm_pid" 2>/dev/null || true
+		wait "$vm_pid" 2>/dev/null || true
 	else
 		(cd "$JAIL_DIR" && "${cmd[@]}") 2>&1 | tee "$RUN_DIR/console.log" || rc=$?
 	fi
