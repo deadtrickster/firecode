@@ -1174,8 +1174,12 @@ cleanup_run() {
 	# The VM is a child, and a child outlives a parent that was killed. A
 	# closed pipe is enough to do that - which is how a stray VM per run got
 	# left behind by anything reading our output with head.
-	[[ -n $VM_PID ]] && kill "$VM_PID" 2>/dev/null
-	[[ -n $STTY_SAVED ]] && stty "$STTY_SAVED" 2>/dev/null
+	# Both of these routinely fail - the VM has usually exited already, and
+	# there may be no terminal to restore. Under set -e an unguarded failure
+	# here exits the shell on the spot, before the status below is returned,
+	# so a session that went perfectly reports 1.
+	if [[ -n $VM_PID ]]; then kill "$VM_PID" 2>/dev/null || true; fi
+	if [[ -n $STTY_SAVED ]]; then stty "$STTY_SAVED" 2>/dev/null || true; fi
 	relays_down
 	net_down
 	if [[ $KEEP -eq 0 ]]; then

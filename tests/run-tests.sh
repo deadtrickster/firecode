@@ -395,7 +395,7 @@ test_concurrent_runs() {
 	contains "the second one really ran" "B-DONE" "$(cat "$b")"
 
 	local taps
-	taps=$(grep -ho 'fcllm[0-9]*' "$a" "$b" | sort -u | wc -l)
+	taps=$(grep -ho 'fccode[0-9]*' "$a" "$b" | sort -u | wc -l)
 	check "they used different tap devices" "2" "$taps"
 	contains "the second one is told its session is not resumable" \
 		"not be resumable" "$(cat "$b")"
