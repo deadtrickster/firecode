@@ -137,8 +137,13 @@ test_host_transcripts_untouched() {
 		return
 	fi
 
-	local before after
-	before=$(find "$real" -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)
+	# A claude session running right now is appending to its own transcript,
+	# which is not firecode writing. Compare only the files nothing is
+	# actively touching - a real breach would change one of those.
+	local before after settled
+	settled=$(mktemp)
+	find "$real" -type f -mmin +2 2>/dev/null | sort >"$settled"
+	before=$(xargs -r -a "$settled" sha256sum 2>/dev/null | sha256sum)
 
 	local project
 	project=$(make_project)
@@ -146,13 +151,13 @@ test_host_transcripts_untouched() {
 	(cd "$ROOT" && "$FIRECODE" claude --import-sessions --no-jail --no-net \
 		--workdir "$project" --timeout 1 -- --version >/dev/null 2>&1)
 
-	after=$(find "$real" -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)
+	after=$(xargs -r -a "$settled" sha256sum 2>/dev/null | sha256sum)
 	check "host transcripts are byte-identical after an import" "$before" "$after"
 
-	local count_before count_after
-	count_before=$(find "$real" -name '*.jsonl' | wc -l)
-	count_after=$(find "$real" -name '*.jsonl' | wc -l)
-	check "no host transcript added or removed" "$count_before" "$count_after"
+	local missing
+	missing=$(while IFS= read -r f; do [[ -f $f ]] || echo "$f"; done <"$settled" | wc -l)
+	check "no host transcript was removed" "0" "$missing"
+	rm -f "$settled"
 }
 
 test_project_tree_untouched() {
@@ -427,8 +432,11 @@ test_prompt_required() {
 	local project out
 	project=$(make_project)
 
-	out=$("$FIRECODE" claude --workdir "$project" --resume abc123 2>&1)
-	contains "a bare --resume is refused" "nothing for the agent to do" "$out"
+	# Flags with no task mean a session you drive, not an unattended run with
+	# nothing to do - so this opens the REPL rather than being refused.
+	out=$("$FIRECODE" claude --workdir "$project" --resume abc123 --no-jail --no-net \
+		--no-tmux 2>&1 | head -3)
+	contains "a bare --resume opens a session" "mode=interactive" "$out"
 
 	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --timeout 1 \
 		--resume abc123 "carry on" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
