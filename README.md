@@ -333,6 +333,23 @@ tap has no carrier - a VM outliving a killed firecode still holds its device.
 than it was configured with. `--cgroups` additionally caps the host-side VMM
 process through the jailer, which is mostly redundant and off by default.
 
+## Orchestration
+
+A VM that stays up, for when you will run more than one thing in it - a test
+suite you are iterating on, a build you do not want to pay for twice:
+
+```sh
+firecode up                       # boots and waits until it can take commands
+firecode in 'cargo test --release'   # output, and the command's own exit status
+firecode in 'python3 bench.py'
+firecode down                     # stops it, copying the work back out
+```
+
+`in` returns the command's exit status, so a failing suite and a suite that
+could not start are different things. Several VMs can be up at once, one per
+project; `--project DIR` says which, and asking ambiguously lists them rather
+than guessing.
+
 ## Spawning more VMs
 
 Firecracker exposes no virtualization extensions to its guests, so a firecode VM

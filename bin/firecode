@@ -82,6 +82,7 @@ PORTS_FILE="${FIRECODE_PORTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/firecode/ho
 # Guest vsock port the interactive session listens on.
 CONSOLE_PORT=${FIRECODE_CONSOLE_PORT:-1024}
 FILES_PORT=${FIRECODE_FILES_PORT:-1025}
+EXEC_PORT=${FIRECODE_EXEC_PORT:-1026}
 
 refuse_if_sensitive() {
 	local path=$1 rel full line
@@ -619,6 +620,10 @@ import_host_sessions() {
 	# into a mounted image would need root; this does not.
 	sbin debugfs -R "rdump / $tmp" "$img" >/dev/null 2>&1 || true
 	rm -rf "$tmp/lost+found"
+	# overlayfs makes its work directory mode 000, and mkfs cannot walk into
+	# what it cannot enter. This is our own copy, and the guest owns these
+	# directories as root anyway.
+	chmod -R u+rwX "$tmp" 2>/dev/null || true
 
 	local dst="$tmp/upper/claude/projects/$slug"
 	mkdir -p "$dst"
@@ -693,16 +698,154 @@ session_name() {
 # A second shell inside a VM that is already running - to try the thing it
 # just built, or watch what it is doing. The guest serves a pty per connection,
 # so this does not disturb whatever is on the first one.
+# The socket of a running VM, for a given project or for the only one there
+# is. A socket file outlives the VM that made it, so only one with something
+# listening counts.
+live_vm_socket() {
+	local want=${1:-}
+	local -a socks=() names=()
+	local r sock proj
+	for r in "$RUNS"/*/; do
+		[[ -f $r/jail ]] || continue
+		sock="$(cat "$r/jail")/firecracker-vsock.sock"
+		[[ -S $sock ]] || continue
+		socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || continue
+		proj=$(cat "$r/project" 2>/dev/null || echo "")
+		if [[ -n $want && $proj != "$want" ]]; then
+			names+=("$proj")
+			continue
+		fi
+		socks+=("$sock")
+		names+=("$proj")
+	done
+
+	# Returns non-zero rather than dying: callers ask "is one up?" as a
+	# question, and a die here would end the process mid-question.
+	((${#socks[@]} == 1)) || return 1
+	echo "${socks[0]}"
+}
+
+# The same lookup, but for callers that need one and cannot continue without.
+require_vm_socket() {
+	local want=${1:-} sock
+	sock=$(live_vm_socket "$want") && {
+		echo "$sock"
+		return 0
+	}
+	local running=""
+	local r
+	for r in "$RUNS"/*/; do
+		[[ -f $r/jail ]] || continue
+		[[ -S $(cat "$r/jail")/firecracker-vsock.sock ]] || continue
+		socat -u /dev/null "UNIX-CONNECT:$(cat "$r/jail")/firecracker-vsock.sock" 2>/dev/null ||
+			continue
+		running="$running $(cat "$r/project" 2>/dev/null)"
+	done
+	if [[ -z $running ]]; then
+		die "no VM is running - start one with: firecode up"
+	fi
+	if [[ -n $want ]]; then
+		die "no VM running for $want (running:$running)"
+	fi
+	die "more than one VM is running - name one with --project (running:$running)"
+}
+
+# A VM that stays up. The point is a warm machine an agent can keep hitting -
+# toolchain installed, data in place - rather than paying a boot and a build
+# for every command it wants to run.
+cmd_up() {
+	local here=$PWD
+	local -a passthru=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--workdir | --project)
+			here=$(cd "$2" && pwd) || die "no such directory: $2"
+			passthru+=(--workdir "$here")
+			shift 2
+			;;
+		*)
+			passthru+=("$1")
+			shift
+			;;
+		esac
+	done
+	if live_vm_socket "$here" >/dev/null 2>&1; then
+		log "a VM is already up for this project - firecode in <command>"
+		return 0
+	fi
+
+	# Held open by a process that does nothing, so the VM stays up until it is
+	# told to stop.
+	log "starting a VM and leaving it up"
+	nohup setsid "$SELF" exec ${passthru+"${passthru[@]}"} --timeout 0 -- \
+		sh -c 'while :; do sleep 3600; done' \
+		>"$RUNS/up.log" 2>&1 &
+	disown 2>/dev/null || true
+
+	# Firecracker's socket accepts a connection the moment the VMM starts,
+	# which is long before the guest has booted and opened its channels. Wait
+	# for something to actually answer on the exec port instead.
+	local waited=0
+	while ((waited < 180)); do
+		local sock
+		if sock=$(live_vm_socket "$here" 2>/dev/null) &&
+			python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - true >/dev/null 2>&1; then
+			log "up. firecode in <command>, firecode enter, firecode down"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	die "the VM did not come up - see $RUNS/up.log"
+}
+
+# One command in the VM that is up, with its output and its exit status.
+cmd_in() {
+	local cwd="-" want=""
+	while [[ ${1:-} == --* ]]; do
+		case "$1" in
+		--cwd)
+			cwd="$2"
+			shift 2
+			;;
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		*) break ;;
+		esac
+	done
+	[[ $# -gt 0 ]] || die "usage: firecode in [--cwd DIR] <command...>"
+	local sock
+	sock=$(require_vm_socket "$want")
+	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
+}
+
+cmd_down() {
+	local want=""
+	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
+	local sock
+	sock=$(require_vm_socket "$want")
+	log "stopping the VM"
+	# Asking it to shut down cleanly is what unmounts the project drive and
+	# lets the work be copied back.
+	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+		"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
+	local waited=0
+	while ((waited < 60)); do
+		socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || {
+			log "stopped"
+			return 0
+		}
+		sleep 1
+		waited=$((waited + 1))
+	done
+	log "it is taking its time; still shutting down"
+}
+
 cmd_enter() {
 	local -a socks=()
-	local d
-	for d in "$JAIL_BASE"/firecracker/*/root; do
-		[[ -S $d/firecracker-vsock.sock ]] || continue
-		socat -u /dev/null "UNIX-CONNECT:$d/firecracker-vsock.sock" 2>/dev/null &&
-			socks+=("$d/firecracker-vsock.sock")
-	done
-	((${#socks[@]} > 0)) || die "no VM is running"
-	((${#socks[@]} == 1)) || die "${#socks[@]} VMs are running - stop all but one"
+	socks=("$(require_vm_socket "")")
 
 	log "entering the running VM (exit leaves it running)"
 	exec python3 "$SCRIPTS/vsock-console.py" "${socks[0]}" "$CONSOLE_PORT"
@@ -1002,7 +1145,7 @@ net_down() {
 		priv ip link del "$TAP_DEV" 2>/dev/null || true
 	fi
 	TAP_DEV=""
-	[[ -n $NET_FD ]] && exec {NET_FD}>&- 2>/dev/null
+	if [[ -n $NET_FD ]]; then exec {NET_FD}>&- 2>/dev/null || true; fi
 	NET_FD=""
 }
 
@@ -1183,8 +1326,11 @@ cleanup_run() {
 	relays_down
 	net_down
 	if [[ $KEEP -eq 0 ]]; then
-		[[ -n $RUN_DIR ]] && rm -f "$RUN_DIR"/*.ext4
-		[[ -n $JAIL_DIR ]] && rm -rf "$(dirname "$JAIL_DIR")"
+		# rm can fail here - the jailer makes device nodes as root - and in
+		# "test && command" it is the command's failure that set -e acts on,
+		# so an unguarded one ends the run early and skips what follows.
+		[[ -n $RUN_DIR ]] && rm -f "$RUN_DIR"/*.ext4 2>/dev/null
+		if [[ -n $JAIL_DIR ]]; then rm -rf "$(dirname "$JAIL_DIR")" 2>/dev/null || true; fi
 	fi
 	return $status
 }
@@ -1407,6 +1553,10 @@ launch() {
 	RUN_DIR="$RUNS/$id"
 	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
 	mkdir -p "$RUN_DIR" "$JAIL_DIR"
+	# Which project this VM is for, so several can run and still be told
+	# apart by something other than "the only one".
+	printf '%s\n' "$WORKDIR" >"$RUN_DIR/project"
+	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
 	trap cleanup_run EXIT INT TERM PIPE HUP
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
@@ -1527,6 +1677,7 @@ launch() {
 		# arrows work and Enter appears dead.
 		echo "FIRECODE_CONSOLE_PORT=$CONSOLE_PORT"
 		echo "FIRECODE_FILES_PORT=$FILES_PORT"
+		echo "FIRECODE_EXEC_PORT=$EXEC_PORT"
 		echo "FIRECODE_TERM='${TERM:-}'"
 		echo "FIRECODE_TERM_PROGRAM='${TERM_PROGRAM:-}'"
 		echo "FIRECODE_COLORTERM='${COLORTERM:-}'"
@@ -1553,7 +1704,7 @@ launch() {
 	# mean rebuilding a 6G rootfs.
 	local g
 	for g in firecode-setup.sh agent-entrypoint.sh profile.sh keydump.sh \
-		console.sh fileserver.sh; do
+		console.sh fileserver.sh execserver.sh; do
 		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
 	done
 
@@ -1841,6 +1992,19 @@ EOF
 			log "agent exit status: $(cat "$st")"
 			rm -f "$st"
 		fi
+
+		# A run that changed nothing should not leave a copy of your project
+		# behind. Most of these VMs are transient - a test, a probe, one that
+		# failed to start - and seventeen identical directories beside a
+		# project is just litter to work out the meaning of later.
+		if diff -rq --exclude=.git "$WORKDIR" "$out_dir" >/dev/null 2>&1; then
+			rm -rf "$out_dir"
+			log "nothing changed, so no result directory"
+			echo
+			[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
+			echo
+			return $rc
+		fi
 		echo
 		echo "  result:  $out_dir"
 		echo "  diff:    diff -ru --exclude=.git '$WORKDIR' '$out_dir' | less"
@@ -1992,6 +2156,11 @@ firecode - run a coding agent in a Firecracker microVM
 
   firecode attach [project]      reattach to a running session
   firecode enter                 a second shell inside the VM running now
+
+  firecode up                    start a VM and leave it running
+  firecode in CMD [args...]      run a command in it, with its exit status
+                                 --project DIR picks which VM, --cwd DIR where
+  firecode down                  stop it, copying the work back out
   firecode list                  sessions, runs, and whether drives still exist
   firecode extract <id> [dest]   pull a run's /src back out
   firecode gc [keep]             drop old run drives (default: keep 5)
@@ -2129,6 +2298,18 @@ attach)
 enter)
 	shift
 	cmd_enter "$@"
+	;;
+up)
+	shift
+	cmd_up "$@"
+	;;
+in)
+	shift
+	cmd_in "$@"
+	;;
+down)
+	shift
+	cmd_down "$@"
 	;;
 exec)
 	shift

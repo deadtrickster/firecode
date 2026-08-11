@@ -190,6 +190,53 @@ def build_tools(cfg):
     projects = sorted(cfg.projects) or ["(none configured)"]
     return [
         {
+            "name": "vm_up",
+            "description": (
+                "Start a VM for a project and leave it running. Use this when "
+                "you will run more than one command: the machine stays warm, "
+                "so a toolchain and a build are paid for once rather than per "
+                "command. Returns when it is ready to accept commands."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": {"type": "string", "enum": projects}},
+                "required": ["project"],
+            },
+        },
+        {
+            "name": "vm_in",
+            "description": (
+                "Run one command in a project's running VM and return its "
+                "output and exit status. The exit status is the command's own, "
+                "so a failing test suite and one that could not start are "
+                "distinguishable."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string",
+                            "description": "Where to run it. Defaults to the project."},
+                    "timeout": {"type": "integer",
+                                "description": "Seconds before giving up. Default 600."},
+                },
+                "required": ["project", "command"],
+            },
+        },
+        {
+            "name": "vm_down",
+            "description": "Stop a project's VM, copying its work back out.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": {"type": "string", "enum": projects}},
+                "required": ["project"],
+            },
+        },
+        {
+            "name": "vm_list",
+            "description": "The VMs running now, and which project each is for.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
             "name": "list_projects",
             "description": "Projects this server is allowed to start a VM for.",
             "inputSchema": {"type": "object", "properties": {}},
@@ -248,7 +295,48 @@ def build_tools(cfg):
     ]
 
 
+def _project_path(cfg, key):
+    if key not in cfg.projects:
+        raise ValueError(f"unknown project {key!r}. Known: "
+                         + (", ".join(sorted(cfg.projects)) or "(none)"))
+    return cfg.projects[key]
+
+
+def _firecode(args, timeout=600):
+    """Run the CLI and hand back what it said, with its status."""
+    p = subprocess.run([FIRECODE] + args, capture_output=True, text=True,
+                       timeout=timeout)
+    out = (p.stdout or "") + (p.stderr or "")
+    return p.returncode, out.strip()
+
+
 def call_tool(cfg, runs, name, args):
+    if name == "vm_up":
+        path = _project_path(cfg, args["project"])
+        rc, out = _firecode(["up", "--workdir", path] + cfg.extra_args, timeout=300)
+        if rc != 0:
+            return f"could not start a VM for {args['project']}:\n{out}"
+        return f"{args['project']} is up. Run commands with vm_in."
+
+    if name == "vm_in":
+        path = _project_path(cfg, args["project"])
+        cmd = ["in", "--project", path]
+        if args.get("cwd"):
+            cmd += ["--cwd", args["cwd"]]
+        cmd.append(args["command"])
+        rc, out = _firecode(cmd, timeout=int(args.get("timeout", 600)))
+        head = f"exit status {rc}"
+        return f"{head}\n{out}" if out else head
+
+    if name == "vm_down":
+        path = _project_path(cfg, args["project"])
+        rc, out = _firecode(["down", "--project", path], timeout=180)
+        return out or ("stopped" if rc == 0 else f"exit {rc}")
+
+    if name == "vm_list":
+        rc, out = _firecode(["list"], timeout=60)
+        return out or "(nothing running)"
+
     if name == "list_projects":
         if not cfg.projects:
             return (f"No projects configured. Add them to {cfg.path} - "

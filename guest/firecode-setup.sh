@@ -328,6 +328,19 @@ PY
 		fi
 	fi
 
+	# One command at a time, for a program rather than a person: the console
+	# hands out a pty, this returns output and an exit status.
+	if [[ -x $CTL_MNT/execserver.sh ]]; then
+		local err
+		if err=$(systemd-run --unit=firecode-exec --collect --quiet \
+			socat "VSOCK-LISTEN:${FIRECODE_EXEC_PORT:-1026},fork,reuseaddr" \
+			"EXEC:$CTL_MNT/execserver.sh" 2>&1); then
+			log "exec channel ready on vsock port ${FIRECODE_EXEC_PORT:-1026}"
+		else
+			log "WARNING: exec channel did not start: $err"
+		fi
+	fi
+
 	# File transfer in and out of a running VM. Firecracker cannot share a
 	# host directory, so this is the only live channel there is.
 	if [[ -x $CTL_MNT/fileserver.sh ]]; then
