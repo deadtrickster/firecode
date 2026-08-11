@@ -50,6 +50,7 @@ IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
 NO_MCP=0
 NO_TMUX=0
+DRY_RUN=0
 WORKTREE=""
 FRESH_ROOT=0
 declare -a EXTRA_DIRS=()
@@ -1165,10 +1166,15 @@ has_prompt() {
 RUN_DIR=""
 JAIL_DIR=""
 STTY_SAVED=""
+VM_PID=""
 
 cleanup_run() {
 	local status=$?
-	trap - EXIT INT TERM
+	trap - EXIT INT TERM PIPE HUP
+	# The VM is a child, and a child outlives a parent that was killed. A
+	# closed pipe is enough to do that - which is how a stray VM per run got
+	# left behind by anything reading our output with head.
+	[[ -n $VM_PID ]] && kill "$VM_PID" 2>/dev/null
 	[[ -n $STTY_SAVED ]] && stty "$STTY_SAVED" 2>/dev/null
 	relays_down
 	net_down
@@ -1244,6 +1250,10 @@ launch() {
 			;;
 		--all-files)
 			USE_GITIGNORE=0
+			shift
+			;;
+		--dry-run)
+			DRY_RUN=1
 			shift
 			;;
 		--no-tmux)
@@ -1393,9 +1403,13 @@ launch() {
 	RUN_DIR="$RUNS/$id"
 	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
 	mkdir -p "$RUN_DIR" "$JAIL_DIR"
-	trap cleanup_run EXIT INT TERM
+	trap cleanup_run EXIT INT TERM PIPE HUP
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
+	if ((DRY_RUN)); then
+		log "dry run: nothing built, nothing booted"
+		return 0
+	fi
 
 	build_config_drive
 
@@ -1759,6 +1773,7 @@ EOF
 		# attached to one.
 		(cd "$JAIL_DIR" && "${cmd[@]}") >"$RUN_DIR/console.log" 2>&1 &
 		local vm_pid=$!
+		VM_PID=$vm_pid
 
 		echo >&2
 		python3 "$SCRIPTS/vsock-console.py" \
@@ -2009,6 +2024,7 @@ options (before the agent's own arguments):
   --no-net        no network at all
   --no-jail       skip the jailer (still a real VM, less hardening, no root)
   --no-tmux       do not wrap an interactive session in byobu/tmux
+  --dry-run       say what would happen and stop, without building or booting
   --no-sync       do not copy /src back out
   --keep          keep the run's drives afterwards
   --cgroups       also cap the host-side process via jailer cgroups

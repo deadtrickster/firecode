@@ -434,8 +434,7 @@ test_prompt_required() {
 
 	# Flags with no task mean a session you drive, not an unattended run with
 	# nothing to do - so this opens the REPL rather than being refused.
-	out=$("$FIRECODE" claude --workdir "$project" --resume abc123 --no-jail --no-net \
-		--no-tmux 2>&1 | head -3)
+	out=$("$FIRECODE" claude --workdir "$project" --resume abc123 --dry-run 2>&1)
 	contains "a bare --resume opens a session" "mode=interactive" "$out"
 
 	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --timeout 1 \
