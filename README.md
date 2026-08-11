@@ -240,6 +240,22 @@ firecode claude --add-dir ~/Projects "match the API the sibling repo uses"
 Mounted at its real path, gitignore-filtered, and cached between runs. Copies:
 the guest can read them, nothing written there goes back out.
 
+## What the guest may print at you
+
+A terminal executes some of what is printed at it, and everything the guest
+prints is written by the thing being contained. Its output is filtered on the
+way to your terminal:
+
+- **dropped**: OSC 52 (setting your clipboard), DCS/APC/PM/SOS payloads - which
+  on some terminals include "define this key to type the following", outliving
+  the session - and `ESC c`, a full reset that wipes your scrollback
+- **kept**: CSI, so cursor movement and colour still work, and OSC 0/1/2 for the
+  window title, because without those a TUI cannot draw
+
+An unattended run is stricter still: it prints logs, so nothing but text gets
+through. The console log keeps the unfiltered bytes, so the record is complete.
+`--raw` on the console turns the filter off.
+
 ## What the agent is told
 
 Three things reach the model, and only these:
@@ -364,7 +380,6 @@ logs stay. Layers, state and snapshots are never touched by `gc`.
   drive and its session is not resumable. It says so at the time.
 - An OAuth refresh inside a VM rotates the token and that copy is discarded. If
   the provider invalidates the old one, the host needs a re-auth.
-- A guest can write escape sequences to your terminal through the console.
 - x86_64 only.
 - Firecracker snapshots are not wired up. "Resume" means the agent's session,
   tree and layer, not a suspended VM.
