@@ -131,7 +131,22 @@ firecode claude --worktree docs "update the docs"      # at the same time
 A worktree's `.git` is a file pointing back into the main checkout, which is
 not in the VM, so the copy gets a real `.git` built from the repository's
 common directory with git itself setting the branch. History and commits work
-in there; the branch comes back in the result directory.
+in there.
+
+**The work comes back into the worktree itself**, with no timestamped copy
+beside it - firecode created that worktree, so firecode may write to it. The
+VM's commits are fetched into your repository and the branch moved onto them;
+uncommitted edits land in the working tree. Afterwards it is an ordinary
+worktree:
+
+```sh
+git -C ../thing-parser-rewrite log --oneline
+git merge parser-rewrite
+git worktree remove ../thing-parser-rewrite
+```
+
+Your own checkout is never treated this way - it stays untouched and you get
+the sibling copy.
 
 Nothing is copied per run: a VM adds a sparse layer rather than duplicating six
 gigabytes of rootfs.

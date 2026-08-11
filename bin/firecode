@@ -1784,9 +1784,38 @@ EOF
 	echo >&2
 	log "VM exited (status $rc)"
 
-	if ((SYNC_BACK)); then
+	if ((SYNC_BACK)) && [[ -n $WORKTREE ]]; then
+		# A worktree firecode made is scratch by construction - a branch to
+		# throw away - so the work goes back into it rather than beside it
+		# with a timestamp. What you get afterwards is an ordinary worktree:
+		# cd into it, diff it, merge it, delete it.
+		local tmp
+		tmp=$(mktemp -d "$RUNS/incoming.XXXXXX")
+		log "returning the work to the worktree at $WORKDIR"
+		extract_image "$src_drive" "$tmp"
+		rm -f "$tmp/.firecode-exit-status"
+
+		# The commits first. The VM had a standalone .git, so its history is
+		# fetched into the real repository and the branch moved onto it.
+		if [[ -d $tmp/.git ]] && git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
+			if git -C "$WORKDIR" fetch -q "$tmp" HEAD:refs/firecode/incoming 2>/dev/null; then
+				git -C "$WORKDIR" reset -q --hard refs/firecode/incoming
+				git -C "$WORKDIR" update-ref -d refs/firecode/incoming
+				log "branch $WORKTREE now has what the agent committed"
+			fi
+		fi
+		# Then whatever it did not commit.
+		rsync -a --delete --exclude=.git "$tmp"/ "$WORKDIR"/ 2>/dev/null || true
+		rm -rf "$tmp"
+
+		echo
+		echo "  worktree: $WORKDIR  (branch $WORKTREE)"
+		echo "  history:  git -C '$WORKDIR' log --oneline -5"
+		[[ -f $RUN_DIR/console.log ]] && echo "  console:  $RUN_DIR/console.log"
+		echo
+	elif ((SYNC_BACK)); then
 		local out_dir="${WORKDIR}-${id#firecode-}"
-		log "copying /src out to $out_dir"
+		log "copying the project out to $out_dir"
 		extract_image "$src_drive" "$out_dir"
 		local st="$out_dir/.firecode-exit-status"
 		if [[ -f $st ]]; then
