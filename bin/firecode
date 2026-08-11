@@ -45,6 +45,8 @@ TIMEOUT=0
 WORKDIR="."
 AGENT=""
 SYNC_BACK=1
+FAST=0
+REFRESH=0
 RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
@@ -750,18 +752,150 @@ require_vm_socket() {
 	die "more than one VM is running - name one with --project (running:$running)"
 }
 
+# --- fast start ---------------------------------------------------------
+#
+# Firecracker can save a running VM - guest memory and device state - and map
+# it back later. Restoring skips the kernel, systemd, our setup script, and
+# the guest memory allocation that dominates a cold start. That last one is
+# most of it: a 4G VM spends ~2.4s having its memory set up and ~0.5s
+# actually booting.
+#
+# The catch is that a snapshot is only valid against the exact drive bytes the
+# guest had cached. The lower layers are already immutable - they are mounted
+# read-only and never written - so they are not the problem. The upper
+# workspace layer, the project and the agent state are, and a restored VM gets
+# the checkpoint's copies of those rather than the live files.
+#
+# Which gives the whole thing a clean rule: a fast VM never touches the real
+# drives, so it is transient - what it writes goes away with it.
+#
+# That makes a checkpoint a build artifact rather than a live thing, and it is
+# stamped like one: the base images, the project's content and the machine
+# shape. Not the mutable drives - a normal run writes to those continuously,
+# so pinning them would invalidate the checkpoint every time and it would
+# never once be used. The cost of that choice is that a toolchain installed
+# after the checkpoint is not in it; --refresh takes a new one.
+memcheck_dir() { echo "$STATE_DIR/mem-$1"; }
+
+# What the checkpoint is only valid against. The immutable drives by identity,
+# the project by content, and the machine shape - a snapshot of a 4G VM cannot
+# be restored into a 1G one.
+memcheck_stamp() {
+	local project=$1 f
+	shift
+	# Every drive by identity, immutable or not. A fast VM writes only to its
+	# own copies, so these move when a normal run changes something - which is
+	# exactly when the checkpoint should stop being used.
+	{
+		printf 'shape:%s:%s:%s\n' "$MEM" "$VCPU" "$NONET"
+		printf 'project:%s\n' "$(dir_fingerprint "$project" 2>/dev/null || echo none)"
+		for f in "$@"; do
+			[[ -f $f ]] && printf '%s:%s:%s\n' \
+				"$(basename "$f")" "$(stat -c %s "$f")" "$(stat -c %Y "$f")"
+		done
+	} | sha256sum | cut -d' ' -f1
+}
+
+memcheck_valid() {
+	local d=$1 stamp=$2 f
+	[[ -n ${FIRECODE_TRACE:-} ]] &&
+		log "checkpoint: want $stamp, have $(cat "$d/stamp" 2>/dev/null || echo none)"
+	[[ -f $d/vmstate && -f $d/mem && -f $d/stamp && -f $d/writables ]] || return 1
+	[[ $(cat "$d/stamp") == "$stamp" ]] || return 1
+	while read -r f; do
+		[[ -f $d/w-$f ]] || return 1
+	done <"$d/writables"
+	return 0
+}
+
+# Save a running VM. Paused first, so guest memory and the drive files agree -
+# copying a drive out from under a running guest would checkpoint a filesystem
+# mid-write.
+memcheck_save() {
+	local api=$1 jail=$2 dest=$3 stamp=$4 f
+	shift 4
+	local tmp="$dest.new"
+	rm -rf "$tmp"
+	mkdir -p "$tmp" "$jail/snap"
+
+	fc_api "$api" PATCH /vm '{"state":"Paused"}' || return 1
+	fc_api "$api" PUT /snapshot/create \
+		'{"snapshot_type":"Full","snapshot_path":"snap/vmstate","mem_file_path":"snap/mem"}' ||
+		return 1
+
+	for f in "$@"; do
+		cp --sparse=always "$jail/$f" "$tmp/w-$f" || return 1
+		printf '%s\n' "$f"
+	done >"$tmp/writables"
+
+	fc_api "$api" PATCH /vm '{"state":"Resumed"}' || true
+
+	[[ -f $jail/snap/vmstate && -f $jail/snap/mem ]] || return 1
+	mv -f "$jail/snap/vmstate" "$tmp/vmstate"
+	mv -f "$jail/snap/mem" "$tmp/mem"
+	# Guest memory is written out in full and is mostly zeroes; punching them
+	# out costs nothing and keeps a 4G VM from being a 4G file.
+	fallocate -d "$tmp/mem" 2>/dev/null || true
+	printf '%s\n' "$stamp" >"$tmp/stamp"
+
+	rm -rf "$dest"
+	mv "$tmp" "$dest"
+	return 0
+}
+
+# Wait for the API socket, then map the snapshot back in and let it run.
+memcheck_load() {
+	local sock=$1 waited=0 t0
+	# Microseconds, from the shell. Not date +%s%3N: this machine's date is
+	# uutils, which ignores the width and hands back all nine digits.
+	t0=${EPOCHREALTIME/[.,]/}
+	while [[ ! -S $sock ]] && ((waited < 100)); do
+		sleep 0.05
+		waited=$((waited + 1))
+	done
+	[[ -S $sock ]] || {
+		log "firecracker never opened its API socket"
+		return 1
+	}
+	fc_api "$sock" PUT /snapshot/load \
+		'{"snapshot_path":"vmstate","mem_backend":{"backend_path":"mem","backend_type":"File"},"resume_vm":true}' || return 1
+	log "guest resumed in $(((${EPOCHREALTIME/[.,]/} - t0) / 1000))ms"
+}
+
+fc_api() {
+	local sock=$1 method=$2 path=$3 body=$4 out
+	out=$(curl -s -f --unix-socket "$sock" -X "$method" \
+		-H 'Content-Type: application/json' \
+		-d "$body" "http://localhost$path" 2>&1) || {
+		log "firecracker refused $method $path: $out"
+		return 1
+	}
+	return 0
+}
+
 # A VM that stays up. The point is a warm machine an agent can keep hitting -
 # toolchain installed, data in place - rather than paying a boot and a build
 # for every command it wants to run.
 cmd_up() {
 	local here=$PWD
 	local -a passthru=()
+	local fast=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--workdir | --project)
 			here=$(cd "$2" && pwd) || die "no such directory: $2"
 			passthru+=(--workdir "$here")
 			shift 2
+			;;
+		--fast)
+			fast=1
+			passthru+=(--fast)
+			shift
+			;;
+		--refresh)
+			fast=1
+			passthru+=(--refresh)
+			shift
 			;;
 		*)
 			passthru+=("$1")
@@ -785,18 +919,85 @@ cmd_up() {
 	# Firecracker's socket accepts a connection the moment the VMM starts,
 	# which is long before the guest has booted and opened its channels. Wait
 	# for something to actually answer on the exec port instead.
-	local waited=0
-	while ((waited < 180)); do
+	# A restore answers in a fraction of a second, so polling once a second
+	# would be most of what a fast start costs. Check often at first, then
+	# back off to stay cheap across a cold boot's minutes.
+	local waited=0 nap=0.05
+	while ((waited < 900)); do
 		local sock
 		if sock=$(live_vm_socket "$here" 2>/dev/null) &&
 			python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - true >/dev/null 2>&1; then
+			((fast)) && up_checkpoint "$sock"
 			log "up. firecode in <command>, firecode enter, firecode down"
 			return 0
 		fi
-		sleep 1
+		# A VM that died is not a VM that is slow. Without this the loop waits
+		# out its whole timeout on a run that failed in the first second.
+		if grep -qE "Firecracker exiting with error|VM exited" "$RUNS/up.log" 2>/dev/null; then
+			log "the VM failed to start:"
+			grep -E "Error|error:" "$RUNS/up.log" | tail -3 >&2
+			die "see $RUNS/up.log"
+		fi
+		sleep "$nap"
 		waited=$((waited + 1))
+		((waited == 40)) && nap=0.25
+		((waited == 100)) && nap=1
 	done
 	die "the VM did not come up - see $RUNS/up.log"
+}
+
+# A VM that just booted is the best thing to checkpoint: nothing has run in it
+# yet, so what comes back on restore is a clean warm VM rather than someone
+# else's leftovers.
+up_checkpoint() {
+	local sock=$1 jail
+	jail=$(dirname "$sock")
+
+	# A restored guest wakes up believing it is still the moment it was saved.
+	# A wrong clock breaks TLS and confuses git, so correct it either way.
+	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+		"sudo date -s @$(date +%s)" >/dev/null 2>&1 || true
+
+	[[ -f $jail/.memcheck-stamp ]] || return 0
+	local -a w=()
+	mapfile -t w <"$jail/.memcheck-writables"
+	log "taking a checkpoint so the next start skips the boot"
+	if memcheck_save "$jail/firecracker.socket" "$jail" \
+		"$(cat "$jail/.memcheck-dir")" "$(cat "$jail/.memcheck-stamp")" "${w[@]}"; then
+		# Real blocks, not apparent size: guest memory and the drive copies
+		# are full of holes, and reporting 25G for 1.1G on disk is a lie.
+		log "checkpointed ($(du -sh "$(cat "$jail/.memcheck-dir")" | cut -f1) on disk)"
+	else
+		log "could not checkpoint - this stays a normal VM"
+	fi
+	rm -f "$jail"/.memcheck-*
+}
+
+# Freeze the VM that is running now, whatever state it has got itself into.
+#
+# This is the one that makes a generated fixture worth generating. An agent
+# builds itself a database, loads it, gets it into a state worth keeping - and
+# from then on that state is 60ms away, as often as it likes, however badly it
+# wrecks it in between.
+cmd_checkpoint() {
+	local want=""
+	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
+	local sock jail
+	sock=$(require_vm_socket "$want")
+	jail=$(dirname "$sock")
+	[[ -f $jail/.memcheck-stamp ]] ||
+		die "this VM cannot be checkpointed - it was started by an older firecode"
+
+	local -a w=()
+	mapfile -t w <"$jail/.memcheck-writables"
+	log "pausing the VM and writing it out"
+	if memcheck_save "$jail/firecracker.socket" "$jail" \
+		"$(cat "$jail/.memcheck-dir")" "$(cat "$jail/.memcheck-stamp")" "${w[@]}"; then
+		log "checkpointed ($(du -sh "$(cat "$jail/.memcheck-dir")" | cut -f1) on disk)"
+		log "restore it with:  firecode up --fast"
+	else
+		die "could not checkpoint this VM"
+	fi
 }
 
 # One command in the VM that is up, with its output and its exit status.
@@ -1350,6 +1551,15 @@ launch() {
 			MEM="$2"
 			shift 2
 			;;
+		--fast)
+			FAST=1
+			shift
+			;;
+		--refresh)
+			FAST=1
+			REFRESH=1
+			shift
+			;;
 		--vcpu | --cpus)
 			VCPU="$2"
 			shift 2
@@ -1595,6 +1805,24 @@ launch() {
 	ensure_state_drive "$WORKDIR" "$RUN_DIR"
 	local state_drive=$STATE_DRIVE
 
+	# Whether this is a restore has to be settled here, before the drives get
+	# built: a restore uses none of them, and building them costs more than
+	# the restore does. Everything the stamp needs is cheap to get - the base
+	# images by identity, the project by content.
+	# Computed for every run, not just fast ones: any running VM can be told
+	# to checkpoint itself, and it needs to stamp the result the same way a
+	# later fast start will look it up.
+	local memdir memstamp restoring=0
+	local early_main early_layer=""
+	early_main=$(main_checkout "$WORKDIR")
+	[[ -n $early_main && $early_main != "$WORKDIR" ]] &&
+		early_layer="$STATE_DIR/$(project_slug "$early_main")-layer.ext4"
+	memdir=$(memcheck_dir "$SLUG")
+	memstamp=$(memcheck_stamp "$WORKDIR" "$KERNEL" "$INITRD" "$ROOTFS" \
+		"$CFG_DRIVE" ${early_layer:+"$early_layer"})
+	((REFRESH)) && rm -rf "$memdir"
+	((FAST)) && memcheck_valid "$memdir" "$memstamp" && restoring=1
+
 	# Continuing a conversation that only exists on the host means bringing
 	# the transcript in. Done once per project unless asked for again.
 	local imported_marker="$STATE_DIR/$SLUG.imported"
@@ -1613,7 +1841,12 @@ launch() {
 		src_drive="$RUN_DIR/src.ext4"
 	fi
 
-	if ((RESUME_TREE)) && [[ -f $src_drive ]]; then
+	if ((restoring)); then
+		# The checkpoint carries its own copy of the project, which is the
+		# one the restored guest's memory describes. Packing a new drive here
+		# would be both wasted and wrong.
+		:
+	elif ((RESUME_TREE)) && [[ -f $src_drive ]]; then
 		log "resuming the working tree from the previous run"
 	else
 		((RESUME_TREE)) && log "no previous tree for this project, starting from $WORKDIR"
@@ -1743,7 +1976,8 @@ launch() {
 	fi
 
 	local ctl_drive="$RUN_DIR/ctl.ext4"
-	mkimage_from_dir "$ctl_stage" "$ctl_drive" firecode-ctl "$(size_ro_dir "$ctl_stage")"
+	((restoring)) ||
+		mkimage_from_dir "$ctl_stage" "$ctl_drive" firecode-ctl "$(size_ro_dir "$ctl_stage")"
 
 	# --- the root, as layers rather than a copy.
 	#
@@ -1782,9 +2016,16 @@ launch() {
 
 	# --- jail: everything the VM touches has to live inside the chroot
 	local f
-	for f in "$KERNEL" "$INITRD" ${lower_drives+"${lower_drives[@]}"} \
-		"$workspace_layer" "$src_drive" "$CFG_DRIVE" "$ctl_drive" \
-		"$state_drive" ${extra_drives+"${extra_drives[@]}"}; do
+	# The read-only drives are shared with the live project either way - the
+	# guest never writes to them, so there is nothing to diverge. A restore
+	# brings its own copies of the rest, and building them would be wasted.
+	local -a into_jail=("$KERNEL" "$INITRD" "$CFG_DRIVE"
+		${lower_drives+"${lower_drives[@]}"})
+	((restoring)) || into_jail+=(
+		"$workspace_layer" "$src_drive" "$ctl_drive"
+		"$state_drive" ${extra_drives+"${extra_drives[@]}"}
+	)
+	for f in "${into_jail[@]}"; do
 		ln "$f" "$JAIL_DIR/$(basename "$f")" 2>/dev/null ||
 			cp "$f" "$JAIL_DIR/$(basename "$f")"
 	done
@@ -1876,6 +2117,32 @@ launch() {
 }
 EOF
 
+	# Everything the guest writes to. A checkpoint keeps its own copies of
+	# these, because restoring means handing the guest back the exact bytes
+	# its memory still describes.
+	local -a writables=()
+	for f in "$workspace_layer" "$src_drive" "$ctl_drive" "$state_drive"; do
+		writables+=("$(basename "$f")")
+	done
+
+	if ((restoring)); then
+		# The guest's memory still describes these exact filesystems, so it
+		# gets the checkpoint's copies of them rather than the live drives.
+		while read -r f; do
+			cp --sparse=always "$memdir/w-$f" "$JAIL_DIR/$f"
+		done <"$memdir/writables"
+		ln "$memdir/vmstate" "$JAIL_DIR/vmstate" 2>/dev/null ||
+			cp "$memdir/vmstate" "$JAIL_DIR/vmstate"
+		ln "$memdir/mem" "$JAIL_DIR/mem" 2>/dev/null ||
+			cp --sparse=always "$memdir/mem" "$JAIL_DIR/mem"
+	else
+		# What a checkpoint of this VM would need to know. Written for every
+		# run, so "save the state you are in now" works on any of them.
+		printf '%s\n' "$memdir" >"$JAIL_DIR/.memcheck-dir"
+		printf '%s\n' "$memstamp" >"$JAIL_DIR/.memcheck-stamp"
+		printf '%s\n' "${writables[@]}" >"$JAIL_DIR/.memcheck-writables"
+	fi
+
 	relays_up "$JAIL_DIR" "$relay_ports"
 
 	# Your host is the other end of the guest's link, so anything it serves is
@@ -1901,7 +2168,13 @@ EOF
 			--cgroup "pids.max=4096"
 		)
 	fi
-	jargs+=(-- --api-sock /firecracker.socket --config-file /vm-config.json)
+	# Restoring brings its own devices, drives and machine shape - they come
+	# out of the snapshot, so there is no config file to give it.
+	if ((restoring)); then
+		jargs+=(-- --api-sock /firecracker.socket)
+	else
+		jargs+=(-- --api-sock /firecracker.socket --config-file /vm-config.json)
+	fi
 
 	# The VM boundary is Firecracker and KVM either way. The jailer adds a
 	# chroot, a dropped uid and a private pid namespace around the VMM
@@ -1910,16 +2183,36 @@ EOF
 	local -a cmd=()
 	if ((NOJAIL)); then
 		log "WARNING: --no-jail, the VMM runs unconfined on the host"
-		cmd=("$FC" --api-sock firecracker.socket --config-file vm-config.json)
+		if ((restoring)); then
+			cmd=("$FC" --api-sock firecracker.socket)
+		else
+			cmd=("$FC" --api-sock firecracker.socket --config-file vm-config.json)
+		fi
 	else
 		cmd=(${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
 	fi
 
-	log "booting ($VCPU vcpu, ${MEM}M)"
+	if ((restoring)); then
+		log "restoring from a checkpoint ($VCPU vcpu, ${MEM}M)"
+		log "this VM is transient - it writes to its own copies, not the real drives"
+	else
+		log "booting ($VCPU vcpu, ${MEM}M)"
+	fi
 	echo >&2
 
 	local rc=0
-	if [[ $mode == interactive ]]; then
+	if ((restoring)) && [[ $mode != interactive ]]; then
+		# Loading a snapshot is an API call, which means the VMM has to be
+		# running before the VM exists - so this path cannot hand the
+		# terminal straight to firecracker the way a cold boot does.
+		(cd "$JAIL_DIR" && "${cmd[@]}") >"$RUN_DIR/console.log" 2>&1 &
+		local vm_pid=$!
+		VM_PID=$vm_pid
+		memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1
+		tail -n +1 -f --pid="$vm_pid" "$RUN_DIR/console.log" 2>/dev/null |
+			python3 "$SCRIPTS/termfilter.py" --strict &
+		wait "$vm_pid" 2>/dev/null || rc=$?
+	elif [[ $mode == interactive ]]; then
 		# The VM runs in the background with its serial console going to a
 		# log, and the session comes back over vsock with a pty of its own.
 		# Firecracker's serial input rewrites CR to LF, so a raw-mode TUI on
@@ -1929,6 +2222,7 @@ EOF
 		(cd "$JAIL_DIR" && "${cmd[@]}") >"$RUN_DIR/console.log" 2>&1 &
 		local vm_pid=$!
 		VM_PID=$vm_pid
+		((restoring)) && { memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1; }
 
 		echo >&2
 		python3 "$SCRIPTS/vsock-console.py" \
@@ -2161,6 +2455,11 @@ firecode - run a coding agent in a Firecracker microVM
   firecode in CMD [args...]      run a command in it, with its exit status
                                  --project DIR picks which VM, --cwd DIR where
   firecode down                  stop it, copying the work back out
+  firecode checkpoint            freeze the running VM as it is now, so that
+                                 up --fast brings it back in ~60ms
+  firecode up --fast             restore that checkpoint instead of booting
+                                 (transient: it writes to its own copies)
+  firecode up --refresh          throw the checkpoint away and take a new one
   firecode list                  sessions, runs, and whether drives still exist
   firecode extract <id> [dest]   pull a run's /src back out
   firecode gc [keep]             drop old run drives (default: keep 5)
@@ -2306,6 +2605,10 @@ up)
 in)
 	shift
 	cmd_in "$@"
+	;;
+checkpoint)
+	shift
+	cmd_checkpoint "$@"
 	;;
 down)
 	shift

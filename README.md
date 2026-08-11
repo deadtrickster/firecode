@@ -350,6 +350,48 @@ could not start are different things. Several VMs can be up at once, one per
 project; `--project DIR` says which, and asking ambiguously lists them rather
 than guessing.
 
+## Checkpoints
+
+Firecracker can save a running VM - guest memory and device state - and map it
+back later. A cold boot spends most of its time allocating guest memory (~2.4s
+of a 4G VM's 2.9s; the guest itself boots in half a second). A restore skips
+all of it and the guest is answering again in about 60ms.
+
+```sh
+firecode checkpoint     # freeze the VM running now, exactly as it is
+firecode up --fast      # bring that back instead of booting
+firecode up --refresh   # throw it away and take a new one
+```
+
+What makes this worth having is not the boot time - it is that state a VM
+took real work to reach becomes reusable. Generate test data, load a database,
+get a fixture into a state worth keeping, checkpoint it once, and from then on
+every run starts there:
+
+```sh
+firecode claude          # "write a generator for representative data, then use it"
+firecode checkpoint      # freeze the loaded fixture
+# ... the agent wrecks it, as it should ...
+firecode down && firecode up --fast    # back to the loaded fixture, ~1.7s
+```
+
+A restored VM is **transient**. It gets the checkpoint's own copies of every
+drive it writes to, so nothing it does touches the real project, the workspace
+layer or the agent state - which is exactly why it can be reset over and over,
+and why the checkpoint never goes stale by being used. The read-only layers are
+shared as always, since nothing writes to them.
+
+A checkpoint is a build artifact, not a live thing. It is stamped with the base
+image, the agent's config drive and the project's content, and any of those
+changing means the next fast start boots normally and takes a new one. What it
+does *not* track is a toolchain installed after it was taken - `--refresh` for
+that.
+
+This is also the answer to "the agent needs the real database". It does not:
+give it a generator and a checkpoint of the loaded result. A seed script that
+runs on the *host* would be a way for a VM to run code outside itself, which is
+the one thing this is all for.
+
 ## Spawning more VMs
 
 Firecracker exposes no virtualization extensions to its guests, so a firecode VM
@@ -366,6 +408,18 @@ Projects are named keys from the config, never paths from the caller -
 otherwise an agent could ask for any directory and read it in a VM it controls.
 Children run with `--no-mcp` and an empty `--mcp-config`, so they cannot reach
 the server and spawn in turn.
+
+The tools come in two shapes. `spawn`, `status`, `output` and `cancel` are for
+work handed off and collected later. `vm_up`, `vm_in`, `vm_down`, `vm_list`,
+`vm_checkpoint` and `vm_reset` are for a VM an agent holds and iterates in -
+bring it up once, get a fixture into it, freeze that, and reset to it between
+runs instead of rebuilding it. `list_projects` says what it may touch.
+
+One thing to know: a spawned VM is a sibling on the host, not a child process
+of the VM that asked for it. It is tied to the lifetime of the `firecode` that
+launched it, not to the lifetime of the agent that requested it - so a VM the
+agent forgets about keeps running until its timeout, and `vm_up` VMs have none.
+`firecode list` shows them and `firecode down --project DIR` stops them.
 
 ## Tests
 

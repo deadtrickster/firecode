@@ -232,6 +232,32 @@ def build_tools(cfg):
             },
         },
         {
+            "name": "vm_checkpoint",
+            "description": (
+                "Freeze a project's running VM exactly as it is now. Once "
+                "frozen, vm_up brings that state back in about a second, "
+                "however badly the VM was wrecked in between - so generate "
+                "your fixture or load your test data once, checkpoint it, and "
+                "reset to it before each run instead of rebuilding it."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": {"type": "string", "enum": projects}},
+                "required": ["project"],
+            },
+        },
+        {
+            "name": "vm_reset",
+            "description": (
+                "Throw away what a VM has done and put it back at its "
+                "checkpoint. Fails if the project has never been "
+                "checkpointed."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": {"type": "string", "enum": projects}},
+                "required": ["project"],
+            },
+        },
+        {
             "name": "vm_list",
             "description": "The VMs running now, and which project each is for.",
             "inputSchema": {"type": "object", "properties": {}},
@@ -332,6 +358,24 @@ def call_tool(cfg, runs, name, args):
         path = _project_path(cfg, args["project"])
         rc, out = _firecode(["down", "--project", path], timeout=180)
         return out or ("stopped" if rc == 0 else f"exit {rc}")
+
+    if name == "vm_checkpoint":
+        path = _project_path(cfg, args["project"])
+        rc, out = _firecode(["checkpoint", "--project", path], timeout=600)
+        if rc != 0:
+            return f"could not checkpoint {args['project']}:\n{out}"
+        return f"{out}\nvm_reset puts the VM back here."
+
+    if name == "vm_reset":
+        # Down then up --fast: the restore is what discards everything the VM
+        # did after the checkpoint, because it comes back on the checkpoint's
+        # own copies of the drives rather than on what it wrote.
+        path = _project_path(cfg, args["project"])
+        _firecode(["down", "--project", path], timeout=180)
+        rc, out = _firecode(["up", "--fast", "--project", path], timeout=600)
+        if rc != 0:
+            return f"could not reset {args['project']}:\n{out}"
+        return f"{args['project']} is back at its checkpoint."
 
     if name == "vm_list":
         rc, out = _firecode(["list"], timeout=60)
