@@ -50,6 +50,7 @@ IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
 NO_MCP=0
 NO_TMUX=0
+WORKTREE=""
 FRESH_ROOT=0
 declare -a EXTRA_DIRS=()
 declare -a HOST_PORTS=()
@@ -244,6 +245,37 @@ stage_project() {
 
 	rsync "${rs[@]}" "$workdir"/ "$stage"/ 2>/dev/null || true
 
+	# A git worktree's .git is a file pointing into the main checkout, which is
+	# not in the VM - so git in there would find no repository at all, and the
+	# agent could not read history or commit. Give the copy a real .git from
+	# the common directory, then let git itself set the branch: which refs are
+	# files and which live in a reftable stack is not something to guess at.
+	if [[ -f $workdir/.git ]]; then
+		local common head_ref head_sha
+		common=$(git -C "$workdir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+		if [[ -d $common ]]; then
+			rm -f "$stage/.git"
+			mkdir -p "$stage/.git"
+			rsync -a --exclude=worktrees --exclude=modules --exclude=index \
+				"$common"/ "$stage/.git"/ 2>/dev/null || true
+			git -C "$stage" config --unset core.worktree 2>/dev/null || true
+			git -C "$stage" config --unset core.bare 2>/dev/null || true
+
+			head_sha=$(git -C "$workdir" rev-parse HEAD 2>/dev/null || true)
+			head_ref=$(git -C "$workdir" symbolic-ref -q HEAD 2>/dev/null || true)
+			if [[ -n $head_sha && -n $head_ref ]]; then
+				git -C "$stage" update-ref "$head_ref" "$head_sha" 2>/dev/null
+				git -C "$stage" symbolic-ref HEAD "$head_ref" 2>/dev/null
+			elif [[ -n $head_sha ]]; then
+				git -C "$stage" update-ref --no-deref HEAD "$head_sha" 2>/dev/null
+			fi
+			# The index came from the main checkout's branch; rebuild it so
+			# the agent does not open on a diff it did not make.
+			git -C "$stage" reset -q 2>/dev/null || true
+			log "worktree: gave the copy a standalone .git on ${head_ref##*/}"
+		fi
+	fi
+
 	local full staged
 	full=$(du -sb --apparent-size "$workdir" 2>/dev/null | cut -f1)
 	staged=$(du -sb --apparent-size "$stage" 2>/dev/null | cut -f1)
@@ -405,6 +437,17 @@ build_config_drive() {
 		# is what decides providers and MCP servers.
 		rsync -a --copy-unsafe-links --exclude=node_modules \
 			"$OPENCODE_CONF"/ "$stage/opencode-config"/ 2>/dev/null || true
+	fi
+	# opencode reads AGENTS.md where claude reads CLAUDE.md, so the same
+	# briefing has to be put somewhere else entirely or opencode runs with no
+	# idea where it is.
+	if [[ -f $GUEST/firecode-context.md ]]; then
+		mkdir -p "$stage/opencode-config"
+		{
+			[[ -f $OPENCODE_CONF/AGENTS.md ]] && cat "$OPENCODE_CONF/AGENTS.md"
+			echo
+			cat "$GUEST/firecode-context.md"
+		} >"$stage/opencode-config/AGENTS.md"
 	fi
 
 	# What the agent is told about where it is.
@@ -1223,6 +1266,10 @@ launch() {
 			IMPORT_SESSIONS=0
 			shift
 			;;
+		--worktree)
+			WORKTREE="$2"
+			shift 2
+			;;
 		--fresh)
 			RESUME_TREE=0
 			shift
@@ -1258,6 +1305,29 @@ launch() {
 
 	resolve_assets
 	WORKDIR=$(cd "$WORKDIR" && pwd) || die "workdir does not exist"
+
+	# Run in a git worktree of this repository, making it if it is not there.
+	# Each worktree gets its own layer and inherits the main checkout's, so
+	# several can be worked on at once without sharing a toolchain or a tree.
+	if [[ -n $WORKTREE ]]; then
+		local repo
+		repo=$(git -C "$WORKDIR" rev-parse --show-toplevel 2>/dev/null) ||
+			die "--worktree needs a git repository"
+		repo=$(main_checkout "$repo")
+		local wt="${repo}-${WORKTREE//[^A-Za-z0-9._-]/-}"
+		if [[ -d $wt ]]; then
+			log "worktree $WORKTREE is at $wt"
+		elif git -C "$repo" show-ref --verify --quiet "refs/heads/$WORKTREE"; then
+			git -C "$repo" worktree add "$wt" "$WORKTREE" >/dev/null ||
+				die "could not add a worktree for the existing branch $WORKTREE"
+			log "worktree $WORKTREE checked out at $wt"
+		else
+			git -C "$repo" worktree add -b "$WORKTREE" "$wt" >/dev/null ||
+				die "could not create the worktree $WORKTREE"
+			log "new branch $WORKTREE, worktree at $wt"
+		fi
+		WORKDIR=$wt
+	fi
 	# The project directory is a way into the guest just as much as --add-dir
 	# is. Matters most if launching is ever exposed to something automated.
 	refuse_if_sensitive "$WORKDIR"
@@ -1889,6 +1959,8 @@ options (before the agent's own arguments):
   --all-files     include gitignored files too (they are left out by default)
   --fresh-root    throw away this workspace's layer and start from the base
                   image again (packages it installed are lost)
+  --worktree NAME run in a git worktree of this repo, creating it if needed.
+                  Its own layer, inheriting the main checkout's.
   --add-dir DIR   extra host dir, read-only at /mnt/<name>, repeatable
   --host-port N   make the host's localhost:N reachable at localhost:N in the
                   guest, over vsock; repeatable. For a local llama-server or

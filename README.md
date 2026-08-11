@@ -121,6 +121,18 @@ checkout's read-only - the same relationship it has to the repository. So the
 main checkout can be on dotnet 8 and a worktree on dotnet 9, neither disturbing
 the other, both sharing one base image.
 
+`--worktree` makes one if it is not there, and runs in it:
+
+```sh
+firecode claude --worktree parser-rewrite "port the parser"
+firecode claude --worktree docs "update the docs"      # at the same time
+```
+
+A worktree's `.git` is a file pointing back into the main checkout, which is
+not in the VM, so the copy gets a real `.git` built from the repository's
+common directory with git itself setting the branch. History and commits work
+in there; the branch comes back in the result directory.
+
 Nothing is copied per run: a VM adds a sparse layer rather than duplicating six
 gigabytes of rootfs.
 
