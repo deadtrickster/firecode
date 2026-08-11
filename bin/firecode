@@ -1774,7 +1774,11 @@ EOF
 		kill "$vm_pid" 2>/dev/null || true
 		wait "$vm_pid" 2>/dev/null || true
 	else
-		(cd "$JAIL_DIR" && "${cmd[@]}") 2>&1 | tee "$RUN_DIR/console.log" || rc=$?
+		# tee keeps the unfiltered record; what reaches the terminal is
+		# scrubbed. An unattended run prints logs, and a log has no business
+		# setting the clipboard or redefining a key.
+		(cd "$JAIL_DIR" && "${cmd[@]}") 2>&1 | tee "$RUN_DIR/console.log" |
+			python3 "$SCRIPTS/termfilter.py" --strict || rc=$?
 	fi
 
 	echo >&2

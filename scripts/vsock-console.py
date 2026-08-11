@@ -24,6 +24,9 @@ import termios
 import time
 import tty
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from termfilter import Filter  # noqa: E402
+
 BUF = 65536
 
 
@@ -56,10 +59,16 @@ def connect(uds_path, port, timeout):
     raise SystemExit(f"could not reach the guest console: {last or 'timed out'}")
 
 
-def relay(sock):
-    """stdin -> guest, guest -> stdout, until either end goes away."""
+def relay(sock, filtered=True):
+    """stdin -> guest, guest -> stdout, until either end goes away.
+
+    What comes back is written by the guest, so it goes through the escape
+    filter first: a terminal executes some of what is printed at it, and
+    setting your clipboard or defining a key is not something a session in
+    there should be able to do."""
     stdin = sys.stdin.fileno()
     stdout = sys.stdout.fileno()
+    scrub = Filter() if filtered else None
     saved = None
     if os.isatty(stdin):
         saved = termios.tcgetattr(stdin)
@@ -78,7 +87,7 @@ def relay(sock):
                 data = sock.recv(BUF)
                 if not data:
                     break
-                os.write(stdout, data)
+                os.write(stdout, scrub.feed(data) if scrub else data)
     except (OSError, ConnectionError):
         pass
     finally:
@@ -94,6 +103,7 @@ def main(argv):
     timeout = 90.0
     if "--timeout" in argv:
         timeout = float(argv[argv.index("--timeout") + 1])
+    filtered = "--raw" not in argv
 
     # The guest owns the session; a stray Ctrl-C here should reach it as a
     # byte rather than killing the client out from under the terminal.
@@ -101,7 +111,7 @@ def main(argv):
 
     sock = connect(uds_path, port, timeout)
     try:
-        relay(sock)
+        relay(sock, filtered=filtered)
     finally:
         sock.close()
     return 0

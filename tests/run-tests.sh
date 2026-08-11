@@ -439,6 +439,18 @@ test_prompt_required() {
 	contains "a flag value is not mistaken for a prompt" "do a thing" "$out"
 }
 
+# A guest writes to your terminal, and a terminal executes some of what is
+# printed at it. These are the sequences that do something other than draw.
+test_terminal_escapes() {
+	local line
+	while IFS= read -r line; do
+		case "$line" in
+		ok\ *) ok "${line#ok }" ;;
+		NO\ *) no "${line#NO }" ;;
+		esac
+	done < <(python3 "$ROOT/tests/escapes.py" 2>&1)
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -483,6 +495,7 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 run_test shellcheck
 run_test denylist
 run_test arg_massaging
+run_test terminal_escapes
 run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched
