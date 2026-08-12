@@ -3174,7 +3174,17 @@ launch() {
 			pin_cpus=("${pin_cpus[@]:0:VCPU}")
 			log "pinned to performance cores ${pin_cpus[*]}"
 		fi
-		((HYBRID)) && log "hybrid cpu: E-cores excluded, they vectorise differently"
+		((HYBRID)) && log "hybrid cpu: P and E cores differ, so runs are comparable only within one kind"
+		# What actually ruins a measurement on a workstation, measured rather
+		# than assumed: a busy machine. On this one, an FMA loop's median moved
+		# 12% between core types and its spread was 17% within a single core -
+		# under a load average of 9. The minimum of several runs is the number
+		# to keep, because interference only ever adds time.
+		local load
+		load=$(cut -d' ' -f1 /proc/loadavg)
+		if awk -v l="$load" 'BEGIN{exit !(l > 2)}'; then
+			log "host load is $load - timings will be noisy; take the minimum of several runs"
+		fi
 		if ((VPMU)); then
 			log "hardware counters available: perf stat -e cycles,instructions"
 		else
