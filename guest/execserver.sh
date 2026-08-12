@@ -9,9 +9,13 @@
 # Protocol, because something has to be:
 #
 #   line 1   working directory, or "-" for the project
-#   line 2   the command, run through a shell
+#   line 2   the command, base64, run through a shell
 #   then     everything it printed, verbatim
 #   last     a line "__firecode_exit <status>"
+#
+# base64 because a command is not a line. Sending it raw meant a heredoc or
+# anything else with a newline in it was silently cut at the first one, and
+# the truncated remainder ran - which is a great deal worse than an error.
 #
 # socat forks one of these per connection, so several can run at once.
 set -u
@@ -24,9 +28,14 @@ RUN_HOME=${FIRECODE_HOME:-/root}
 PROJECT=${FIRECODE_PROJECT:-$RUN_HOME}
 
 read -r cwd || exit 1
-read -r cmd || exit 1
+read -r cmd64 || exit 1
 cwd=${cwd%$'\r'}
-cmd=${cmd%$'\r'}
+cmd64=${cmd64%$'\r'}
+cmd=$(printf '%s' "$cmd64" | base64 -d 2>/dev/null) || {
+	printf 'firecode: could not decode the command\n'
+	printf '__firecode_exit 2\n'
+	exit 0
+}
 [[ $cwd == "-" || -z $cwd ]] && cwd=$PROJECT
 
 declare -a env=(

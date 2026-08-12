@@ -1,0 +1,113 @@
+name: guest kernel
+
+# Builds the traceable guest kernel and publishes it as a release asset, so a
+# checkout can pull one rather than spending an hour of its own CPU on it.
+#
+# The kernel firecracker publishes has no ftrace, kprobes, uprobes or BTF, so
+# nothing can be traced inside a VM. This one has them, built from the config
+# of the kernel that is known to boot here (guest/kernel-base.config) with the
+# tracing options added on top.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "kernel version (default: whatever the base config came from)"
+        required: false
+        type: string
+  push:
+    paths:
+      - guest/kernel-base.config
+      - scripts/build-kernel.sh
+      - .github/workflows/kernel.yml
+
+permissions:
+  contents: write        # to publish the release the kernel is pulled from
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: work out which version
+        id: v
+        run: |
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            version=$(sed -n 's/^# Linux\/x86 \([0-9.]*\) Kernel Configuration/\1/p' \
+              guest/kernel-base.config | head -1)
+          fi
+          [ -n "$version" ] || { echo "no version in the base config"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=kernel-$version-debug" >> "$GITHUB_OUTPUT"
+          echo "asset=vmlinux-$version-debug" >> "$GITHUB_OUTPUT"
+
+      # Already built for this version, so there is nothing to do. Deleting
+      # the release is how you force a rebuild - the artifact is the cache.
+      - name: is it already published?
+        id: have
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.v.outputs.tag }}" \
+               --json assets --jq '.assets[].name' 2>/dev/null \
+               | grep -qx "${{ steps.v.outputs.asset }}"; then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.v.outputs.tag }} is already published"
+          else
+            echo "skip=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A kernel built with DWARF5 (which BTF is generated from) needs far
+      # more disk than a runner has spare. These are the big preinstalled
+      # toolchains, none of which a kernel build wants.
+      - name: make room
+        if: steps.have.outputs.skip == 'no'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          df -h / | tail -1
+
+      - name: build
+        if: steps.have.outputs.skip == 'no'
+        run: scripts/build-kernel.sh "${{ steps.v.outputs.version }}"
+
+      - name: publish
+        if: steps.have.outputs.skip == 'no'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd images
+          sha256sum "${{ steps.v.outputs.asset }}" > "${{ steps.v.outputs.asset }}.sha256"
+          gh release create "${{ steps.v.outputs.tag }}" \
+            --title "guest kernel ${{ steps.v.outputs.version }} (traceable)" \
+            --notes "$(printf '%s\n' \
+              'Guest kernel with the tracing machinery firecracker'"'"'s own kernel leaves out:' \
+              'ftrace, kprobes, uprobes, BPF_EVENTS and BTF.' \
+              '' \
+              'Built from guest/kernel-base.config - the config of the kernel known to boot' \
+              'here - with those options added and resolved by olddefconfig.' \
+              '' \
+              'Pull it with: firecode setup --debug-kernel')" \
+            "${{ steps.v.outputs.asset }}" "${{ steps.v.outputs.asset }}.sha256" \
+          || gh release upload "${{ steps.v.outputs.tag }}" \
+               "${{ steps.v.outputs.asset }}" "${{ steps.v.outputs.asset }}.sha256" --clobber
+
+      - name: what it can do
+        if: steps.have.outputs.skip == 'no'
+        run: |
+          {
+            echo "## ${{ steps.v.outputs.asset }}"
+            echo
+            echo "| option | state |"
+            echo "|---|---|"
+            for opt in FTRACE KPROBES UPROBES BPF_EVENTS DEBUG_INFO_BTF PERF_EVENTS; do
+              echo "| CONFIG_$opt | enabled |"
+            done
+            echo
+            echo "Pull it with \`firecode setup --debug-kernel\`."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -11,6 +11,9 @@ set -euo pipefail
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
 IMAGES="$ROOT/images"
+# The image whose e2fsprogs does the ext4 conversion, as root inside a
+# container. Same trick prepare uses, and the reason none of this needs sudo.
+CONVERTER_IMAGE="${FIRECODE_CONVERTER_IMAGE:-firecode/rootfs:latest}"
 GUEST="$ROOT/guest"
 SCRIPTS="$ROOT/scripts"
 VENDOR="$ROOT/vendor/bin"
@@ -156,13 +159,31 @@ priv() {
 KERNEL=""
 ROOTFS=""
 INITRD=""
+# "" the stock kernel, "debug" the traceable one, or a path.
+WANT_KERNEL="${FIRECODE_KERNEL:-}"
 
 resolve_assets() {
 	[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firecode setup"
 
 	local k
-	k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -type f | sort -V | tail -1)
-	[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
+	case "$WANT_KERNEL" in
+	"")
+		# Newest stock kernel. -debug ones are excluded rather than sorted
+		# around: "debug" sorts after any digit, so a plain glob would have
+		# silently made the traceable kernel the default for every run.
+		k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -not -name '*-debug' -type f |
+			sort -V | tail -1)
+		[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
+		;;
+	debug)
+		k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-debug' -type f | sort -V | tail -1)
+		[[ -n $k ]] || die "no debug kernel - run: firecode setup --debug-kernel"
+		;;
+	*)
+		k=$WANT_KERNEL
+		[[ -f $k ]] || die "no such kernel: $k"
+		;;
+	esac
 	KERNEL=$k
 
 	# Explicitly the prepared image. Do not glob and take the first match:
@@ -767,6 +788,142 @@ require_vm_socket() {
 	die "more than one VM is running - name one with --project (running:$running)"
 }
 
+# --- imported images as layers ------------------------------------------
+#
+# A project's build environment is usually already a docker image - serenedb
+# ships its own toolchain image, and rebuilding that inside a VM per run would
+# be absurd. So import it: export the image once, keyed by its digest, and
+# mount it as a read-only lower layer under the project's own.
+#
+# This is not a second docker. Docker is good at building and caching an
+# image; what it cannot do is run one behind a kernel boundary or hand back a
+# running system in 60ms. So it keeps the job it is good at, and its output
+# becomes an input here.
+#
+# Keyed by digest because a toolchain changes on a different cadence than the
+# code built with it: the image moves rarely, the build moves every commit.
+# One is a layer, the other is a drive.
+image_digest() {
+	docker image inspect --format '{{.Id}}' "$1" 2>/dev/null | sed 's/^sha256://' | cut -c1-12
+}
+
+layer_file() { echo "$STATE_DIR/img-$1.ext4"; }
+layers_of_project() { echo "$STATE_DIR/$1.layers"; }
+
+# Export an image to an ext4 that the initramfs will recognise as a layer -
+# which means its root has to sit under upper/, with a work/ beside it.
+#
+# The conversion runs inside a container as root, the same trick prepare uses,
+# so root-owned files survive and the host needs no privileges at all.
+import_image() {
+	local image=$1 digest=$2 out size tar
+	out=$(layer_file "$digest")
+	[[ -f $out ]] && {
+		log "already imported: $image ($digest)"
+		return 0
+	}
+
+	mkdir -p "$STATE_DIR"
+	tar="$STATE_DIR/.img-$digest.tar"
+	log "exporting $image"
+	local cid
+	cid=$(docker create "$image" /bin/true) || die "cannot create a container from $image"
+	docker export "$cid" -o "$tar" || {
+		docker rm -f "$cid" >/dev/null 2>&1
+		die "cannot export $image"
+	}
+	docker rm -f "$cid" >/dev/null 2>&1
+
+	# Room for the filesystem plus the metadata ext4 needs to describe it.
+	size=$(($(stat -c %s "$tar") * 5 / 4 + 512 * 1024 * 1024))
+	log "converting to a layer ($(numfmt --to=iec "$size"))"
+
+	docker run --rm -v "$STATE_DIR:/out" --entrypoint bash "$CONVERTER_IMAGE" -c '
+		set -euo pipefail
+		tar_in=$1; out=$2; size=$3; uid=$4; gid=$5
+		stage=/tmp/firecode-layer
+		rm -rf "$stage"; mkdir -p "$stage/upper" "$stage/work"
+		tar -C "$stage/upper" -xf "$tar_in"
+		rm -f "$stage/upper/.dockerenv"
+		rm -f "$out.tmp"
+		truncate -s "$size" "$out.tmp"
+		mkfs.ext4 -q -F -L fl-layer -d "$stage" "$out.tmp"
+		chown "$uid:$gid" "$out.tmp"
+		mv -f "$out.tmp" "$out"
+		rm -rf "$stage"
+	' _ "/out/$(basename "$tar")" "/out/$(basename "$out")" "$size" "$(id -u)" "$(id -g)" ||
+		die "converting $image to a layer failed"
+
+	rm -f "$tar"
+	printf '%s\n' "$image" >"$STATE_DIR/img-$digest.ref"
+	log "imported $image as a layer ($(du -sh "$out" | cut -f1) on disk)"
+}
+
+cmd_layer() {
+	local sub=${1:-ls}
+	shift || true
+	local dir=$PWD image=""
+	local -a rest=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project | --workdir)
+			dir=$(cd "$2" && pwd) || die "no such directory: $2"
+			shift 2
+			;;
+		*)
+			rest+=("$1")
+			shift
+			;;
+		esac
+	done
+	image=${rest[0]:-}
+	local slug attached
+	slug=$(project_slug "$dir")
+	attached=$(layers_of_project "$slug")
+
+	case "$sub" in
+	add)
+		[[ -n $image ]] || die "usage: firecode layer add <docker-image> [--project DIR]"
+		command -v docker >/dev/null 2>&1 || die "docker is needed to import an image"
+		local digest
+		digest=$(image_digest "$image")
+		[[ -n $digest ]] || die "no such image locally: $image (docker pull it first)"
+		import_image "$image" "$digest"
+		mkdir -p "$STATE_DIR"
+		# Attached by digest, so re-tagging or rebuilding the image does not
+		# silently change what a VM boots with. Re-running add picks up the
+		# new digest and replaces the entry.
+		if [[ -f $attached ]]; then
+			grep -v "	$image\$" "$attached" >"$attached.tmp" 2>/dev/null || true
+			mv -f "$attached.tmp" "$attached"
+		fi
+		printf '%s\t%s\n' "$digest" "$image" >>"$attached"
+		log "$image is now a read-only layer for $dir"
+		log "it applies to every VM for this project, worktrees included"
+		;;
+	ls)
+		if [[ ! -s $attached ]]; then
+			echo "no imported layers for $dir"
+			return 0
+		fi
+		local d i f
+		while IFS=$'\t' read -r d i; do
+			f=$(layer_file "$d")
+			printf '%-14s %-40s %s\n' "$d" "$i" \
+				"$([[ -f $f ]] && du -sh "$f" | cut -f1 || echo "MISSING - re-add it")"
+		done <"$attached"
+		;;
+	rm)
+		[[ -n $image ]] || die "usage: firecode layer rm <docker-image> [--project DIR]"
+		[[ -f $attached ]] || die "no imported layers for $dir"
+		grep -v "	$image\$" "$attached" >"$attached.tmp" || true
+		mv -f "$attached.tmp" "$attached"
+		log "$image detached from $dir (the image itself is kept - firecode gc drops unused ones)"
+		;;
+	*) die "usage: firecode layer [add <image>|ls|rm <image>] [--project DIR]" ;;
+	esac
+}
+
 # What a run actually changed, as paths relative to the project.
 changed_files() {
 	local src=$1 out=$2
@@ -939,7 +1096,13 @@ memcheck_stamp() {
 		printf 'shape:%s:%s:%s\n' "$MEM" "$VCPU" "$NONET"
 		printf 'project:%s\n' "$(dir_fingerprint "$project" 2>/dev/null || echo none)"
 		for f in "$@"; do
-			[[ -f $f ]] && printf '%s:%s:%s\n' \
+			# || continue rather than && printf: a missing file leaves the
+			# loop - and so the brace group - with a failing status, which
+			# under pipefail fails the whole pipeline, fails the assignment,
+			# and under set -e ends the run without printing anything. Which
+			# it did, the moment an optional path was passed in last.
+			[[ -f $f ]] || continue
+			printf '%s:%s:%s\n' \
 				"$(basename "$f")" "$(stat -c %s "$f")" "$(stat -c %Y "$f")"
 		done
 	} | sha256sum | cut -d' ' -f1
@@ -1742,6 +1905,11 @@ launch() {
 			FAST=1
 			shift
 			;;
+		--kernel)
+			# "debug" for the traceable one, or a path to any vmlinux.
+			WANT_KERNEL="$2"
+			shift 2
+			;;
 		--refresh)
 			FAST=1
 			REFRESH=1
@@ -2032,7 +2200,7 @@ launch() {
 		early_layer="$STATE_DIR/$(project_slug "$early_main")-layer.ext4"
 	memdir=$(memcheck_dir "$SLUG")
 	memstamp=$(memcheck_stamp "$WORKDIR" "$KERNEL" "$INITRD" "$ROOTFS" \
-		"$CFG_DRIVE" ${early_layer:+"$early_layer"})
+		"$CFG_DRIVE" "$(layers_of_project "$SLUG")" ${early_layer:+"$early_layer"})
 	((REFRESH)) && rm -rf "$memdir"
 	((FAST)) && memcheck_valid "$memdir" "$memstamp" && restoring=1
 
@@ -2215,6 +2383,24 @@ launch() {
 		lower_drives+=("$main_layer")
 		log "inheriting the layer of $main_dir (this is a worktree of it)"
 	fi
+	# Imported images sit under the project's own layer and over the base, so
+	# a toolchain image supplies what the base does not and the project can
+	# still install on top of it.
+	local imported
+	imported=$(layers_of_project "$SLUG")
+	if [[ -f $imported ]]; then
+		local d i f
+		while IFS=$'\t' read -r d i; do
+			f=$(layer_file "$d")
+			if [[ -f $f ]]; then
+				lower_drives+=("$f")
+				log "layer: $i"
+			else
+				log "WARNING: layer $i ($d) is missing - firecode layer add it again"
+			fi
+		done <"$imported"
+	fi
+
 	lower_drives+=("$ROOTFS")
 
 	workspace_layer="$STATE_DIR/$SLUG-layer.ext4"
@@ -2893,6 +3079,10 @@ in)
 checkpoint)
 	shift
 	cmd_checkpoint "$@"
+	;;
+layer)
+	shift
+	cmd_layer "$@"
 	;;
 down)
 	shift

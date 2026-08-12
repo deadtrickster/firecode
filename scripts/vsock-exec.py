@@ -8,6 +8,7 @@ a caller can tell a failing test suite from one that never started.
 usage: vsock-exec.py <uds> <port> <cwd|-> <command...>
 """
 
+import base64
 import os
 import socket
 import sys
@@ -40,7 +41,10 @@ def main(argv):
         raise SystemExit(f"guest refused the connection: {reply!r}")
     sock.settimeout(None)
 
-    sock.sendall(f"{cwd}\n{command}\n".encode())
+    # base64, because a command is not a line: sent raw, anything containing a
+    # newline was cut at the first one and the remainder ran anyway.
+    encoded = base64.b64encode(command.encode()).decode()
+    sock.sendall(f"{cwd}\n{encoded}\n".encode())
 
     # The guest's output is filtered like anything else it prints at us.
     scrub = Filter(strict=True)
