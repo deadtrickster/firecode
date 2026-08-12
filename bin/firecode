@@ -811,9 +811,15 @@ live_vm_socket() {
 			vm_reachable "$sock" || continue
 		fi
 		proj=$(cat "$r/project" 2>/dev/null || echo "")
-		# `want` is a project path or a VM name - whichever the caller had.
+		# `want` is whatever the caller had in front of them: a project path,
+		# a VM name, the run id, or the short form ps prints for a VM started
+		# before names existed. Anything displayed has to be usable, or the
+		# listing is telling you a name you cannot type.
 		if [[ -n $want && $proj != "$want" ]]; then
-			[[ $(cat "$r/name" 2>/dev/null) == "$want" ]] || continue
+			local rid
+			rid=$(basename "${r%/}")
+			[[ $(cat "$r/name" 2>/dev/null) == "$want" || $rid == "$want" ||
+			${rid##*-} == "$want" ]] || continue
 		fi
 		# Appended together, always: the two are read by index below, and a
 		# filtered-out run that lands in one but not the other silently
@@ -862,8 +868,7 @@ require_vm_socket() {
 	for r in "$RUNS"/*/; do
 		[[ -f $r/jail ]] || continue
 		[[ -S $(cat "$r/jail")/firecracker-vsock.sock ]] || continue
-		socat -u /dev/null "UNIX-CONNECT:$(cat "$r/jail")/firecracker-vsock.sock" 2>/dev/null ||
-			continue
+		vm_reachable "$(cat "$r/jail")/firecracker-vsock.sock" || continue
 		running="$running $(cat "$r/project" 2>/dev/null)"
 	done
 	if [[ -z $running ]]; then
@@ -1938,7 +1943,18 @@ cmd_in() {
 		*) break ;;
 		esac
 	done
-	[[ $# -gt 0 ]] || die "usage: firecode in [--cwd DIR] <command...>"
+	[[ $# -gt 0 ]] || die "usage: firecode in [VM] [--cwd DIR] <command...>"
+
+	# `firecode in fctop pytest` names the VM the way docker exec does, while
+	# `firecode in pytest` still means the VM belonging to where you are
+	# standing. Told apart by asking: a first word that is a running VM is the
+	# VM, anything else is the command. Ambiguous only if you name a VM after
+	# a program you also want to run in it.
+	if (($# > 1)) && live_vm_socket "$1" >/dev/null 2>&1; then
+		want="$1"
+		shift
+	fi
+
 	local sock
 	sock=$(require_vm_socket "$want")
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
@@ -1956,7 +1972,7 @@ cmd_down() {
 		"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
 	local waited=0
 	while ((waited < 60)); do
-		socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || {
+		vm_reachable "$sock" || {
 			log "stopped"
 			return 0
 		}
@@ -2013,7 +2029,7 @@ cmd_cp() {
 	for d in "$JAIL_BASE"/firecracker/*/root; do
 		[[ -S $d/firecracker-vsock.sock ]] || continue
 		# The file outlives the VM. Only something listening counts.
-		socat -u /dev/null "UNIX-CONNECT:$d/firecracker-vsock.sock" 2>/dev/null &&
+		vm_reachable "$d/firecracker-vsock.sock" &&
 			socks+=("$d/firecracker-vsock.sock")
 	done
 	((${#socks[@]} > 0)) || die "no VM is running"
@@ -3576,8 +3592,7 @@ live_runs() {
 		else
 			# No cgroup for this run, so fall back to asking the VM itself.
 			sock="$(cat "$d/jail")/firecracker-vsock.sock"
-			[[ -S $sock ]] || continue
-			socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || continue
+			vm_reachable "$sock" || continue
 		fi
 		printf '%s\t%s\t%s\t%s\n' "$id" "$proj" "$parent" \
 			"$(cat "$d/name" 2>/dev/null || echo "${id##*-}")"
@@ -3769,8 +3784,7 @@ cmd_gc() {
 	local j
 	for j in "$JAIL_BASE"/firecracker/*/; do
 		[[ -d $j ]] || continue
-		if [[ -S $j/root/firecracker-vsock.sock ]] &&
-			socat -u /dev/null "UNIX-CONNECT:$j/root/firecracker-vsock.sock" 2>/dev/null; then
+		if vm_reachable "$j/root/firecracker-vsock.sock"; then
 			continue # still alive
 		fi
 		# The jailer makes device nodes in there as root, so a plain rm can
