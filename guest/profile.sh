@@ -76,8 +76,16 @@ declare -a _fl_cmd=(bash -i)
 if [[ ${FIRECODE_AGENT:-} == keys ]]; then
 	_fl_cmd=(/opt/firecode/run/keydump.sh)
 fi
+# The agent belongs to the session, not to the port.
+#
+# An interactive run's session arrives on this channel, so the first connection
+# gets the agent. Every later one is someone opening a second window into a VM
+# that is already working - `firecode enter`, or fctop's `s` - and handing them
+# another agent instead of a shell is not what either of them asked for, and
+# starts a second agent on the same project.
+_fl_first_console=/opt/firecode/run/console-taken
 if [[ ${FIRECODE_MODE:-} == interactive && -n ${FIRECODE_AGENT:-} &&
-	${FIRECODE_AGENT} != keys ]]; then
+	${FIRECODE_AGENT} != keys ]] && mkdir "$_fl_first_console" 2>/dev/null; then
 	if command -v "$FIRECODE_AGENT" >/dev/null 2>&1; then
 		# Whatever was asked for on the host - --resume, a model, and so on.
 		declare -a _fl_args=()

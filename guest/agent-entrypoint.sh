@@ -102,14 +102,19 @@ fi
 narrate() {
 	python3 -u -c '
 import json, sys
-for line in sys.stdin:
-    line = line.strip()
+# Bytes, decoded leniently, and nothing in here may raise. This process is
+# only here to make a log readable; if it dies it must not take the run with
+# it, and a single odd byte in a tool result is not a reason to stop.
+raw = getattr(sys.stdin, "buffer", sys.stdin)
+for line in iter(raw.readline, b""):
+  try:
+    line = line.decode("utf-8", "replace").strip()
     if not line:
         continue
     try:
         ev = json.loads(line)
     except ValueError:
-        print(line, flush=True)
+        print(line[:400], flush=True)
         continue
     kind = ev.get("type")
     msg = ev.get("message") or {}
@@ -127,20 +132,39 @@ for line in sys.stdin:
         print("  == %s in %ss, %s turns ==" % (
             ev.get("subtype", "done"), round(ev.get("duration_ms", 0) / 1000),
             ev.get("num_turns", "?")), flush=True)
+  except Exception:
+    continue
 ' 2>/dev/null || cat
 }
 
 rc=0
-if [[ $RUN_USER == root ]]; then
-	if ((STREAM)); then
-		set -o pipefail
-		env "${ENV[@]}" "${CMD[@]}" </dev/null | narrate || rc=$?
+if ((STREAM)); then
+	# Through a file, not a pipe.
+	#
+	# Piping the agent into the narrator makes the agent's life depend on the
+	# narrator's: anything that ends the reader sends SIGPIPE to the writer,
+	# and a run that had been working for six minutes dies mid-write with
+	# "Session terminated, killing shell" and no exit status. A log prettifier
+	# must not be able to kill the thing it is describing.
+	#
+	# So the agent writes to a file it owns, and the narrator tails it. If the
+	# narrator dies, the run does not notice, and the raw stream is still on
+	# disk to read afterwards.
+	RAW=/tmp/firecode-agent-stream.jsonl
+	: >"$RAW"
+	chmod 666 "$RAW" 2>/dev/null || true
+	tail -n +1 -F "$RAW" 2>/dev/null | narrate &
+	NARRATOR=$!
+	if [[ $RUN_USER == root ]]; then
+		env "${ENV[@]}" "${CMD[@]}" </dev/null >"$RAW" 2>&1 || rc=$?
 	else
-		env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
+		runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" </dev/null >"$RAW" 2>&1 || rc=$?
 	fi
-elif ((STREAM)); then
-	set -o pipefail
-	runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" </dev/null | narrate || rc=$?
+	# Let it drain what is left before it goes.
+	sleep 1
+	kill "$NARRATOR" 2>/dev/null || true
+elif [[ $RUN_USER == root ]]; then
+	env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
 else
 	runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
 fi
