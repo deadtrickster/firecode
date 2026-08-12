@@ -392,6 +392,49 @@ give it a generator and a checkpoint of the loaded result. A seed script that
 runs on the *host* would be a way for a VM to run code outside itself, which is
 the one thing this is all for.
 
+## Watching something inside a VM from out here
+
+Anything that inspects a running process wants three things, and they cross a
+VM boundary in three different ways:
+
+| | how it gets across |
+|---|---|
+| a socket to connect to | TCP - the VM has an address |
+| files, like perf captures | `firecode mirror` copies them out |
+| `/proc` | it does not travel at all, so mount the guest's |
+
+That last one is the trap. `/proc` is the kernel of the machine you read it
+on, so a tool running here describes *this* machine while the process it is
+reporting on runs in a VM - and it looks perfectly healthy doing it.
+
+```sh
+eval "$(firecode info --env)"        # FIRECODE_VM_IP, _SOCKET, _RUN ...
+firecode mirror --once --out ~/.cache/vm '/tmp/*.perf.data'
+scripts/vmprocfs.py "$FIRECODE_VM_SOCKET" 1026 ~/.cache/vm/proc &
+```
+
+`firecode info` deliberately reports facts rather than any particular tool's
+settings; mapping them is one line each, in your own shell. For serenedash:
+
+```sh
+eval "$(firecode info --env)"
+export SERENEDB_TARGET=remote SERENEDB_HOST=$FIRECODE_VM_IP SERENEDB_PORT=7891
+export SERENEDASH_PERF_DIR=~/.cache/vm/tmp
+export SERENEDASH_SYMBOL_PATHS=/path/to/build/bin
+serenedash --once
+```
+
+Measured against a SereneDB running in a VM: the SQL panels are live, and the
+profile panel resolves a capture taken inside the VM against a local build -
+`duckdb::dict_fsst::CompressedStringScanState::ReconstructEntry` at 23.7%,
+columnar work 79.6% of samples. The panels that read `/proc` describe this
+machine until they are pointed at the mount.
+
+Symbols need a build with symbols *and* a matching build-id. A stripped binary
+profiles perfectly and resolves to nothing, and nothing says so - which is why
+running your own build inside the VM is the shortest path to a readable
+profile.
+
 ## Spawning more VMs
 
 Firecracker exposes no virtualization extensions to its guests, so a firecode VM

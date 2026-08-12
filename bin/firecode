@@ -808,94 +808,74 @@ disk_mounts() {
 	printf '%s' "${out# }"
 }
 
-# Point a dashboard at a server running inside a VM.
+# What a running VM is, in facts rather than in some tool's vocabulary.
 #
-# A dashboard needs three things and they arrive by three different routes:
-# SQL over TCP, perf captures as files, and /proc - which does not travel at
-# all, being the kernel of whatever machine you read it on. This works out
-# where the VM is, brings the captures over, and prints the settings for it.
+# Anything that wants to look at a process inside a VM needs the same three
+# things, by three different routes: an address to connect to, files to read,
+# and /proc - which does not travel at all, being the kernel of whatever
+# machine you read it on. What none of those needs is for firecode to know the
+# name of the variable your particular dashboard reads them from.
 #
-# Nothing here is specific to any one dashboard beyond the variable names: it
-# is the VM's address, a directory of captures, and where the symbols live.
-cmd_dash() {
-	local want="" port=7890 password="${PGPASSWORD:-}" cache="" glob=""
-	local -a symbols=()
+#   eval "$(firecode info --env)"
+#   export SERENEDB_HOST=$FIRECODE_VM_IP   # your mapping, in your shell
+#
+# so a tool this was never written for is two lines away, and this file does
+# not grow a case per dashboard.
+cmd_info() {
+	local want="" as="env"
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--project)
 			want=$(cd "$2" && pwd)
 			shift 2
 			;;
-		--port)
-			port="$2"
-			shift 2
+		--json)
+			as="json"
+			shift
 			;;
-		--password)
-			password="$2"
-			shift 2
+		--env)
+			as="env"
+			shift
 			;;
-		--symbols)
-			symbols+=("$(cd "$(dirname "$2")" && pwd)/$(basename "$2")")
-			shift 2
-			;;
-		--captures)
-			glob="$2"
-			shift 2
-			;;
-		--cache)
-			cache="$2"
-			shift 2
-			;;
-		*) die "usage: firecode dash [--project D] [--port N] [--password P] [--symbols DIR]... [--captures GLOB] [--cache DIR]" ;;
+		*) die "usage: firecode info [--project DIR] [--env | --json]" ;;
 		esac
 	done
 
-	local sock ip
+	local sock jail ip run project
 	sock=$(require_vm_socket "$want")
+	jail=$(dirname "$sock")
 	ip=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
 		"ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null |
 		tr -cd '0-9.')
-	[[ -n $ip ]] || die "that VM has no network - start it without --no-net for a dashboard to reach it"
+	local r
+	for r in "$RUNS"/*/; do
+		[[ -f $r/jail && $(cat "$r/jail") == "$jail" ]] || continue
+		run=$(basename "${r%/}")
+		project=$(cat "$r/project" 2>/dev/null)
+		break
+	done
 
-	cache=${cache:-${XDG_CACHE_HOME:-$HOME/.cache}/firecode/dash}
-	mkdir -p "$cache"
-
-	# Captures are files, and a file resolves against any build with a
-	# matching build-id - so they are worth having on this side even though
-	# the process that made them is somewhere else.
-	glob=${glob:-'/tmp/*.perf.data /var/tmp/*/*.data'}
-	local pulled=0
-	# shellcheck disable=SC2086  # a glob list, deliberately word-split
-	if cmd_mirror --once ${want:+--project "$want"} --out "$cache" $glob >/dev/null 2>&1; then
-		pulled=$(find "$cache" -name '*.data' -o -name '*.perf.data' 2>/dev/null | wc -l)
+	if [[ $as == json ]]; then
+		python3 -c '
+import json, sys
+print(json.dumps(dict(zip(
+    ("run", "project", "ip", "socket", "exec_port", "console_port", "files_port"),
+    sys.argv[1:])), indent=2))
+' "${run:-}" "${project:-}" "${ip:-}" "$sock" "$EXEC_PORT" "$CONSOLE_PORT" "$FILES_PORT"
+		return 0
 	fi
 
-	log "the VM is at $ip, serving on port $port"
-	((pulled)) && log "brought over $pulled capture(s) into $cache"
-	((pulled)) || log "no captures found in the guest yet (looked in: $glob)"
-	((${#symbols[@]})) ||
-		log "no --symbols given: a stripped binary profiles fine and resolves to nothing"
-	echo >&2
-
-	# Environment rather than a config file, because it is what a dashboard
-	# reads last and highest, and because there is nothing left behind to go
-	# stale when this VM is gone.
 	cat <<EOF
-export SERENEDB_TARGET=remote
-export SERENEDB_HOST=$ip
-export SERENEDB_PORT=$port
-export PGPASSWORD='$password'
-export SERENEDASH_PERF_DIR='$(find "$cache" -name '*.data' -printf '%h\n' 2>/dev/null | head -1 || echo "$cache")'
+FIRECODE_VM_RUN='${run:-}'
+FIRECODE_VM_PROJECT='${project:-}'
+FIRECODE_VM_IP='${ip:-}'
+FIRECODE_VM_SOCKET='$sock'
+FIRECODE_VM_EXEC_PORT='$EXEC_PORT'
+FIRECODE_PROCFS_CMD='$SCRIPTS/vmprocfs.py $sock $EXEC_PORT'
+FIRECODE_MIRROR_CMD='$SELF mirror --once${want:+ --project $want}'
 EOF
-	((${#symbols[@]})) &&
-		printf "export SERENEDASH_SYMBOL_PATHS='%s'\n" "$(
-			IFS=:
-			echo "${symbols[*]}"
-		)"
-	cat <<EOF
-# /proc does not travel: mount the guest's and point a reader at it.
-#   $SCRIPTS/vmprocfs.py $sock $EXEC_PORT ~/.cache/firecode/proc &
-EOF
+	[[ -n $ip ]] ||
+		echo "# no address: this VM was started with --no-net, so nothing can connect to it" >&2
 }
 
 # --- the guest's /proc, on the host -------------------------------------
@@ -3521,9 +3501,9 @@ mirror)
 	shift
 	cmd_mirror "$@"
 	;;
-dash)
+info)
 	shift
-	cmd_dash "$@"
+	cmd_info "$@"
 	;;
 down)
 	shift
