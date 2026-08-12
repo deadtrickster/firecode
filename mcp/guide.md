@@ -189,6 +189,28 @@ program is untraceable.
 
 ## When something goes wrong
 
+A failure from this server comes back as three lines, and they are there to
+save you a round trip:
+
+```
+why:   what actually happened, in terms of this system
+fix:   the next action, if there is one
+retry: no | after <something> | only if the output suggests it
+```
+
+**`retry: no` means calling the tool again cannot work.** A missing snapshot, a
+full disk, a VM that will not boot - none of those change because you asked
+twice. Say what happened and stop; the operator can see things you cannot.
+
+`fix` is written for you where you can act, and says so plainly where you
+cannot ("only the operator can restore it"). If a failure says that, it is not
+a puzzle to solve from inside the VM.
+
+Note the difference between a failing *command* and a failing *call*: `vm_in`
+returning `exit status 1` means your command ran and failed, and its output is
+the evidence. A `why/fix/retry` block means it never ran.
+
+
 - **A VM will not start.** Usually the project is already running one - check
   `vm_list`. Two VMs for one project is not allowed.
 - **A command returns nothing with status 0.** It really produced no output.

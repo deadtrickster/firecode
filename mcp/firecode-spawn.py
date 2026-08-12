@@ -23,6 +23,7 @@ standard library.
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -403,6 +404,90 @@ def _firecode(args, timeout=600):
     return p.returncode, out.strip()
 
 
+# What went wrong, why, and whether trying again could possibly help.
+#
+# A bare failure makes an agent guess, and the cheapest guess is to call the
+# same tool again - which is how a broken snapshot or a full disk turns into
+# twenty identical calls. This server knows the domain and the caller does
+# not, so it owes an answer to all three questions rather than an exit code.
+#
+# `retry` is the one that stops the loop. "no" means nothing the caller can do
+# will change the outcome, and the right move is to say so and stop.
+FAILURES = [
+    (re.compile(r"no VM is running"),
+     ("There is no VM for that project - it was never started, or it stopped.",
+      "Call vm_up for this project first, then retry the command.",
+      "after vm_up")),
+    (re.compile(r"more than one VM is running"),
+     ("Several VMs are up and the request did not say which one.",
+      "This should not reach you - it means the server did not name a project. "
+      "Report it rather than guessing.",
+      "no")),
+    (re.compile(r"no such file or device|no such directory|does not exist"),
+     ("Something the VM was told to attach is not on the host.",
+      "A dataset's disk or snapshot has gone - most likely it was removed, or "
+      "it was never created. Only the operator can restore it; nothing you can "
+      "do from in here will.",
+      "no")),
+    (re.compile(r"No space left on device|no space left"),
+     ("The VM ran out of writable disk.",
+      "Its layer holds everything installed and everything written outside the "
+      "project. Profiles and captures are large - write them to an attached "
+      "dataset if one is mounted, delete what you no longer need, or ask the "
+      "operator to grow the layer (firecode grow). Rerunning the same command "
+      "will fill it again.",
+      "no")),
+    (re.compile(r"did not come up|failed to start|Firecracker exiting with error"),
+     ("The VM did not finish booting.",
+      "Something about this VM's configuration or images is wrong, not "
+      "something about your command. The console log named in the output says "
+      "what. Calling vm_up again will do the same thing.",
+      "no")),
+    (re.compile(r"cannot be checkpointed"),
+     ("This VM cannot be frozen.",
+      "It was started by an older firecode, or restored from a checkpoint "
+      "already. Stop it and start a fresh one with vm_up if you need a new "
+      "checkpoint.",
+      "after vm_down then vm_up")),
+    (re.compile(r"needs --no-jail"),
+     ("A raw device was attached to a VM that runs jailed.",
+      "The server has to be configured to run this project unjailed before "
+      "that dataset can be used. Only the operator can change that.",
+      "no")),
+]
+
+
+def note(msg):
+    """A line for whoever is watching this server run.
+
+    The agent's copy of a failure is written for an agent; this is the other
+    half of it. Someone started this on their own machine and is entitled to
+    see which VMs were asked for, by whom, against which of their disks, and
+    what failed - without reading a transcript to find out.
+    """
+    print(f"[spawn] {time.strftime('%H:%M:%S')} {msg}", file=sys.stderr, flush=True)
+
+
+def explain(what, out, rc=None):
+    """A failure the caller can act on, or stop acting on."""
+    text = out or ""
+    for pattern, (why, fix, retry) in FAILURES:
+        if pattern.search(text):
+            return (f"{what} failed.\n"
+                    f"why: {why}\n"
+                    f"fix: {fix}\n"
+                    f"retry: {retry}\n"
+                    f"---\n{text.strip()[:1500]}")
+    return (f"{what} failed"
+            + (f" (exit {rc})" if rc is not None else "") + ".\n"
+            "why: not a failure this server recognises, so the output below is "
+            "all there is.\n"
+            "fix: read it before retrying - if it names a file, a port or a "
+            "path, that is the thing to look at.\n"
+            "retry: only if the output suggests something transient.\n"
+            f"---\n{text.strip()[:1500]}")
+
+
 def call_tool(cfg, runs, name, args, caller_run=None):
     # A VM asked for by another VM is nested inside it, so it stops when its
     # parent does instead of outliving it as an orphan nobody is watching.
@@ -436,7 +521,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
                     "or whatever it calls it) or it will come up empty and tell "
                     "you nothing.")
         if rc != 0:
-            return f"could not start a VM for {args['project']}:\n{out}"
+            return explain(f"Starting a VM for {args['project']}", out, rc)
         return f"{args['project']} is up. Run commands with vm_in."
 
     if name == "vm_in":
@@ -446,6 +531,13 @@ def call_tool(cfg, runs, name, args, caller_run=None):
             cmd += ["--cwd", args["cwd"]]
         cmd.append(args["command"])
         rc, out = _firecode(cmd, timeout=int(args.get("timeout", 600)))
+
+        # A command that ran and failed is a result, not an error: the status
+        # is the answer. Only a command that could not run at all needs
+        # explaining - and the two look identical if both are just a number.
+        if rc != 0 and re.search(r"no VM is running|No space left|"
+                                 r"could not connect|Connection refused", out or ""):
+            return explain(f"Running a command in {args['project']}", out, rc)
         head = f"exit status {rc}"
         return f"{head}\n{out}" if out else head
 
@@ -458,7 +550,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         path = _project_path(cfg, args["project"])
         rc, out = _firecode(["checkpoint", "--project", path], timeout=600)
         if rc != 0:
-            return f"could not checkpoint {args['project']}:\n{out}"
+            return explain(f"Checkpointing {args['project']}", out, rc)
         return f"{out}\nvm_reset puts the VM back here."
 
     if name == "vm_reset":
@@ -469,7 +561,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         _firecode(["down", "--project", path], timeout=180)
         rc, out = _firecode(["up", "--fast", "--project", path], timeout=600)
         if rc != 0:
-            return f"could not reset {args['project']}:\n{out}"
+            return explain(f"Resetting {args['project']}", out, rc)
         return f"{args['project']} is back at its checkpoint."
 
     if name == "vm_list":
@@ -675,14 +767,34 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/call":
             name = params.get("name", "")
             args = params.get("arguments") or {}
+            caller = _peer_run_id(self.client_address,
+                                  self.server.server_address[1])
+            # What was asked for, before it is done. An operator watching this
+            # sees a VM being started against one of their disks at the moment
+            # it happens, not after it has finished.
+            detail = ", ".join(f"{k}={v}" for k, v in sorted(args.items())
+                               if k in ("project", "datasets", "command", "task"))
+            note(f"{name}({detail[:160]})" + (f" from VM {caller}" if caller else ""))
             try:
                 text = call_tool(self.cfg, self.runs, name, args,
-                                 caller_run=_peer_run_id(
-                                     self.client_address,
-                                     self.server.server_address[1]))
+                                 caller_run=caller)
+                first = str(text).splitlines()[0] if str(text).strip() else "(no output)"
+                note(f"  {name}: {first[:120]}")
                 return ok({"content": self._wrap(str(text))})
             except Exception as exc:  # reported to the caller, not a crash
-                return ok({"content": self._wrap(f"error: {exc}"), "isError": True})
+                note(f"  {name} failed: {type(exc).__name__}: {exc}")
+                # Even an unexpected exception says what it was doing and
+                # whether repeating it could help. A caller that gets only a
+                # message calls the same tool again, which is the loop this
+                # server exists to prevent.
+                return ok({"content": self._wrap(
+                    f"{name} failed.\n"
+                    f"why: {type(exc).__name__}: {exc}\n"
+                    "fix: if that names something you chose - a project, a "
+                    "dataset, a command - correct it. If it does not, this is "
+                    "the server's problem, not yours: report it and move on.\n"
+                    "retry: no, unless you change the arguments."),
+                    "isError": True})
 
         return err(-32601, f"method not found: {method}")
 

@@ -1444,9 +1444,16 @@ cmd_up() {
 		fi
 		# A VM that died is not a VM that is slow. Without this the loop waits
 		# out its whole timeout on a run that failed in the first second.
-		if grep -qE "Firecracker exiting with error|VM exited" "$RUNS/up.log" 2>/dev/null; then
+		#
+		# "error:" as well as the VMM's own failures: a run can end before
+		# firecracker is ever started - a missing disk, an unreadable image -
+		# and matching only the VMM's exit meant those waited the full fifteen
+		# minutes and then reported a timeout, which says nothing about the
+		# actual cause.
+		if grep -qE "Firecracker exiting with error|VM exited|\[firecode\] error:" \
+			"$RUNS/up.log" 2>/dev/null; then
 			log "the VM failed to start:"
-			grep -E "Error|error:" "$RUNS/up.log" | tail -3 >&2
+			grep -E "\[firecode\] error:|Error|error:" "$RUNS/up.log" | tail -3 >&2
 			die "see $RUNS/up.log"
 		fi
 		sleep "$nap"
