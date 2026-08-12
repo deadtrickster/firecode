@@ -325,6 +325,73 @@ def build_tools(cfg):
                 "required": ["project"],
             },
         },
+        # Running something that does not finish.
+        #
+        # vm_in waits for a command, which is right for a build or a test and
+        # useless for a server: it never returns, so the call blocks until it
+        # is killed. Backgrounding it by hand loses the log, the exit status
+        # and any way to ask whether it is still alive - the caller ends up
+        # polling `tail` and guessing. The guest runs systemd; these are units.
+        {
+            "name": "vm_serve",
+            "description": (
+                "Start a long-running process in a VM under a name, and return "
+                "immediately. For anything that does not exit on its own: a "
+                "server, a watcher, a load generator. Its output is captured "
+                "and readable with vm_logs, and it keeps running between your "
+                "calls."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "name": {"type": "string",
+                             "description": "Short name to refer to it by later."},
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string",
+                            "description": "Where to run it. Defaults to the project."},
+                },
+                "required": ["project", "name", "command"],
+            },
+        },
+        {
+            "name": "vm_logs",
+            "description": "What a process started by vm_serve has printed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "name": {"type": "string"},
+                    "lines": {"type": "integer", "description": "Default 50."},
+                },
+                "required": ["project", "name"],
+            },
+        },
+        {
+            "name": "vm_ps",
+            "description": (
+                "What is running in a VM and what it is doing: the processes "
+                "started with vm_serve and whether they are still up, the "
+                "ports being listened on and how to reach them from outside, "
+                "and the VM's own load and memory. Look here before concluding "
+                "anything from a timing."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": {"type": "string", "enum": projects}},
+                "required": ["project"],
+            },
+        },
+        {
+            "name": "vm_stop",
+            "description": "Stop something started by vm_serve. The VM keeps running.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "name": {"type": "string"},
+                },
+                "required": ["project", "name"],
+            },
+        },
         {
             "name": "vm_list",
             "description": "The VMs running now, and which project each is for.",
@@ -563,6 +630,57 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         if rc != 0:
             return explain(f"Resetting {args['project']}", out, rc)
         return f"{args['project']} is back at its checkpoint."
+
+    if name in ("vm_serve", "vm_logs", "vm_ps", "vm_stop"):
+        path = _project_path(cfg, args["project"])
+        unit = "firecode-svc-" + re.sub(r"[^A-Za-z0-9_-]", "-", args.get("name", ""))
+
+        if name == "vm_serve":
+            cwd = args.get("cwd") or path
+            # A transient unit: supervised, its output in the journal, gone
+            # when the VM stops. --collect so a failed one does not linger as
+            # a corpse that blocks the same name being used again.
+            cmd = (f"sudo systemd-run --unit={shlex.quote(unit)} --collect "
+                   f"--working-directory={shlex.quote(cwd)} "
+                   f"--property=User=$(id -un) "
+                   f"bash -lc {shlex.quote(args['command'])} 2>&1 | tail -2")
+            rc, out = _firecode(["in", "--project", path, cmd], timeout=120)
+            if rc != 0:
+                return explain(f"Starting {args['name']} in {args['project']}", out, rc)
+            return (f"{args['name']} is running in {args['project']}.\n"
+                    f"It keeps running between calls. vm_logs reads its output, "
+                    f"vm_ps says whether it is still up and what it is listening on.")
+
+        if name == "vm_logs":
+            n = int(args.get("lines", 50))
+            cmd = f"sudo journalctl -u {shlex.quote(unit)} -n {n} --no-pager 2>&1 | tail -{n}"
+            rc, out = _firecode(["in", "--project", path, cmd], timeout=120)
+            return out or f"(nothing logged by {args['name']} yet)"
+
+        if name == "vm_stop":
+            cmd = f"sudo systemctl stop {shlex.quote(unit)} 2>&1 | tail -2; echo stopped"
+            rc, out = _firecode(["in", "--project", path, cmd], timeout=120)
+            return f"{args['name']} stopped."
+
+        # vm_ps: everything a caller needs before believing anything it sees.
+        cmd = (
+            "echo '--- services ---'; "
+            "systemctl list-units 'firecode-svc-*' --no-legend --no-pager 2>/dev/null "
+            "| awk '{print $1, $4}' || true; "
+            "echo '--- listening ---'; "
+            "ss -ltnp 2>/dev/null | tail -n +2 | awk '{print $4}' | sort -u || true; "
+            "echo '--- address ---'; "
+            "ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true; "
+            "echo '--- load ---'; cut -d' ' -f1-3 /proc/loadavg; "
+            "echo '--- memory ---'; free -m | awk '/Mem:/{print $3\" MB used of \"$2\" MB\"}'"
+        )
+        rc, out = _firecode(["in", "--project", path, cmd], timeout=120)
+        if rc != 0:
+            return explain(f"Looking at {args['project']}", out, rc)
+        return (out or "(nothing)") + (
+            "\n\nA port listed above on 0.0.0.0 is reachable from the host at "
+            "the address shown - tell the human that address and port rather "
+            "than localhost, which for them is a different machine.")
 
     if name == "vm_list":
         rc, out = _firecode(["list"], timeout=60)

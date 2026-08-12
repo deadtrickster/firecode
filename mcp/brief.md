@@ -15,20 +15,19 @@ Until then:
 - **`vm_in` returns the command's own exit status.** A failing test suite and a
   suite that could not start are different outcomes - branch on the number, not
   on the text.
-- **Checkpoint anything expensive to reach.** Once a VM has a database loaded
-  or a fixture built, `vm_checkpoint` freezes it and `vm_reset` returns to it in
-  about a second, however badly you wrecked it. Generate state properly once
-  rather than cheaply many times.
-- **Real data is attached, not copied.** `vm_up` takes `datasets`, and a
-  terabyte costs what a megabyte does. But it is *mounted*, not loaded: point
-  the server's own config at that path, or it starts empty and tells you
-  nothing. The guide covers this.
-- **A VM you started stops when you stop.** Nothing you leave running outlives
-  the session, so a VM you are done with should be told `vm_down` rather than
-  abandoned - but nothing leaks if you forget.
-- **What you write in a VM stays in that VM** unless it is a project directory,
-  which is copied back when the VM stops. A restored checkpoint writes to its
-  own copies and keeps nothing.
+- **Checkpoint anything expensive to reach.** Once a fixture or database is
+  loaded, `vm_checkpoint` freezes it and `vm_reset` returns there in about a
+  second, however badly you wrecked it. Build state properly once.
+- **Real data is attached, not copied.** `vm_up` takes `datasets`; a terabyte
+  costs what a megabyte does. It is *mounted*, not loaded - point the server's
+  own config at that path or it starts empty and tells you nothing.
+- **If you are timing something, take the minimum of several runs** and check
+  the host is not busy. A mean or median here measures the machine's mood, not
+  your code, and hardware counters may not exist at all. The guide says how.
+- **A VM you started stops when you stop**, so nothing leaks if you forget -
+  but tell a finished VM `vm_down` anyway.
+- **What you write stays in that VM** unless it is the project directory, which
+  is copied back when the VM stops.
 
 Every result carries `guide_revision`. If it differs from the guide you were
 given, re-read `firecode://guide` and say so.

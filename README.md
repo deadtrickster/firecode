@@ -500,6 +500,15 @@ firecode list                 # sessions and runs
 firecode extract <id>         # pull a run's project back out (with --keep)
 firecode gc                   # drop old run drives, keep the last 5
 
+firecode layer add IMAGE      # a docker image as a read-only layer, by digest
+firecode layer ls             # which images this project boots with
+firecode --disk DEV:/mnt:rw   # a host disk or snapshot, attached not copied
+firecode --vmm libvirt ...    # the other hypervisor: qemu, and PCI devices
+firecode --gpu auto ...       # pass the discrete GPU (implies libvirt)
+firecode --vectorized ...     # pin to performance cores, and say what cannot
+                              # be measured here
+firecode --kernel debug       # the traceable kernel: ftrace, kprobes, BTF
+
 firecode state list           # per-project drives
 firecode state reset          # forget this project's history, tree and layer
 ```

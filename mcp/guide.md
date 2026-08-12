@@ -178,6 +178,39 @@ hypervisor and the human has to arrange it.
 uprobes and bpftrace do not. Say which you needed rather than concluding the
 program is untraceable.
 
+## Measuring, when the work is about speed
+
+Optimisation work lives or dies on the measurement, and a VM on a workstation
+is a hostile place to take one. The failure is never an error - it is a number
+that looks fine and is not.
+
+**Take the minimum of several runs, never the mean or the median.**
+Interference only ever adds time, so the minimum is the closest thing to the
+code's own speed. Measured on this hardware, the same binary's *median* moved
+by 12% and its spread was 17-23% between runs, purely from other load; the
+minimum told the truth throughout. If you report a mean you are reporting the
+machine's mood.
+
+**Check what else is running before believing a timing.** `vm_in` with `uptime`
+costs nothing. A host under load makes every comparison noise, and the honest
+move is to say so rather than to publish the number.
+
+**Hardware counters may not exist.** `perf stat -e cycles,instructions` can
+report `<not supported>` - on a hybrid CPU no hypervisor can offer a virtual
+PMU. That is not something to work around, and not something to report as a
+failure of the code. Wall-clock timing and `perf record -e cpu-clock` sampling
+both work; IPC, cache misses and branch mispredicts do not. Say which you had.
+
+**A comparison must hold everything else still.** Same VM, same core type, same
+data, ideally the same checkpoint restored between runs - which is what
+`vm_reset` is for. Two implementations timed under different conditions have
+not been compared.
+
+**Vector width and instruction set are the host's**, not a VM's invention: the
+guest sees the same `avx2`, `avx_vnni`, `fma` and so on. So a dispatch that
+picks a path here picks the same path outside. Check `/proc/cpuinfo` rather
+than assuming a baseline.
+
 ## Long or heavy work
 
 - A command that will take a while is fine - `vm_in` waits, with a timeout you

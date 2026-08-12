@@ -56,6 +56,10 @@ PARENT_RUN=""
 # thing it cannot: there is no PCI bus in a firecracker VM, so no GPU either.
 VMM="${FIRECODE_VMM:-firecracker}"
 VECTORIZED=0
+DELIVER=""
+# Authenticate guests through the host instead of copying a token into each.
+AUTH_RELAY=0
+AUTH_RELAY_PORT=""
 HYBRID=0
 PCORES=""
 VPMU=0
@@ -451,6 +455,13 @@ build_config_drive() {
 	for item in .credentials.json settings.json settings.local.json CLAUDE.md \
 		agents commands skills plugins output-styles; do
 		[[ -e $CLAUDE_HOME/$item ]] || continue
+		# With a relay in front, the guest authenticates through the host and
+		# has no business holding a token: a VM cannot reach your filesystem,
+		# but a copied session is the one thing in there worth stealing. It is
+		# also the thing that expires and cannot be refreshed from inside.
+		if ((AUTH_RELAY)) && [[ $item == .credentials.json ]]; then
+			continue
+		fi
 		rsync -a --copy-unsafe-links "$CLAUDE_HOME/$item" "$stage/claude/" 2>/dev/null || true
 	done
 
@@ -756,7 +767,26 @@ except OSError:
 		return $?
 	fi
 	[[ -S $addr ]] || return 1
-	socat -u /dev/null "UNIX-CONNECT:$addr" 2>/dev/null
+	# The handshake, not just a connect.
+	#
+	# Opening the socket and closing it leaves firecracker logging "vsock:
+	# error adding local-init connection: UnexpectedEof" - it was waiting for
+	# "CONNECT <port>" and got a hangup. Harmless, but it is our own polling
+	# writing errors into the log a person reads to see what a VM is doing.
+	python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(sys.argv[1])
+    s.sendall(b"CONNECT %d\n" % int(sys.argv[2]))
+    reply = s.recv(64)
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+sys.exit(0 if reply.startswith(b"OK") else 1)
+' "$addr" "$EXEC_PORT" 2>/dev/null
 }
 
 live_vm_socket() {
@@ -781,7 +811,10 @@ live_vm_socket() {
 			vm_reachable "$sock" || continue
 		fi
 		proj=$(cat "$r/project" 2>/dev/null || echo "")
-		[[ -n $want && $proj != "$want" ]] && continue
+		# `want` is a project path or a VM name - whichever the caller had.
+		if [[ -n $want && $proj != "$want" ]]; then
+			[[ $(cat "$r/name" 2>/dev/null) == "$want" ]] || continue
+		fi
 		# Appended together, always: the two are read by index below, and a
 		# filtered-out run that lands in one but not the other silently
 		# shifts every name onto the wrong socket.
@@ -1934,10 +1967,13 @@ cmd_down() {
 }
 
 cmd_enter() {
+	local want=${1:-}
+	# A name, a project path, or nothing and the VM you are standing in.
+	[[ -n $want && -d $want ]] && want=$(cd "$want" && pwd)
 	local -a socks=()
-	socks=("$(require_vm_socket "")")
+	socks=("$(require_vm_socket "$want")")
 
-	log "entering the running VM (exit leaves it running)"
+	log "entering the VM (exit leaves it running)"
 	exec python3 "$SCRIPTS/vsock-console.py" "${socks[0]}" "$CONSOLE_PORT"
 }
 
@@ -2503,6 +2539,22 @@ launch() {
 			WANT_KERNEL="$2"
 			shift 2
 			;;
+		--auth-relay)
+			# The guest reaches the model API through this host, holding no
+			# credentials of its own. Refresh stays where it belongs - with the
+			# one client that owns the session - so a long run cannot expire
+			# and cannot rotate your desktop's login out from under it.
+			AUTH_RELAY=1
+			shift
+			;;
+		--deliver)
+			# Where the work should end up when the run finishes. Without
+			# this a result lands in a timestamped directory beside the
+			# project, which is right when you are watching and useless when
+			# something else is waiting for it to appear somewhere specific.
+			DELIVER=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+			shift 2
+			;;
 		--vectorized)
 			# For work whose whole point is how fast it runs. Pins the VM to
 			# performance cores, sizes it to them, and says up front which of
@@ -2750,6 +2802,19 @@ launch() {
 	mkdir -p "$RUN_DIR" "$JAIL_DIR"
 	# Which project this VM is for, so several can run and still be told
 	# apart by something other than "the only one".
+	# A name a person can say. The run id is a timestamp and a pid, which
+	# identifies a run and describes nothing - and every command that takes a
+	# VM then wants a path or a 40-character id. Named after the project,
+	# because that is what anyone calls it.
+	local vm_name base n=1
+	base=$(basename "$WORKDIR" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//')
+	vm_name=${base:-vm}
+	while live_runs 2>/dev/null | cut -f4 | grep -qx "$vm_name"; do
+		n=$((n + 1))
+		vm_name="$base-$n"
+	done
+	printf '%s\n' "$vm_name" >"$RUN_DIR/name"
+
 	printf '%s\n' "$WORKDIR" >"$RUN_DIR/project"
 	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
 	# How to reach this VM's channels, whichever backend started it.
@@ -2804,6 +2869,26 @@ launch() {
 		done <"$PORTS_FILE"
 	fi
 	# The `|| true` is load-bearing: with nothing to forward, grep matches
+	# The relay, if asked for: a port on this host that guests reach through
+	# the same vsock relay as any other, and an ANTHROPIC_BASE_URL pointing at
+	# it. Started here rather than by hand because it has to outlive nothing
+	# and be gone with the run.
+	if ((AUTH_RELAY)); then
+		AUTH_RELAY_PORT=${AUTH_RELAY_PORT:-$((9800 + RANDOM % 100))}
+		if ! ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT "; then
+			setsid python3 "$SCRIPTS/auth-relay.py" --port "$AUTH_RELAY_PORT" \
+				>"$RUN_DIR/auth-relay.log" 2>&1 &
+			disown 2>/dev/null || true
+			local waited=0
+			while ((waited < 40)) && ! ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT "; do
+				sleep 0.1
+				waited=$((waited + 1))
+			done
+		fi
+		HOST_PORTS+=("$AUTH_RELAY_PORT")
+		log "authenticating through this host on port $AUTH_RELAY_PORT - the VM gets no token"
+	fi
+
 	# nothing and exits 1, which under `set -e` takes the whole run down.
 	relay_ports=$(printf '%s\n' ${mcp+"${mcp[@]}"} ${HOST_PORTS+"${HOST_PORTS[@]}"} |
 		grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)
@@ -2928,6 +3013,7 @@ launch() {
 		echo "FIRECODE_GID=$(id -g)"
 		echo "FIRECODE_HOME='$HOME'"
 		echo "FIRECODE_PROJECT='$WORKDIR'"
+		((AUTH_RELAY)) && echo "ANTHROPIC_BASE_URL='http://localhost:$AUTH_RELAY_PORT'"
 		echo "FIRECODE_EXTRA='${extra_spec[*]-}'"
 		# Where each --disk should be mounted, in the order they were given.
 		# Not the device names: those are assigned further down, after this
@@ -3402,7 +3488,7 @@ EOF
 		[[ -f $RUN_DIR/console.log ]] && echo "  console:  $RUN_DIR/console.log"
 		echo
 	elif ((SYNC_BACK)); then
-		local out_dir="${WORKDIR}-${id#firecode-}"
+		local out_dir="${DELIVER:-${WORKDIR}-${id#firecode-}}"
 		log "copying the project out to $out_dir"
 		extract_image "$src_drive" "$out_dir"
 		local st="$out_dir/.firecode-exit-status"
@@ -3415,7 +3501,7 @@ EOF
 		# behind. Most of these VMs are transient - a test, a probe, one that
 		# failed to start - and seventeen identical directories beside a
 		# project is just litter to work out the meaning of later.
-		if diff -rq --exclude=.git "$WORKDIR" "$out_dir" >/dev/null 2>&1; then
+		if [[ -z $DELIVER ]] && diff -rq --exclude=.git "$WORKDIR" "$out_dir" >/dev/null 2>&1; then
 			rm -rf "$out_dir"
 			log "nothing changed, so no result directory"
 			echo
@@ -3493,8 +3579,130 @@ live_runs() {
 			[[ -S $sock ]] || continue
 			socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || continue
 		fi
-		printf '%s\t%s\t%s\n' "$id" "$proj" "$parent"
+		printf '%s\t%s\t%s\t%s\n' "$id" "$proj" "$parent" \
+			"$(cat "$d/name" 2>/dev/null || echo "${id##*-}")"
 	done
+}
+
+# What every VM is actually doing, in one place.
+#
+# `list` says which VMs exist, which is not the question anyone has while a VM
+# is working. This asks each of them: what is the agent doing, what else is
+# running, what is it listening on, and is it busy or wedged - the things you
+# would otherwise get by opening a shell in each one in turn.
+cmd_ps() {
+	local want="" id proj parent addr any=0
+	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
+
+	local vmname
+	while IFS=$'\t' read -r id proj parent vmname; do
+		[[ -n $want && $proj != "$want" && $vmname != "$want" ]] && continue
+		any=1
+		addr=$(cat "$RUNS/$id/vsock" 2>/dev/null)
+		local backend="firecracker"
+		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
+		echo
+		printf '%s  %s\n' "${vmname:-$id}" "$proj"
+		printf '  %s\n' "$id"
+		printf '  %s' "$backend"
+		[[ $parent != "-" && -n $parent ]] && printf ', stops with %s' "$parent"
+		echo
+
+		# One round trip for everything worth knowing. A VM whose exec channel
+		# does not answer is not necessarily dead - it may be thrashing - so
+		# say that rather than reporting it as gone.
+		local snap
+		# shellcheck disable=SC2016  # runs in the guest, expanded there
+		snap=$(timeout 25 python3 "$SCRIPTS/vsock-exec.py" "$addr" "$EXEC_PORT" - '
+up=$(cut -d" " -f1 /proc/uptime | cut -d. -f1)
+printf "  up %sm, load%s\n" "$((up / 60))" "$(cut -d" " -f1-3 /proc/loadavg | sed "s/^/ /")"
+free -m | awk "/Mem:/{printf \"  memory %s of %s MB\\n\", \$3, \$2}"
+a=$(pgrep -a -f "claude|opencode|qwen" | grep -v pgrep | head -1 | cut -c1-90)
+[ -n "$a" ] && printf "  agent %s\n" "$a"
+s=$(systemctl list-units "firecode-svc-*" --no-legend --no-pager 2>/dev/null | awk "{printf \"%s(%s) \", \$1, \$4}")
+[ -n "$s" ] && printf "  services %s\n" "$s"
+p=$(ss -ltn 2>/dev/null | tail -n +2 | awk "{print \$4}" | grep -v "^127\." | sort -u | tr "\n" " ")
+[ -n "$p" ] && printf "  listening %s\n" "$p"
+true' 2>/dev/null) || snap=""
+		if [[ -n $snap ]]; then
+			printf '%s\n' "$snap"
+		else
+			echo "  (not answering - busy, or shutting down)"
+		fi
+	done < <(live_runs)
+
+	((any)) || echo "no VMs running"
+}
+
+# What a VM has printed - the console, which is where the agent's own output
+# goes as well as the kernel's.
+#
+# The obvious place to look, and until now you had to know that a run keeps its
+# console under runs/<id>/ and find the right one yourself.
+cmd_logs() {
+	local want="" follow=0 lines=60 id proj RAW_LOGS=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		-f | --follow)
+			follow=1
+			shift
+			;;
+		-n)
+			lines="$2"
+			shift 2
+			;;
+		--all)
+			RAW_LOGS=1
+			shift
+			;;
+		-*) die "usage: firecode logs [VM] [--project DIR] [-n LINES] [-f] [--all]" ;;
+		*)
+			# A VM name, so `firecode logs cl-irc` means that one. Without it
+			# this shows whichever console was written to last, which with two
+			# VMs running is a coin toss rather than an answer.
+			want="$1"
+			[[ -d $want ]] && want=$(cd "$want" && pwd)
+			shift
+			;;
+		esac
+	done
+
+	# The newest run for that project, running or not: the log of a run that
+	# just ended is usually the one being asked for.
+	local newest="" newest_time=0 d t
+	for d in "$RUNS"/*/; do
+		[[ -f $d/console.log ]] || continue
+		proj=$(cat "$d/project" 2>/dev/null)
+		if [[ -n $want && $proj != "$want" ]]; then
+			[[ $(cat "$d/name" 2>/dev/null) == "$want" ]] || continue
+		fi
+		t=$(stat -c %Y "$d/console.log" 2>/dev/null || echo 0)
+		((t > newest_time)) && {
+			newest_time=$t
+			newest=$d
+		}
+	done
+	[[ -n $newest ]] || die "no console log${want:+ for $want} - has anything run yet?"
+
+	id=$(basename "${newest%/}")
+	log "$id  $(cat "$newest/project" 2>/dev/null)"
+
+	# The guest kernel probes legacy ISA ports - the CMOS clock at 0x70, a DMA
+	# page register at 0x87, PCI config space at 0xcfc - and firecracker
+	# emulates none of them, so it logs a bus error per probe. Harmless, and
+	# noise in the one place anyone looks to see what an agent is doing.
+	# --all keeps them for when the VMM itself is the thing being debugged.
+	local -a filter=(grep -av "bus_error: MissingAddressRange")
+	((RAW_LOGS)) && filter=(cat)
+	if ((follow)); then
+		tail -n "$lines" -f "$newest/console.log" | "${filter[@]}"
+	else
+		tail -n "$lines" "$newest/console.log" | "${filter[@]}"
+	fi
 }
 
 cmd_list() {
@@ -3508,15 +3716,12 @@ cmd_list() {
 	cmd_sessions
 	echo
 	echo "VMs running:"
-	local any=0 id proj parent
-	while IFS=$'\t' read -r id proj parent; do
+	local any=0 id proj parent vmname
+	while IFS=$'\t' read -r id proj parent vmname; do
 		any=1
-		if [[ $parent != "-" && -n $parent ]]; then
-			printf '  %-38s %s\n' "$id" "$proj"
-			printf '  %-38s   stops when %s does\n' "" "$parent"
-		else
-			printf '  %-38s %s\n' "$id" "$proj"
-		fi
+		printf '  %-20s %s\n' "${vmname:-$id}" "$proj"
+		[[ $parent != "-" && -n $parent ]] &&
+			printf '  %-20s   stops when %s does\n' "" "$parent"
 	done < <(live_runs)
 	((any)) || echo "  (none)"
 
@@ -3651,6 +3856,8 @@ firecode - run a coding agent in a Firecracker microVM
   firecode up                    start a VM and leave it running
   firecode in CMD [args...]      run a command in it, with its exit status
                                  --project DIR picks which VM, --cwd DIR where
+  firecode ps                    what every VM is doing right now
+  firecode logs [-f]             what it has printed, agent output included
   firecode down                  stop it, copying the work back out
   firecode checkpoint            freeze the running VM as it is now, so that
                                  up --fast brings it back in ~60ms
@@ -3742,6 +3949,19 @@ list | ls)
 	shift
 	cmd_list "$@"
 	;;
+ps)
+	shift
+	cmd_ps "$@"
+	;;
+logs)
+	shift
+	cmd_logs "$@"
+	;;
+stop)
+	# docker's word for it; firecode's is down.
+	shift
+	cmd_down "$@"
+	;;
 extract)
 	shift
 	cmd_extract "$@"
@@ -3777,7 +3997,15 @@ claude | opencode)
 	;;
 shell)
 	shift
-	launch shell "$@"
+	# `shell <name>` means the VM called that, and leaving it does not stop
+	# it - the same thing `docker exec -it` does, and what anyone typing this
+	# expects. With no argument there is nothing to attach to, so it starts a
+	# VM whose session *is* the shell, and ending that ends the VM.
+	if [[ -n ${1:-} && $1 != -* ]] && live_vm_socket "$1" >/dev/null 2>&1; then
+		cmd_enter "$1"
+	else
+		launch shell "$@"
+	fi
 	;;
 keys)
 	shift
