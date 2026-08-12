@@ -74,7 +74,7 @@ class Runs:
     def active(self):
         return [r for r in self.runs.values() if r["state"] == "running"]
 
-    def spawn(self, project, task, timeout=None, resume=None):
+    def spawn(self, project, task, timeout=None, resume=None, parent_run=None):
         with self.lock:
             if project not in self.cfg.projects:
                 raise ValueError(
@@ -98,6 +98,9 @@ class Runs:
                    "--workdir", workdir,
                    "--timeout", str(int(timeout or self.cfg.default_timeout)),
                    "--no-mcp"]
+            # Tied to whoever asked, so it cannot outlive them unnoticed.
+            if parent_run:
+                cmd += ["--parent-run", parent_run]
             for port in self.cfg.host_ports:
                 cmd += ["--host-port", str(port)]
             cmd += self.cfg.extra_args
@@ -336,10 +339,15 @@ def _firecode(args, timeout=600):
     return p.returncode, out.strip()
 
 
-def call_tool(cfg, runs, name, args):
+def call_tool(cfg, runs, name, args, caller_run=None):
+    # A VM asked for by another VM is nested inside it, so it stops when its
+    # parent does instead of outliving it as an orphan nobody is watching.
+    parent = ["--parent-run", caller_run] if caller_run else []
+
     if name == "vm_up":
         path = _project_path(cfg, args["project"])
-        rc, out = _firecode(["up", "--workdir", path] + cfg.extra_args, timeout=300)
+        rc, out = _firecode(["up", "--workdir", path] + parent + cfg.extra_args,
+                            timeout=300)
         if rc != 0:
             return f"could not start a VM for {args['project']}:\n{out}"
         return f"{args['project']} is up. Run commands with vm_in."
@@ -389,7 +397,8 @@ def call_tool(cfg, runs, name, args):
 
     if name == "spawn":
         run_id = runs.spawn(args["project"], args["task"],
-                            args.get("timeout"), args.get("resume"))
+                            args.get("timeout"), args.get("resume"),
+                            parent_run=caller_run)
         return (f"started {run_id} on {args['project']}. "
                 f"It runs unattended and shuts down when done. "
                 f"Check with status({run_id}).")
@@ -408,6 +417,59 @@ def call_tool(cfg, runs, name, args):
         return runs.cancel(args["run_id"])
 
     raise ValueError(f"no such tool {name!r}")
+
+
+def _peer_run_id(client_address, server_port):
+    """Which VM is on the other end of this connection, if any.
+
+    A guest reaches this server through its own relay process, and that relay
+    runs inside the VM's cgroup - so the connection itself says who is asking,
+    with nothing for the guest to declare and nothing for it to forge. Used
+    only to decide what a spawned VM should outlive; never for access.
+
+    Returns a run id, or None when the caller is not inside a firecode VM -
+    which is the normal case for an agent running on the host.
+    """
+    try:
+        peer_port = client_address[1]
+        want = None
+        with open("/proc/net/tcp") as fh:
+            next(fh)
+            for line in fh:
+                f = line.split()
+                local, remote = f[1], f[2]
+                if (int(local.split(":")[1], 16) == server_port
+                        and int(remote.split(":")[1], 16) == peer_port):
+                    want = f[9]          # the socket's inode
+                    break
+        if want is None:
+            return None
+
+        target = f"socket:[{want}]"
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    if os.readlink(f"/proc/{pid}/fd/{fd}") != target:
+                        continue
+                    with open(f"/proc/{pid}/cgroup") as fh:
+                        cg = fh.read()
+                except OSError:
+                    continue
+                # The innermost one: a nested VM's path holds its parent's run
+                # as well as its own, and it is its own that it must be a
+                # child of.
+                found = [p[len("run-"):] for p in cg.strip().split("/")
+                         if p.startswith("run-")]
+                return found[-1] if found else None
+    except Exception:
+        return None
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -479,7 +541,10 @@ class Handler(BaseHTTPRequestHandler):
             name = params.get("name", "")
             args = params.get("arguments") or {}
             try:
-                text = call_tool(self.cfg, self.runs, name, args)
+                text = call_tool(self.cfg, self.runs, name, args,
+                                 caller_run=_peer_run_id(
+                                     self.client_address,
+                                     self.server.server_address[1]))
                 return ok({"content": [{"type": "text", "text": str(text)}]})
             except Exception as exc:  # reported to the caller, not a crash
                 return ok({"content": [{"type": "text", "text": f"error: {exc}"}],

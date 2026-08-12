@@ -495,6 +495,132 @@ test_shellcheck() {
 	fi
 }
 
+# ------------------------------------------------------------- lifetime
+#
+# What a VM's lifetime has to guarantee, stated as behaviour rather than as
+# mechanism. Nothing below knows that cgroups exist: the contract is that
+# stopping a VM stops everything it started, that a VM which dies badly is
+# still recognisable as dead, and that nothing is left running afterwards -
+# which is what any implementation of this has to keep true.
+
+# Every VM firecode can see, by the project it belongs to.
+vms_running() {
+	"$FIRECODE" list --ids 2>/dev/null | grep -c "$WORK" || true
+}
+
+# Wait for a condition rather than sleeping a guessed amount.
+wait_until() {
+	local what=$1 secs=$2 waited=0
+	shift 2
+	while ((waited * 4 < secs * 4)); do
+		if "$@"; then return 0; fi
+		sleep 0.25
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+start_vm() {
+	local dir=$1
+	shift
+	(cd "$dir" && "$FIRECODE" up --no-jail --no-net --mem 1024 "$@" >/dev/null 2>&1)
+}
+
+test_vm_stops_completely() {
+	((QUICK)) && return 0
+	local p
+	p=$(make_project)
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		return 0
+	fi
+	ok "a VM starts"
+	check "it answers commands" "alive" \
+		"$(cd "$p" && "$FIRECODE" in 'echo alive' 2>/dev/null | tail -1)"
+
+	(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
+	if wait_until "gone" 30 test "$(vms_running)" = "0"; then
+		ok "down leaves nothing running"
+	else
+		no "down leaves nothing running" "$("$FIRECODE" list 2>&1 | head -3)"
+	fi
+}
+
+test_child_dies_with_parent() {
+	((QUICK)) && return 0
+	local parent child parent_run
+	parent=$(make_project)
+	child="$WORK/childproj"
+	rm -rf "$child"
+	mkdir -p "$child"
+	echo x >"$child/README.md"
+	git -C "$child" init -q 2>/dev/null
+
+	if ! start_vm "$parent"; then
+		no "the parent VM starts"
+		return 0
+	fi
+	ok "the parent VM starts"
+
+	# Whatever identifies a run to firecode - here, the id it reports for the
+	# VM belonging to this project.
+	parent_run=$("$FIRECODE" list --ids 2>/dev/null | awk -v p="$parent" '$2==p{print $1}' | head -1)
+	if [[ -z $parent_run ]]; then
+		no "the parent VM has an id" "firecode list --ids reported none"
+		(cd "$parent" && "$FIRECODE" down >/dev/null 2>&1)
+		return 0
+	fi
+	ok "the parent VM has an id"
+
+	if ! start_vm "$child" --parent-run "$parent_run"; then
+		no "a VM starts as a child of it"
+		(cd "$parent" && "$FIRECODE" down >/dev/null 2>&1)
+		return 0
+	fi
+	ok "a VM starts as a child of it"
+	check "both are running" "2" "$(vms_running)"
+
+	# The whole point: stopping the parent has to reach the child, which no
+	# process tree connects it to.
+	(cd "$parent" && "$FIRECODE" down --project "$parent" >/dev/null 2>&1)
+	if wait_until "child gone" 45 test "$(vms_running)" = "0"; then
+		ok "stopping the parent stops the child too"
+	else
+		no "stopping the parent stops the child too" \
+			"$("$FIRECODE" list 2>&1 | head -4)"
+		(cd "$child" && "$FIRECODE" down --project "$child" >/dev/null 2>&1)
+	fi
+}
+
+test_killed_vm_is_reported_dead() {
+	((QUICK)) && return 0
+	local p
+	p=$(make_project)
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		return 0
+	fi
+	ok "a VM starts"
+
+	# A launcher killed outright runs no cleanup, which is how strays were
+	# left behind before. What must not happen is firecode continuing to
+	# report the VM as usable.
+	local vmm
+	vmm=$(pgrep -x firecracker | tail -1)
+	kill -9 "$vmm" 2>/dev/null || true
+
+	if wait_until "reported gone" 30 test "$(vms_running)" = "0"; then
+		ok "a VM killed outright stops being listed"
+	else
+		no "a VM killed outright stops being listed" "$("$FIRECODE" list 2>&1 | head -3)"
+	fi
+	if [[ -z $(pgrep -x firecracker) ]]; then
+		ok "and nothing of it is left running"
+	else
+		no "and nothing of it is left running" "$(pgrep -a firecracker | head -2)"
+	fi
+}
+
 # -------------------------------------------------------------------- main
 
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
@@ -516,6 +642,9 @@ run_test concurrent_runs
 run_test ro_image_cached
 run_test jailed
 run_test interactive
+run_test vm_stops_completely
+run_test child_dies_with_parent
+run_test killed_vm_is_reported_dead
 
 echo
 if ((FAIL == 0)); then

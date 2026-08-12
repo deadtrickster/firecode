@@ -415,11 +415,18 @@ work handed off and collected later. `vm_up`, `vm_in`, `vm_down`, `vm_list`,
 bring it up once, get a fixture into it, freeze that, and reset to it between
 runs instead of rebuilding it. `list_projects` says what it may touch.
 
-One thing to know: a spawned VM is a sibling on the host, not a child process
-of the VM that asked for it. It is tied to the lifetime of the `firecode` that
-launched it, not to the lifetime of the agent that requested it - so a VM the
-agent forgets about keeps running until its timeout, and `vm_up` VMs have none.
-`firecode list` shows them and `firecode down --project DIR` stops them.
+A spawned VM is a sibling on the host rather than a child process of the VM
+that asked for it - but it does stop when that VM stops. Each run owns a
+cgroup, a VM started on another's behalf is nested inside its parent's, and
+tearing a run down takes its descendants with it: asked politely first, so
+their work still gets copied back, then not. `firecode list` shows what is
+running and which VMs are tied to which.
+
+The parent is worked out from the connection - a guest reaches the host
+through a relay that runs inside that guest's own cgroup - so nothing has to
+be declared by the guest or believed from it. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the ownership model and the invariants
+the tests hold to.
 
 ## Tests
 

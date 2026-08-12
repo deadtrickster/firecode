@@ -47,6 +47,7 @@ AGENT=""
 SYNC_BACK=1
 FAST=0
 REFRESH=0
+PARENT_RUN=""
 RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
@@ -713,18 +714,32 @@ live_vm_socket() {
 		[[ -S $sock ]] || continue
 		socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || continue
 		proj=$(cat "$r/project" 2>/dev/null || echo "")
-		if [[ -n $want && $proj != "$want" ]]; then
-			names+=("$proj")
-			continue
-		fi
+		[[ -n $want && $proj != "$want" ]] && continue
+		# Appended together, always: the two are read by index below, and a
+		# filtered-out run that lands in one but not the other silently
+		# shifts every name onto the wrong socket.
 		socks+=("$sock")
 		names+=("$proj")
 	done
 
 	# Returns non-zero rather than dying: callers ask "is one up?" as a
 	# question, and a die here would end the process mid-question.
-	((${#socks[@]} == 1)) || return 1
-	echo "${socks[0]}"
+	if ((${#socks[@]} == 1)); then
+		echo "${socks[0]}"
+		return 0
+	fi
+	# Several are up and none was named, so the directory you are standing in
+	# gets to decide. Without this, working in a project while another VM
+	# happens to be running elsewhere makes every command ambiguous.
+	if [[ -z $want ]] && ((${#socks[@]} > 1)); then
+		local i
+		for i in "${!socks[@]}"; do
+			[[ ${names[$i]} == "$PWD" ]] || continue
+			echo "${socks[$i]}"
+			return 0
+		done
+	fi
+	return 1
 }
 
 # The same lookup, but for callers that need one and cannot continue without.
@@ -750,6 +765,96 @@ require_vm_socket() {
 		die "no VM running for $want (running:$running)"
 	fi
 	die "more than one VM is running - name one with --project (running:$running)"
+}
+
+# --- who owns what ------------------------------------------------------
+#
+# A run owns a VMM, a few relay processes, a tap, a jail directory and a lock.
+# "Stop that VM" has to mean all of it, from any process, whether or not the
+# one that started it is still around - and a process tree cannot express
+# that. firecracker is deliberately detached, socat gets reparented, and a VM
+# started on another VM's behalf is launched by a different firecode entirely,
+# with no kinship to the VM that asked for it.
+#
+# A cgroup expresses it exactly. Every run gets a subtree:
+#
+#   firecode.slice/run-<id>/vm          the VMM, and nothing else
+#                          /relays      the socat processes serving it
+#                          /children/   runs started on this one's behalf
+#
+# The VMM gets a leaf to itself so that "is this run alive" can mean "is the
+# VM alive". Relays are helpers: one still running after the VMM died says the
+# run is leaking, not that it is up.
+#
+# so one write to cgroup.kill on run-<id> takes the VM, its helpers, and every
+# descendant VM with it - no pids to chase, no races with reparenting, and it
+# works from a process that had nothing to do with starting any of them.
+#
+# Processes only ever live in the leaves, because cgroup v2 refuses a cgroup
+# that holds both processes and child cgroups once a controller is enabled.
+#
+# This also gives liveness an answer that a pid file cannot: a run is alive if
+# its cgroup is populated. Nothing to go stale, and a SIGKILLed launcher
+# leaves a tree that is still identifiable and still killable.
+CG_DIR=""
+
+cg_root() {
+	local uid
+	uid=$(id -u)
+	echo "/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/firecode.slice"
+}
+
+# systemd delegates this subtree to the user, so none of it needs root. Where
+# that is not true - no cgroup2, no delegation - everything still runs, and
+# lifetime falls back to what it was before: each VM tied to its launcher.
+cg_supported() {
+	[[ $(stat -fc %T /sys/fs/cgroup 2>/dev/null) == cgroup2fs ]] || return 1
+	local base
+	base=$(cg_root)
+	mkdir -p "$base" 2>/dev/null || return 1
+	[[ -w $base/cgroup.procs && -e $base/cgroup.kill ]]
+}
+
+# The tree for one run, nested inside its parent's when it has one.
+cg_make() {
+	local id=$1 parent_cg=${2:-} dir
+	cg_supported || return 1
+	if [[ -n $parent_cg && -d $parent_cg ]]; then
+		dir="$parent_cg/children/run-$id"
+	else
+		dir="$(cg_root)/run-$id"
+	fi
+	mkdir -p "$dir/vm" "$dir/relays" 2>/dev/null || return 1
+	echo "$dir"
+}
+
+# Called inside the subshell that is about to become the VMM or a relay, so
+# the process lands in the cgroup before it is anything else.
+cg_join() {
+	[[ -n ${1:-} && -d $1 ]] || return 0
+	echo "$BASHPID" >"$1/cgroup.procs" 2>/dev/null || true
+}
+
+# populated is recursive: it is 1 while anything in the subtree is alive.
+cg_alive() {
+	[[ -n ${1:-} && -d $1 ]] || return 1
+	grep -qs '^populated 1' "$1/cgroup.events"
+}
+
+# Everything in the subtree, in one write. Descendants included, which is the
+# entire point: this is how a child VM stops when its parent does.
+cg_kill() {
+	local dir=${1:-}
+	[[ -n $dir && -d $dir ]] || return 0
+	echo 1 >"$dir/cgroup.kill" 2>/dev/null || true
+	# A cgroup cannot be removed while it holds processes, and the kill is
+	# not instant, so give it a moment before tidying up.
+	local waited=0
+	while cg_alive "$dir" && ((waited < 50)); do
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	find "$dir" -depth -type d -exec rmdir {} + 2>/dev/null || true
 }
 
 # --- fast start ---------------------------------------------------------
@@ -1412,9 +1517,12 @@ relays_up() {
 		# Bound from inside the jail directory on purpose. A unix socket path
 		# is capped at 108 bytes, and the absolute path to a run's jail is
 		# already longer than that for any normally placed checkout.
-		(cd "$jail_dir" && exec socat \
-			"UNIX-LISTEN:firecracker-vsock.sock_$p,fork,unlink-early" \
-			"TCP:127.0.0.1:$p") >>"$RUN_DIR/relays.log" 2>&1 &
+		(
+			cg_join "$CG_DIR/relays"
+			cd "$jail_dir" && exec socat \
+				"UNIX-LISTEN:firecracker-vsock.sock_$p,fork,unlink-early" \
+				"TCP:127.0.0.1:$p"
+		) >>"$RUN_DIR/relays.log" 2>&1 &
 		RELAY_PIDS+=($!)
 	done
 	# Give socat time to create the sockets: firecracker resets the guest's
@@ -1508,9 +1616,35 @@ has_prompt() {
 # ---------------------------------------------------------------- launch
 
 RUN_DIR=""
+RUN_ID=""
 JAIL_DIR=""
 STTY_SAVED=""
 VM_PID=""
+
+# Ask every VM this run started to shut down, then wait a little for them to
+# do it. Shutting down cleanly is what unmounts a guest's project drive and
+# lets its work be copied back out, so it is worth a few seconds even when the
+# cgroup could end all of them instantly.
+stop_children() {
+	local me=$1 r sock waited=0
+	for r in "$RUNS"/*/; do
+		[[ -f $r/parent && -f $r/jail ]] || continue
+		[[ $(cat "$r/parent" 2>/dev/null) == "$me" ]] || continue
+		sock="$(cat "$r/jail")/firecracker-vsock.sock"
+		[[ -S $sock ]] || continue
+		log "stopping the VM this run started ($(basename "${r%/}"))"
+		python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+			"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
+	done
+	# populated is recursive, so this waits on the whole descendant tree at
+	# once - grandchildren included, without having to walk it.
+	[[ -n $CG_DIR ]] || return 0
+	while cg_alive "$CG_DIR/children" && ((waited < 100)); do
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	return 0
+}
 
 cleanup_run() {
 	local status=$?
@@ -1522,7 +1656,16 @@ cleanup_run() {
 	# there may be no terminal to restore. Under set -e an unguarded failure
 	# here exits the shell on the spot, before the status below is returned,
 	# so a session that went perfectly reports 1.
+	# VMs started on this one's behalf get asked to stop first: a child that
+	# is killed outright loses whatever it had not written back, and being a
+	# sub-VM is not a reason to lose work. The cgroup below is the backstop
+	# for whatever ignores the request.
+	if [[ -n $RUN_ID ]]; then stop_children "$RUN_ID" || true; fi
 	if [[ -n $VM_PID ]]; then kill "$VM_PID" 2>/dev/null || true; fi
+	# And everything this run owns, including any VM started on its behalf.
+	# Killing the pid above only ever reached the VMM this process started;
+	# a child VM belongs to a different firecode and would have survived.
+	if [[ -n $CG_DIR ]]; then cg_kill "$CG_DIR" || true; fi
 	if [[ -n $STTY_SAVED ]]; then stty "$STTY_SAVED" 2>/dev/null || true; fi
 	relays_down
 	net_down
@@ -1559,6 +1702,13 @@ launch() {
 			FAST=1
 			REFRESH=1
 			shift
+			;;
+		--parent-run)
+			# Which run asked for this VM. Only lifetime depends on it, never
+			# access, so a guest naming the wrong parent can shorten its own
+			# VM's life and nothing else.
+			PARENT_RUN="$2"
+			shift 2
 			;;
 		--vcpu | --cpus)
 			VCPU="$2"
@@ -1761,12 +1911,31 @@ launch() {
 	# launched together from one shell would collide on the same run id.
 	id="firecode-$(date +%Y%m%d-%H%M%S)-$BASHPID"
 	RUN_DIR="$RUNS/$id"
+	RUN_ID="$id"
 	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
 	mkdir -p "$RUN_DIR" "$JAIL_DIR"
 	# Which project this VM is for, so several can run and still be told
 	# apart by something other than "the only one".
 	printf '%s\n' "$WORKDIR" >"$RUN_DIR/project"
 	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
+
+	# The cgroup this run owns. Nested inside the parent's when this VM was
+	# asked for by another one, which is what makes the parent's teardown
+	# reach it. A parent that named itself and is already gone leaves the run
+	# at the top level rather than failing it - the VM is still wanted, it
+	# just has nothing to outlive.
+	local parent_cg=""
+	if [[ -n $PARENT_RUN && -f $RUNS/$PARENT_RUN/cgroup ]]; then
+		parent_cg=$(cat "$RUNS/$PARENT_RUN/cgroup")
+		printf '%s\n' "$PARENT_RUN" >"$RUN_DIR/parent"
+	fi
+	if CG_DIR=$(cg_make "$id" "$parent_cg"); then
+		printf '%s\n' "$CG_DIR" >"$RUN_DIR/cgroup"
+		[[ -n $parent_cg ]] && log "this VM belongs to run $PARENT_RUN and stops when it does"
+	else
+		CG_DIR=""
+		log "WARNING: no usable cgroup, so this VM is only tied to this process"
+	fi
 	trap cleanup_run EXIT INT TERM PIPE HUP
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
@@ -2205,7 +2374,8 @@ EOF
 		# Loading a snapshot is an API call, which means the VMM has to be
 		# running before the VM exists - so this path cannot hand the
 		# terminal straight to firecracker the way a cold boot does.
-		(cd "$JAIL_DIR" && "${cmd[@]}") >"$RUN_DIR/console.log" 2>&1 &
+		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
+			>"$RUN_DIR/console.log" 2>&1 &
 		local vm_pid=$!
 		VM_PID=$vm_pid
 		memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1
@@ -2219,7 +2389,8 @@ EOF
 		# that console never sees Enter. Keeping the VM off the terminal also
 		# means the jailer works here, which it does not when firecracker is
 		# attached to one.
-		(cd "$JAIL_DIR" && "${cmd[@]}") >"$RUN_DIR/console.log" 2>&1 &
+		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
+			>"$RUN_DIR/console.log" 2>&1 &
 		local vm_pid=$!
 		VM_PID=$vm_pid
 		((restoring)) && { memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1; }
@@ -2241,7 +2412,8 @@ EOF
 		# tee keeps the unfiltered record; what reaches the terminal is
 		# scrubbed. An unattended run prints logs, and a log has no business
 		# setting the clipboard or redefining a key.
-		(cd "$JAIL_DIR" && "${cmd[@]}") 2>&1 | tee "$RUN_DIR/console.log" |
+		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") 2>&1 |
+			tee "$RUN_DIR/console.log" |
 			python3 "$SCRIPTS/termfilter.py" --strict || rc=$?
 	fi
 
@@ -2336,27 +2508,84 @@ cmd_extract() {
 	echo "$dest"
 }
 
+# Every VM that is actually running now, as "<id> <project> <parent>".
+#
+# Liveness is asked of the cgroup, not of a pid file or a socket: a pid can be
+# reused and a socket file outlives the process that made it, but a cgroup is
+# populated exactly while something in it is alive. That is what lets a run
+# whose launcher was killed outright still be recognised - and cleaned up.
+live_runs() {
+	local d id proj parent cg sock
+	[[ -d $RUNS ]] || return 0
+	for d in "$RUNS"/*/; do
+		[[ -f $d/jail ]] || continue
+		id=$(basename "${d%/}")
+		proj=$(cat "$d/project" 2>/dev/null || echo "?")
+		parent=$(cat "$d/parent" 2>/dev/null || echo "-")
+		cg=$(cat "$d/cgroup" 2>/dev/null || echo "")
+		if [[ -n $cg ]]; then
+			cg_alive "$cg/vm" || continue
+		else
+			# No cgroup for this run, so fall back to asking the VM itself.
+			sock="$(cat "$d/jail")/firecracker-vsock.sock"
+			[[ -S $sock ]] || continue
+			socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || continue
+		fi
+		printf '%s\t%s\t%s\n' "$id" "$proj" "$parent"
+	done
+}
+
 cmd_list() {
+	# Machine-readable, for tests and for anything scripting this.
+	if [[ ${1:-} == --ids ]]; then
+		live_runs
+		return 0
+	fi
+
 	echo "sessions:"
 	cmd_sessions
 	echo
-	echo "runs:"
-	if [[ ! -d $RUNS ]]; then
-		echo "no runs yet"
-		return 0
-	fi
-	local d id state
+	echo "VMs running:"
+	local any=0 id proj parent
+	while IFS=$'\t' read -r id proj parent; do
+		any=1
+		if [[ $parent != "-" && -n $parent ]]; then
+			printf '  %-38s %s\n' "$id" "$proj"
+			printf '  %-38s   stops when %s does\n' "" "$parent"
+		else
+			printf '  %-38s %s\n' "$id" "$proj"
+		fi
+	done < <(live_runs)
+	((any)) || echo "  (none)"
+
+	[[ -d $RUNS ]] || return 0
+
+	# Only the runs that still hold something. A finished run leaves a
+	# directory of metadata behind, and after a busy day there are hundreds
+	# of them - printing them all buries the two lines that matter.
+	local d kept=0 done_count=0
 	for d in "$RUNS"/*/; do
 		[[ -d $d ]] || continue
-		id=$(basename "$d")
-		state="cleaned"
-		compgen -G "$d*.ext4" >/dev/null && state="drives kept"
-		printf '%-40s %s\n' "$id" "$state"
+		if compgen -G "$d*.ext4" >/dev/null; then
+			((kept == 0)) && {
+				echo
+				echo "runs still holding drives:"
+			}
+			kept=$((kept + 1))
+			printf '  %-38s %s\n' "$(basename "${d%/}")" "$(du -sh "$d" | cut -f1)"
+		else
+			done_count=$((done_count + 1))
+		fi
 	done
+	if ((done_count)); then
+		echo
+		echo "$done_count finished run(s) - firecode gc clears them"
+	fi
 }
 
 cmd_gc() {
 	local keep=${1:-5} n=0 d
+	local -a stuck=()
 	[[ -d $RUNS ]] || return 0
 	# Newest first; anything past the keep count goes entirely.
 	while IFS= read -r d; do
@@ -2378,10 +2607,16 @@ cmd_gc() {
 			continue # still alive
 		fi
 		# The jailer makes device nodes in there as root, so a plain rm can
-		# come up short.
-		rm -rf "$j" 2>/dev/null || priv rm -rf "$j"
+		# come up short. Where it does, say so and carry on: leaving one
+		# directory behind is not a reason to abandon the rest of the sweep,
+		# and there is no terminal here to authenticate with anyway.
+		rm -rf "$j" 2>/dev/null || stuck+=("$j")
 	done
 	log "kept the $keep most recent runs (logs only)"
+	if ((${#stuck[@]})); then
+		log "${#stuck[@]} jail director(ies) need root to remove:"
+		log "  sudo rm -rf ${stuck[*]}"
+	fi
 }
 
 cmd_doctor() {
