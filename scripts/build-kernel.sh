@@ -117,6 +117,30 @@ docker run --rm \
 	echo "[kernel] compiling with $(nproc) jobs (this is the slow part)"
 	make -j"$(nproc)" vmlinux
 
+	# perf, from the same tree.
+	#
+	# Distributions package perf per kernel version, and there is no package
+	# for a kernel built here - so a guest is left borrowing a released perf
+	# and hoping the mismatch does not matter. It usually does not for
+	# software events, but "usually" is a poor foundation for a profiler, and
+	# the tools are sitting right there in the source that produced the kernel.
+	#
+	# Static, so it can be dropped into any guest without carrying its
+	# libraries. NO_LIBTRACEEVENT and friends keep it building without a pile
+	# of optional dependencies; what remains is record, report and script.
+	echo "[kernel] building perf from the same tree"
+	if make -C tools/perf -j"$(nproc)" \
+		NO_LIBTRACEEVENT=1 NO_LIBELF=0 NO_JVMTI=1 NO_LIBBPF=1 \
+		NO_LIBPYTHON=1 NO_LIBPERL=1 NO_SLANG=1 NO_LIBCAP=1 \
+		LDFLAGS=-static >/tmp/perf-build.log 2>&1; then
+		cp tools/perf/perf "/out/perf-$VERSION"
+		chown "$HOST_UID:$HOST_GID" "/out/perf-$VERSION"
+		echo "[kernel] built perf-$VERSION"
+	else
+		echo "[kernel] perf did not build - the kernel is still fine" >&2
+		tail -5 /tmp/perf-build.log >&2
+	fi
+
 	# DWARF was needed to generate BTF and is dead weight afterwards - it is
 	# a third of a gigabyte that firecracker would parse and never load.
 	# .BTF survives strip --strip-debug because the kernel actually maps it.

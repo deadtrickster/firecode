@@ -83,6 +83,10 @@ jobs:
         run: |
           cd images
           sha256sum "${{ steps.v.outputs.asset }}" > "${{ steps.v.outputs.asset }}.sha256"
+          # perf from the same tree, when it built. A guest otherwise borrows a
+          # released perf whose version does not match its kernel.
+          PERF="perf-${{ steps.v.outputs.version }}"
+          [ -f "$PERF" ] && sha256sum "$PERF" > "$PERF.sha256" || true
           gh release create "${{ steps.v.outputs.tag }}" \
             --title "guest kernel ${{ steps.v.outputs.version }} (traceable)" \
             --notes "$(printf '%s\n' \
@@ -94,8 +98,10 @@ jobs:
               '' \
               'Pull it with: firecode setup --debug-kernel')" \
             "${{ steps.v.outputs.asset }}" "${{ steps.v.outputs.asset }}.sha256" \
+            $(ls "perf-${{ steps.v.outputs.version }}"* 2>/dev/null) \
           || gh release upload "${{ steps.v.outputs.tag }}" \
-               "${{ steps.v.outputs.asset }}" "${{ steps.v.outputs.asset }}.sha256" --clobber
+               "${{ steps.v.outputs.asset }}" "${{ steps.v.outputs.asset }}.sha256" \
+               $(ls "perf-${{ steps.v.outputs.version }}"* 2>/dev/null) --clobber
 
       - name: what it can do
         if: steps.have.outputs.skip == 'no'

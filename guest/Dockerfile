@@ -183,4 +183,17 @@ RUN printf '%s\n' \
 	'MISE_CACHE_DIR=/var/cache/mise' \
 	> /etc/environment
 
+# The package index, kept rather than deleted.
+#
+# Every layer above drops /var/lib/apt/lists to keep the image small, which is
+# right for an image you ship and wrong for one you work in: the first
+# `apt-get install` in a VM then fails to find anything until someone runs
+# `apt-get update`, and a script that does not know to do that gets a package
+# that does not exist. It costs about 40MB of a 6G image and saves that
+# roundtrip in every VM ever booted from it.
+#
+# Last, so it is the state the image ends in rather than something a later
+# layer cleans up again.
+RUN apt-get update
+
 CMD ["/sbin/init"]
