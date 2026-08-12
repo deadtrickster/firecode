@@ -19,6 +19,10 @@ Until then:
   or a fixture built, `vm_checkpoint` freezes it and `vm_reset` returns to it in
   about a second, however badly you wrecked it. Generate state properly once
   rather than cheaply many times.
+- **Real data is attached, not copied.** `vm_up` takes `datasets`, and a
+  terabyte costs what a megabyte does. But it is *mounted*, not loaded: point
+  the server's own config at that path, or it starts empty and tells you
+  nothing. The guide covers this.
 - **A VM you started stops when you stop.** Nothing you leave running outlives
   the session, so a VM you are done with should be told `vm_down` rather than
   abandoned - but nothing leaks if you forget.

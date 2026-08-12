@@ -160,6 +160,52 @@ mount_extras() {
 	done
 }
 
+# Host disks handed to this VM whole, rather than copied into it - which is
+# the only workable arrangement once a dataset is measured in terabytes.
+#
+# Paired by position: they are attached after every drive firecode owns, so
+# they are the last N virtio disks, in the order they were given. Not by label,
+# because these are someone else's filesystems and two of them sharing a label
+# is exactly how the wrong disk gets mounted.
+mount_disks() {
+	local spec="${FIRECODE_DISKS:-}"
+	[[ -n $spec ]] || return 0
+
+	# Deliberate word splitting: the spec is a space-separated list this
+	# harness wrote itself, one entry per --disk.
+	# shellcheck disable=SC2206
+	local -a wanted=($spec) devs=()
+	local d
+	for d in /dev/vd*; do [[ -b $d ]] && devs+=("$d"); done
+	local n=${#wanted[@]} total=${#devs[@]}
+	((total >= n)) || {
+		log "WARNING: expected $n extra disk(s), found $total block devices"
+		return 0
+	}
+
+	local i dev target opts
+	for i in "${!wanted[@]}"; do
+		dev=${devs[$((total - n + i))]}
+		[[ ${wanted[$i]} == "-" ]] && {
+			log "disk $dev attached, not mounted (as asked)"
+			continue
+		}
+		target=${wanted[$i]%%:*}
+		opts=${wanted[$i]##*:}
+		mkdir -p "$target"
+		# Whatever it holds - a filesystem this kernel may or may not know.
+		# Saying which disk and which mountpoint matters more than the errno:
+		# "cannot mount" with neither is the least useful line in a log.
+		if mount -o "$opts" "$dev" "$target" 2>/dev/null; then
+			log "mounted $dev at $target ($opts)"
+		elif mount -o "$opts" -t auto "$dev" "$target" 2>/dev/null; then
+			log "mounted $dev at $target ($opts)"
+		else
+			log "WARNING: could not mount $dev at $target - it is still $dev"
+		fi
+	done
+}
+
 # The project, writable, at the path it has on the host - and only there.
 mount_project() {
 	local target=${FIRECODE_PROJECT:-}
@@ -260,6 +306,7 @@ main() {
 		log "tracing available: $(cat /sys/kernel/tracing/available_tracers 2>/dev/null)"
 	fi
 
+	mount_disks
 	setup_network
 	setup_relays
 

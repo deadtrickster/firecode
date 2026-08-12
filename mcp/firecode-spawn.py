@@ -78,6 +78,26 @@ class Config:
         for name, p in (raw.get("projects") or {}).items():
             self.projects[name] = os.path.abspath(os.path.expanduser(p))
 
+        # Datasets are named for the same reason projects are: an agent asks
+        # for "tpcc", never for a path or a device. Handing a caller-supplied
+        # device to a VM would be handing it any disk on the machine.
+        #
+        # Each carries where it should be mounted and whether it may be
+        # written, because those are not the agent's to choose either - and
+        # because a dataset attached without a mountpoint is a dataset the
+        # server it was fetched for cannot be pointed at.
+        self.datasets = {}
+        for name, spec in (raw.get("datasets") or {}).items():
+            if isinstance(spec, str):
+                spec = {"path": spec}
+            path = os.path.abspath(os.path.expanduser(spec["path"]))
+            self.datasets[name] = {
+                "path": path,
+                "mount": spec.get("mount") or f"/data/{name}",
+                "mode": "ro" if spec.get("mode") == "ro" else "rw",
+                "note": spec.get("note") or "",
+            }
+
         self.max_concurrent = int(raw.get("max_concurrent", 2))
         self.max_total = int(raw.get("max_total", 20))
         self.default_timeout = int(raw.get("default_timeout", 3600))
@@ -221,6 +241,7 @@ class Runs:
 
 def build_tools(cfg):
     projects = sorted(cfg.projects) or ["(none configured)"]
+    datasets = sorted(cfg.datasets) or ["(none configured)"]
     return [
         {
             "name": "vm_up",
@@ -228,10 +249,23 @@ def build_tools(cfg):
                 "Start a VM for a project and leave it running. Use this when "
                 "you will run more than one command: the machine stays warm, "
                 "so a toolchain and a build are paid for once rather than per "
-                "command. Returns when it is ready to accept commands."),
+                "command. Returns when it is ready to accept commands. "
+                "`datasets` attaches real data - see the guide before using "
+                "it: the disk is mounted, never loaded, and the server you "
+                "start has to be configured to use that path."),
             "inputSchema": {
                 "type": "object",
-                "properties": {"project": {"type": "string", "enum": projects}},
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "datasets": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": datasets},
+                        "description": (
+                            "Datasets to attach, by name. Each is a real disk "
+                            "given to the VM whole - nothing is copied, so a "
+                            "terabyte costs the same as a megabyte."),
+                    },
+                },
                 "required": ["project"],
             },
         },
@@ -376,8 +410,31 @@ def call_tool(cfg, runs, name, args, caller_run=None):
 
     if name == "vm_up":
         path = _project_path(cfg, args["project"])
-        rc, out = _firecode(["up", "--workdir", path] + parent + cfg.extra_args,
-                            timeout=300)
+        disks = []
+        chosen = args.get("datasets") or []
+        for ds in chosen:
+            if ds not in cfg.datasets:
+                raise ValueError(
+                    f"unknown dataset {ds!r}. Known: "
+                    + (", ".join(sorted(cfg.datasets)) or "(none)"))
+            d = cfg.datasets[ds]
+            disks += ["--disk", f"{d['path']}:{d['mount']}:{d['mode']}"]
+        # A raw device cannot be handed to a jailed VMM: the jailer chroots,
+        # and making a device node in there needs root.
+        if disks and "--no-jail" not in cfg.extra_args:
+            disks.append("--no-jail")
+        rc, out = _firecode(["up", "--workdir", path] + parent + disks + cfg.extra_args,
+                            timeout=600)
+        if rc == 0 and chosen:
+            where = "; ".join(
+                f"{d} at {cfg.datasets[d]['mount']} ({cfg.datasets[d]['mode']})"
+                + (f" - {cfg.datasets[d]['note']}" if cfg.datasets[d]["note"] else "")
+                for d in chosen)
+            return (f"{args['project']} is up with {where}.\n"
+                    "The data is mounted, not loaded: point the server's own "
+                    "configuration at that path (data_directory, -D, --datadir "
+                    "or whatever it calls it) or it will come up empty and tell "
+                    "you nothing.")
         if rc != 0:
             return f"could not start a VM for {args['project']}:\n{out}"
         return f"{args['project']} is up. Run commands with vm_in."
@@ -423,7 +480,19 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         if not cfg.projects:
             return (f"No projects configured. Add them to {cfg.path} - "
                     "paths are never taken from the caller.")
-        return "\n".join(f"{n}  {p}" for n, p in sorted(cfg.projects.items()))
+        out = ["projects:"]
+        out += [f"  {n}  {p}" for n, p in sorted(cfg.projects.items())]
+        if cfg.datasets:
+            out.append("")
+            out.append("datasets (attach with vm_up datasets=[...]):")
+            for n, d in sorted(cfg.datasets.items()):
+                line = f"  {n}  mounts at {d['mount']} ({d['mode']})"
+                if d["note"]:
+                    line += f" - {d['note']}"
+                out.append(line)
+            out.append("  a dataset is mounted, not loaded: point the server's")
+            out.append("  own config at that path or it comes up empty.")
+        return "\n".join(out)
 
     if name == "spawn":
         run_id = runs.spawn(args["project"], args["task"],

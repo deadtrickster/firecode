@@ -99,6 +99,52 @@ what changed. Work in the project directory when the work is meant to be kept.
 Installing things is fine and it persists - `apt-get install`, a language
 toolchain, whatever the job needs. You are root.
 
+## Working against real data
+
+`list_projects` also lists **datasets**. A dataset is a real disk - often a
+snapshot of a production volume - handed to the VM whole:
+
+```
+vm_up  project=lab  datasets=["tpcc"]
+```
+
+Nothing is copied. A five-terabyte dataset attaches as fast as a small one,
+because the guest is given the same blocks the host has. This is the only
+workable way to debug against real data, and it is why the answer to "can I
+have the production database" is yes rather than no.
+
+**A dataset is mounted, not loaded, and that is the part people get wrong.**
+The disk appears at a path - say `/data/tpcc` - and nothing else happens. If
+you then start the server with its default configuration it will initialise an
+empty directory somewhere else, come up perfectly healthy, and tell you
+nothing about the data you attached. The two have to be paired:
+
+```
+vm_in  project=lab  command="ls /data/tpcc"              # what is actually there
+vm_in  project=lab  command="pg_ctl -D /data/tpcc start" # point the server AT it
+```
+
+Whatever the server calls it - `data_directory`, `-D`, `--datadir`,
+`--store-path` - that setting has to name the mountpoint. Check the server
+actually opened it (its log, or the row counts) before drawing a conclusion
+from anything it says.
+
+**Writable, and safe because of the snapshot, not because of read-only.** Most
+datasets are attached `rw`, and should be: a database has to write to start at
+all - recovery, WAL, temp files - and one attached read-only will simply
+refuse to come up. What protects the original is that you were given a
+snapshot, so your writes land in its copy-on-write space and the real volume
+is untouched. Write freely; that is what it is for.
+
+A dataset marked `ro` is one where that is not true, and there the server may
+genuinely be unable to start. Say so rather than working around it by copying
+the data somewhere writable - at this size that will fill the disk.
+
+**Space is finite even so.** A snapshot has a fixed amount of copy-on-write
+space, and a session that writes more than that kills the snapshot and your
+VM's view of the data with it. Heavy write tests against a huge dataset are
+worth mentioning before you run them, not after.
+
 ## Looking inside a running process
 
 Whether this works depends on the kernel the VM booted. Check first:

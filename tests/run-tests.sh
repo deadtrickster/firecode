@@ -658,6 +658,122 @@ test_killed_vm_is_reported_dead() {
 	fi
 }
 
+# --------------------------------------------------------- the guest's /proc
+#
+# Reading /proc on the host while the process runs in a VM describes the wrong
+# machine and looks healthy doing it, which is the failure these two guard
+# against. Both assert against numbers that cannot match by accident: a VM
+# booted with 1G against a host with rather more.
+
+host_memtotal() { awk '/MemTotal/{print $2}' /proc/meminfo; }
+
+test_proc_mirror() {
+	((QUICK)) && return 0
+	local p out
+	p=$(make_project)
+	out="$WORK/mirror"
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		return 0
+	fi
+	ok "a VM starts"
+
+	if (cd "$p" && "$FIRECODE" mirror --once --out "$out" \
+		'/proc/meminfo' '/proc/uptime' >/dev/null 2>&1); then
+		ok "mirror pulls the paths it was given"
+	else
+		no "mirror pulls the paths it was given"
+		(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
+		return 0
+	fi
+
+	local guest host
+	guest=$(awk '/MemTotal/{print $2}' "$out/proc/meminfo" 2>/dev/null)
+	host=$(host_memtotal)
+	if [[ -n $guest && $guest != "$host" ]]; then
+		ok "what it pulled is the guest's, not this machine's ($guest vs $host kB)"
+	else
+		no "what it pulled is the guest's, not this machine's" "got [$guest] vs host [$host]"
+	fi
+
+	# A pattern matching nothing has to fail rather than quietly leaving the
+	# last tick's files in place, which would age into wrong answers.
+	if (cd "$p" && "$FIRECODE" mirror --once --out "$out" \
+		'/proc/definitely-not-here' >/dev/null 2>&1); then
+		no "a pattern that matches nothing is an error"
+	else
+		ok "a pattern that matches nothing is an error"
+	fi
+	(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
+}
+
+test_proc_mounted() {
+	((QUICK)) && return 0
+	local p mnt venv
+	venv="$ROOT/.venv/bin/python"
+	if [[ ! -x $venv ]] || ! "$venv" -c "import fuse" 2>/dev/null; then
+		ok "the /proc mount (skipped, needs fusepy in .venv)"
+		return 0
+	fi
+	p=$(make_project)
+	mnt="$WORK/vmproc"
+	rm -rf "$mnt"
+	mkdir -p "$mnt"
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		return 0
+	fi
+
+	local sock
+	sock=$("$FIRECODE" list --ids 2>/dev/null | awk -v p="$p" '$2==p{print $1}' | head -1)
+	sock=$(cat "$ROOT/runs/$sock/jail" 2>/dev/null)/firecracker-vsock.sock
+	"$venv" "$ROOT/scripts/vmprocfs.py" "$sock" 1026 "$mnt" --ttl 2 \
+		>"$WORK/vmprocfs.log" 2>&1 &
+	local fuse_pid=$!
+	wait_until "mounted" 20 mountpoint -q "$mnt" || true
+
+	if mountpoint -q "$mnt"; then
+		ok "the guest's /proc mounts"
+	else
+		no "the guest's /proc mounts" "$(tail -2 "$WORK/vmprocfs.log" 2>/dev/null)"
+		kill "$fuse_pid" 2>/dev/null
+		(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
+		return 0
+	fi
+
+	local guest host
+	guest=$(timeout 30 awk '/MemTotal/{print $2}' "$mnt/meminfo" 2>/dev/null)
+	host=$(host_memtotal)
+	if [[ -n $guest && $guest != "$host" ]]; then
+		ok "reading it gives the guest's numbers ($guest vs $host kB)"
+	else
+		no "reading it gives the guest's numbers" "got [$guest] vs host [$host]"
+	fi
+
+	# Listing must not read what it lists. It used to, and `ls` of a few
+	# hundred entries then took minutes and looked exactly like a hang.
+	local began ended
+	began=${EPOCHREALTIME/[.,]/}
+	timeout 45 ls "$mnt" >/dev/null 2>&1
+	ended=${EPOCHREALTIME/[.,]/}
+	if (((ended - began) / 1000000 < 20)); then
+		ok "listing it does not read every file in it ($(((ended - began) / 1000000))s)"
+	else
+		no "listing it does not read every file in it" "took $(((ended - began) / 1000000))s"
+	fi
+
+	# Anything the guest does not have has to come from this machine, or an
+	# unmodified tool breaks for reasons unrelated to the VM.
+	if [[ -n $(timeout 20 cat "$mnt/self/comm" 2>/dev/null) ]]; then
+		ok "what the guest lacks falls through to the host"
+	else
+		no "what the guest lacks falls through to the host" "/self/comm was empty"
+	fi
+
+	fusermount -u "$mnt" 2>/dev/null || kill "$fuse_pid" 2>/dev/null
+	(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
+}
+
 # -------------------------------------------------------------------- main
 
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
@@ -682,6 +798,8 @@ run_test interactive
 run_test vm_stops_completely
 run_test child_dies_with_parent
 run_test killed_vm_is_reported_dead
+run_test proc_mirror
+run_test proc_mounted
 
 echo
 if ((FAIL == 0)); then

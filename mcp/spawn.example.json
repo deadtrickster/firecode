@@ -4,19 +4,31 @@
     "Then give a guest access to it with: firecode claude --host-port 9770 ...",
     "",
     "Projects are named keys on purpose. The caller picks a name, never a",
-    "path, so an agent in a VM cannot ask for a directory you did not list."
+    "path, so an agent in a VM cannot ask for a directory you did not list.",
+    "",
+    "Datasets are disks handed to a VM whole - nothing is copied, so a 5TB",
+    "volume attaches as fast as a small one. Named, like projects, so an agent",
+    "asks for 'tpcc' and never for a device. Give a SNAPSHOT, not the live",
+    "volume: writes then land in copy-on-write space and the original is",
+    "untouched, which is what makes rw safe. A database needs rw to start."
   ],
-
   "projects": {
     "firecode": "~/Projects/firecode"
   },
-
   "max_concurrent": 2,
   "max_total": 20,
   "default_timeout": 3600,
-
-  "host_ports": [18080],
-
+  "host_ports": [
+    18080
+  ],
   "agent": "claude",
-  "extra_args": []
+  "extra_args": [],
+  "datasets": {
+    "tpcc": {
+      "path": "/dev/vg/tpcc-snap",
+      "mount": "/data/tpcc",
+      "mode": "rw",
+      "note": "5TB TPCC, snapshot of /dev/vg/tpcc - point the server's -D at the mountpoint"
+    }
+  }
 }

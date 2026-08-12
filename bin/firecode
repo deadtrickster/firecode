@@ -60,6 +60,10 @@ DRY_RUN=0
 WORKTREE=""
 FRESH_ROOT=0
 declare -a EXTRA_DIRS=()
+# Host disks handed to the guest whole: HOSTPATH[:GUESTPATH[:ro]]. A file or a
+# block device, attached rather than copied - which is the only workable answer
+# once a dataset is measured in terabytes.
+declare -a DISKS=()
 declare -a HOST_PORTS=()
 declare -a EXCLUDES=()
 
@@ -788,6 +792,201 @@ require_vm_socket() {
 	die "more than one VM is running - name one with --project (running:$running)"
 }
 
+# Where each --disk wants to be mounted, in the order given: "PATH:opts".
+# A disk with no mountpoint is still attached - the guest may want the raw
+# device, which is the case for anything that manages its own storage.
+disk_mounts() {
+	local spec rest out=""
+	for spec in ${DISKS+"${DISKS[@]}"}; do
+		rest=${spec#*:}
+		if [[ $rest == "$spec" || -z $rest ]]; then
+			out="$out -"
+			continue
+		fi
+		out="$out ${rest%%:*}:$([[ $spec == *:ro ]] && echo ro || echo rw)"
+	done
+	printf '%s' "${out# }"
+}
+
+# --- the guest's /proc, on the host -------------------------------------
+#
+# A dashboard reads three different things about a server: SQL over a socket,
+# perf captures out of a directory, and /proc for everything the server cannot
+# be asked about itself - runnable threads, context switches, resident memory.
+#
+# The first two cross a VM boundary already. SQL is TCP, and a perf capture is
+# a file that resolves against any build with a matching build-id, on any
+# machine. /proc does not cross anything: it is the kernel of the machine you
+# read it on, and reading it on the host while the process runs in a VM
+# silently describes the wrong machine.
+#
+# So mirror it. One round trip per tick copies the handful of files that
+# matter into a directory on the host that looks exactly like /proc, and
+# anything that can be pointed at a proc root reads the guest instead.
+#
+# Staged into a temp directory in the guest before being packed, because /proc
+# files report a size of zero and tar records what the size field says - a tar
+# taken straight from /proc arrives with every file present and empty.
+# Whatever paths you name, packed from the guest. Globs are expanded there,
+# not here, so a pattern means what it means inside the VM.
+mirror_script() {
+	local patterns=$1
+	cat <<EOF
+set -u
+stage=\$(mktemp -d)
+found=0
+for pat in $patterns; do
+	for f in \$pat; do
+		[ -e "\$f" ] || continue
+		# Each file keeps the path it had, so the mirror is a subtree of the
+		# guest's filesystem rather than a pile of basenames.
+		#
+		# The directories are made here rather than by cp --parents, which
+		# recreates them with the *source* directory's mode - and /proc is
+		# r-xr-xr-x, so the first file lands and every one after it fails
+		# with "permission denied" on a directory cp itself just made.
+		d=\$(dirname "\$f")
+		mkdir -p "\$stage\$d" 2>/dev/null || continue
+		cp -r "\$f" "\$stage\$d/" 2>/dev/null && found=\$((found + 1))
+	done
+done
+[ "\$found" -gt 0 ] || { echo "NOMATCH" >&2; rm -rf "\$stage"; exit 4; }
+# base64 because the exec channel filters what a guest prints at your terminal,
+# as it should - text survives that, a tar stream would not.
+tar -C "\$stage" -cf - . | base64 -w0
+rm -rf "\$stage"
+EOF
+}
+
+cmd_mirror() {
+	local want="" pid="" name="" interval=2 out="" once=0
+	local -a patterns=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		--pid)
+			pid="$2"
+			shift 2
+			;;
+		--name)
+			name="$2"
+			shift 2
+			;;
+		--interval)
+			interval="$2"
+			shift 2
+			;;
+		--out)
+			out="$2"
+			shift 2
+			;;
+		--once)
+			once=1
+			shift
+			;;
+		-*) die "firecode mirror: unknown option $1" ;;
+		*)
+			patterns+=("$1")
+			shift
+			;;
+		esac
+	done
+	((${#patterns[@]})) || die "$(
+		cat <<'USAGE'
+usage: firecode mirror [--project DIR] [--name PROC | --pid N]
+                       [--interval S] [--out DIR] [--once] PATTERN...
+
+Copies paths out of a running VM, repeatedly, into a directory that mirrors
+the guest's filesystem. Patterns are globs expanded inside the guest, and %pid
+stands for the process named by --name or --pid:
+
+  firecode mirror --name serened --out ~/.cache/vm \
+      '/proc/%pid/stat' '/proc/%pid/status' '/proc/%pid/task/*/stat' \
+      '/proc/loadavg' '/proc/meminfo' '/proc/sys/vm/max_map_count'
+
+Then point a reader at ~/.cache/vm as though it were /. This is how anything
+that reads /proc - a dashboard, a profiler's companion - can describe a
+process inside a VM instead of the machine it is running on.
+USAGE
+	)"
+
+	local sock
+	sock=$(require_vm_socket "$want")
+	out=${out:-$RUNS/mirror}
+	mkdir -p "$out"
+
+	local needs_pid=0
+	[[ "${patterns[*]}" == *%pid* ]] && needs_pid=1
+	((needs_pid)) && [[ -z $pid && -z $name ]] &&
+		die "these patterns use %pid, so give --name or --pid"
+
+	log "mirroring $((${#patterns[@]})) pattern(s) from the VM into $out"
+	((once)) || log "every ${interval}s - ^C to stop"
+
+	local tmp payload rc
+	tmp=$(mktemp -d "$RUNS/procmirror.XXXXXX")
+	# shellcheck disable=SC2064  # expand now: the trap must know this path
+	trap "rm -rf '$tmp'" EXIT
+
+	while :; do
+		local resolved=("${patterns[@]}")
+		if ((needs_pid)); then
+			local target=$pid
+			if [[ -n $name ]]; then
+				# Re-resolved every tick on purpose: a process that restarts
+				# comes back as a different pid, and a mirror pinned to the
+				# old one keeps serving the last thing it saw as if it were
+				# live - which is worse than saying nothing.
+				target=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+					"pgrep -x $(printf '%q' "$name") | head -1" 2>/dev/null |
+					tr -cd '0-9')
+			fi
+			if [[ -z $target ]]; then
+				log "no process named ${name:-$pid} in the VM - waiting"
+				((once)) && return 1
+				sleep "$interval"
+				continue
+			fi
+			local i
+			for i in "${!resolved[@]}"; do
+				resolved[i]=${resolved[i]//\%pid/$target}
+			done
+		fi
+
+		rc=0
+		payload=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+			"$(mirror_script "${resolved[*]}")" 2>/dev/null) || rc=$?
+		if ((rc != 0)) || [[ -z $payload ]]; then
+			log "nothing matched in the guest (status $rc)"
+			((once)) && return 1
+		else
+			rm -rf "${tmp:?}/next"
+			mkdir -p "$tmp/next"
+			if printf '%s' "$payload" | base64 -d 2>/dev/null |
+				tar -C "$tmp/next" -xf - 2>/dev/null; then
+				# Swapped in whole, so a reader never catches a half-written
+				# tree - it either sees the last tick or this one.
+				local top
+				for top in "$tmp"/next/*; do
+					[[ -e $top ]] || continue
+					rm -rf "$out/$(basename "$top").swap"
+					mv "$top" "$out/$(basename "$top").swap"
+					rm -rf "${out:?}/$(basename "$top")"
+					mv "$out/$(basename "$top").swap" "$out/$(basename "$top")"
+				done
+			else
+				log "the guest's reply did not unpack - skipping this tick"
+				((once)) && return 1
+			fi
+		fi
+		((once)) && return 0
+		sleep "$interval"
+	done
+}
+
 # --- imported images as layers ------------------------------------------
 #
 # A project's build environment is usually already a docker image - serenedb
@@ -1283,6 +1482,88 @@ up_checkpoint() {
 		log "could not checkpoint - this stays a normal VM"
 	fi
 	rm -f "$jail"/.memcheck-*
+}
+
+# Grow a running VM's disk, without stopping it.
+#
+# The default layer suits installing toolchains. Profiling does not: a perf
+# capture of a busy process runs to hundreds of megabytes a minute, and a full
+# layer does not just fail the capture - it stops the VM being able to do
+# anything, which is a confusing way to learn you needed more disk.
+#
+# Three steps, none of which interrupt the guest: grow the sparse file, have
+# firecracker re-read its size (a PATCH re-reads the backing file and raises a
+# config-change interrupt), then resize the filesystem online, which ext4 has
+# always been able to do while mounted.
+cmd_grow() {
+	local want="" drive="upper" size=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		--drive)
+			drive="$2"
+			shift 2
+			;;
+		*)
+			size="$1"
+			shift
+			;;
+		esac
+	done
+	[[ -n $size ]] || die "usage: firecode grow [--drive upper|state|src] SIZE   (e.g. 64G, or +32G)"
+
+	local sock jail
+	sock=$(require_vm_socket "$want")
+	jail=$(dirname "$sock")
+	[[ -f $jail/vm-config.json ]] ||
+		die "this VM was restored from a checkpoint, so it has no drive table to grow from"
+
+	local base
+	base=$(python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+for d in cfg.get("drives", []):
+    if d.get("drive_id") == sys.argv[2]:
+        print(d["path_on_host"])
+        break
+' "$jail/vm-config.json" "$drive") || true
+	[[ -n $base && -f $jail/$base ]] || die "no drive called $drive in this VM"
+
+	local now target
+	now=$(stat -c %s "$jail/$base")
+	if [[ $size == +* ]]; then
+		target=$((now + $(numfmt --from=iec "${size#+}")))
+	else
+		target=$(numfmt --from=iec "$size")
+	fi
+	((target > now)) || die "$drive is already $(numfmt --to=iec "$now") - this only grows"
+
+	# Sparse, so this costs nothing until the guest writes into it.
+	truncate -s "$target" "$jail/$base" || die "could not grow the image"
+	fc_api "$jail/firecracker.socket" PATCH "/drives/$drive" \
+		"{\"drive_id\":\"$drive\",\"path_on_host\":\"$base\"}" ||
+		die "firecracker would not re-read the drive"
+
+	# The label is how the guest finds it: the device letter depends on the
+	# order drives were attached, and the layer is under an overlay so nothing
+	# mounted points at it.
+	local label
+	case "$drive" in
+	upper) label=fl-layer ;;
+	src) label=firecode-src ;;
+	state) label=firecode-state ;;
+	*) label="" ;;
+	esac
+	if [[ -n $label ]]; then
+		python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+			"dev=\$(blkid -L $label) && sudo resize2fs \$dev" >/dev/null 2>&1 ||
+			log "the guest did not resize its filesystem - do it there with resize2fs"
+	fi
+	log "$drive is now $(numfmt --to=iec "$target"), while the VM keeps running"
+	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "df -h / | tail -1" 2>/dev/null || true
 }
 
 # Freeze the VM that is running now, whatever state it has got itself into.
@@ -1905,6 +2186,17 @@ launch() {
 			FAST=1
 			shift
 			;;
+		--layer-size)
+			# What a VM can write before it runs out. The default suits
+			# installing toolchains; profiling does not - a perf capture of a
+			# busy process runs to hundreds of megabytes a minute, and a full
+			# layer stops the VM doing anything rather than just the capture.
+			# Only used when the layer is first created, so pass it with
+			# --fresh-root to resize an existing one.
+			FIRECODE_LAYER_SIZE=$(numfmt --from=iec "$2" 2>/dev/null || echo "$2")
+			export FIRECODE_LAYER_SIZE
+			shift 2
+			;;
 		--kernel)
 			# "debug" for the traceable one, or a path to any vmlinux.
 			WANT_KERNEL="$2"
@@ -1957,6 +2249,12 @@ launch() {
 		--no-auto-flags)
 			AUTO_FLAGS=0
 			shift
+			;;
+		--disk)
+			# A 5TB dataset is not copied anywhere. It is attached, and the
+			# guest sees the same blocks the host does.
+			DISKS+=("$2")
+			shift 2
 			;;
 		--add-dir)
 			EXTRA_DIRS+=("$2")
@@ -2301,6 +2599,11 @@ launch() {
 		echo "FIRECODE_HOME='$HOME'"
 		echo "FIRECODE_PROJECT='$WORKDIR'"
 		echo "FIRECODE_EXTRA='${extra_spec[*]-}'"
+		# Where each --disk should be mounted, in the order they were given.
+		# Not the device names: those are assigned further down, after this
+		# file is already inside an image. The guest pairs them with the last
+		# N virtio disks, which is exactly where these are attached.
+		echo "FIRECODE_DISKS='$(disk_mounts)'"
 		# Read from the project, not from wherever firecode happens to live, so
 		# a repo-local identity wins the same way it would on the host.
 		echo "FIRECODE_GIT_NAME='$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)'"
@@ -2490,6 +2793,39 @@ launch() {
 		xi=$((xi + 1))
 		next_dev
 		add_drive "extra$xi" "$f" true
+	done
+
+	# Host disks, attached whole and last, which is what lets the guest pair
+	# them with mountpoints by position.
+	local di=0 spec host_path disk_ro
+	for spec in ${DISKS+"${DISKS[@]}"}; do
+		di=$((di + 1))
+		host_path=${spec%%:*}
+		disk_ro=false
+		[[ $spec == *:ro ]] && disk_ro=true
+		[[ -e $host_path ]] || die "--disk: no such file or device: $host_path"
+		if [[ -b $host_path ]] && ((NOJAIL == 0)); then
+			die "--disk $host_path is a block device, which needs --no-jail:
+  the jailer chroots, and a device node inside that chroot has to be made by
+  root. A file image works jailed; a raw device does not, yet."
+		fi
+		next_dev
+		if ((NOJAIL)); then
+			# By absolute path: the whole point is that this lives outside
+			# anything firecode manages, and a 5TB device is not going to be
+			# copied into a jail directory.
+			drive_json+=("{\"drive_id\": \"disk$di\", \"path_on_host\": \"$host_path\", \"is_root_device\": false, \"is_read_only\": $disk_ro}")
+		else
+			# Jailed, the VMM can only see inside its chroot. A hardlink costs
+			# nothing and shares the same inode, so the guest reads the same
+			# blocks - but it only works on the same filesystem.
+			ln "$host_path" "$JAIL_DIR/$(basename "$host_path")" 2>/dev/null ||
+				die "--disk $host_path is on a different filesystem from the jail,
+  so it cannot be linked in. Run with --no-jail, or move the image alongside
+  $JAIL_BASE."
+			add_drive "disk$di" "$host_path" "$disk_ro"
+		fi
+		log "disk: $host_path attached as $NEXT_DEV$([[ $disk_ro == true ]] && echo " (read-only)")"
 	done
 
 	local boot_args="console=ttyS0 reboot=k panic=1 pci=off"
@@ -3083,6 +3419,10 @@ checkpoint)
 layer)
 	shift
 	cmd_layer "$@"
+	;;
+mirror)
+	shift
+	cmd_mirror "$@"
 	;;
 down)
 	shift

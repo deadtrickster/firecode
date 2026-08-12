@@ -60,17 +60,43 @@ def main(argv):
         # it belongs to the protocol rather than to the command's output.
         while b"\n" in tail:
             line, tail = tail.split(b"\n", 1)
-            if line.startswith(TRAILER):
+            # Anywhere in the line, not only at the start of one. The trailer
+            # is written after the command's own output, so it shares a line
+            # with it whenever that output did not end in a newline - which
+            # `printf hi` and `base64 -w0` both do. Looked for only at the
+            # start, the status was never read (every such command "failed"
+            # with 1) and the sentinel was handed back as if it were output.
+            cut = line.rfind(TRAILER)
+            if cut != -1:
                 try:
-                    status = int(line[len(TRAILER):])
+                    status = int(line[cut + len(TRAILER):] or b"1")
                 except ValueError:
                     status = 1
+                line = line[:cut]
+                if line:
+                    out.write(scrub.feed(line))
+                    out.flush()
                 continue
             out.write(scrub.feed(line + b"\n"))
             out.flush()
+    # Whatever is left when the guest hangs up. The trailer is only on a line
+    # of its own when the command's output happened to end with a newline -
+    # `printf hi` or `base64 -w0` leaves it welded to the last line, and
+    # looking for it only at the start of one meant the status was never read
+    # (so every such command "failed" with 1) and the trailer was handed back
+    # as part of the output.
     if tail:
-        out.write(scrub.feed(tail))
-        out.flush()
+        cut = tail.rfind(TRAILER)
+        if cut != -1:
+            rest = tail[cut + len(TRAILER):]
+            try:
+                status = int(rest.split(b"\n", 1)[0] or b"1")
+            except ValueError:
+                status = 1
+            tail = tail[:cut]
+        if tail:
+            out.write(scrub.feed(tail))
+            out.flush()
     sock.close()
     return status
 
