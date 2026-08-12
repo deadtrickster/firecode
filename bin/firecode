@@ -60,6 +60,7 @@ DELIVER=""
 # Authenticate guests through the host instead of copying a token into each.
 AUTH_RELAY=0
 AUTH_RELAY_PORT=""
+API_BASE=""
 HYBRID=0
 PCORES=""
 VPMU=0
@@ -409,6 +410,11 @@ config_fingerprint() {
 		"$OPENCODE_CONF/opencode.json"; do
 		[[ -e $p ]] && parts+=("$p:$(stat -Lc %Y "$p" 2>/dev/null || echo 0)")
 	done
+	# Whether credentials are on the drive at all is part of what the drive
+	# *is*. Without this a relayed run reuses a drive some earlier plain run
+	# built, finds the credentials it was meant not to have, and rotates them
+	# - the exact failure the relay exists to prevent.
+	parts+=("relay:$AUTH_RELAY")
 	printf '%s\n' ${parts+"${parts[@]}"} | sha256sum | cut -d' ' -f1
 }
 
@@ -475,7 +481,14 @@ build_config_drive() {
 	# talk to anything live elsewhere: credentials under the data directory,
 	# providers and MCP servers under the config directory. Without these it
 	# starts up with no provider at all.
-	if [[ -f $OPENCODE_SHARE/auth.json ]]; then
+	if ((AUTH_RELAY)) && [[ $AGENT == opencode ]]; then
+		# Same reason as claude's .credentials.json above, and one more that
+		# is specific to a subscription login: opencode refreshes on startup,
+		# xAI rotates the pair, and the guest's copy of the new one dies with
+		# the VM - leaving the host holding a refresh token that has already
+		# been spent. One run in a VM and the desktop needs a re-login.
+		log "  opencode authenticates through this host - no credentials in the VM"
+	elif [[ -f $OPENCODE_SHARE/auth.json ]]; then
 		mkdir -p "$stage/opencode-share"
 		cp -f "$OPENCODE_SHARE/auth.json" "$stage/opencode-share/auth.json"
 		log "  opencode credentials: $(python3 -c 'import json,sys; print(", ".join(json.load(open(sys.argv[1]))))' "$OPENCODE_SHARE/auth.json" 2>/dev/null || echo "present")"
@@ -2555,6 +2568,15 @@ launch() {
 			WANT_KERNEL="$2"
 			shift 2
 			;;
+		--api-base)
+			# Point the agent at a different endpoint that speaks the same
+			# API - a local model behind a shim, a gateway, a proxy. The
+			# relay does this for the real API; this is for everything else,
+			# and is what makes running the same task against another model a
+			# one-word change rather than a different harness.
+			API_BASE="$2"
+			shift 2
+			;;
 		--auth-relay)
 			# The guest reaches the model API through this host, holding no
 			# credentials of its own. Refresh stays where it belongs - with the
@@ -2891,8 +2913,13 @@ launch() {
 	# and be gone with the run.
 	if ((AUTH_RELAY)); then
 		AUTH_RELAY_PORT=${AUTH_RELAY_PORT:-$((9800 + RANDOM % 100))}
+		# Which credentials are being kept out of the VM depends on which agent
+		# is going to ask for them.
+		local relay_provider=claude
+		[[ $AGENT == opencode ]] && relay_provider=xai
 		if ! ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT "; then
 			setsid python3 "$SCRIPTS/auth-relay.py" --port "$AUTH_RELAY_PORT" \
+				--provider "$relay_provider" \
 				>"$RUN_DIR/auth-relay.log" 2>&1 &
 			disown 2>/dev/null || true
 			local waited=0
@@ -3029,7 +3056,22 @@ launch() {
 		echo "FIRECODE_GID=$(id -g)"
 		echo "FIRECODE_HOME='$HOME'"
 		echo "FIRECODE_PROJECT='$WORKDIR'"
-		((AUTH_RELAY)) && echo "ANTHROPIC_BASE_URL='http://localhost:$AUTH_RELAY_PORT'"
+		# An explicit endpoint wins over the relay: the relay authenticates
+		# against the real API, and pointing it at a local model would send
+		# your token somewhere it does not belong.
+		if [[ -n $API_BASE ]]; then
+			echo "ANTHROPIC_BASE_URL='$API_BASE'"
+		elif ((AUTH_RELAY)); then
+			echo "ANTHROPIC_BASE_URL='http://localhost:$AUTH_RELAY_PORT'"
+		fi
+		# opencode has no environment variable for a provider's endpoint - it
+		# reads that from its config file - so this is the port, and the guest
+		# writes the config around it at boot. It cannot come off the config
+		# drive: that drive is shared between runs and keyed by content, and
+		# the port is per run.
+		if ((AUTH_RELAY)) && [[ $AGENT == opencode && -z $API_BASE ]]; then
+			echo "FIRECODE_XAI_BASE_URL='http://localhost:$AUTH_RELAY_PORT/v1'"
+		fi
 		echo "FIRECODE_EXTRA='${extra_spec[*]-}'"
 		# Where each --disk should be mounted, in the order they were given.
 		# Not the device names: those are assigned further down, after this
@@ -3619,6 +3661,17 @@ cmd_ps() {
 		echo
 		printf '%s  %s\n' "${vmname:-$id}" "$proj"
 		printf '  %s\n' "$id"
+		# When it last said anything. An agent waiting on a model response
+		# burns no cpu and prints nothing, which looks exactly like a wedged
+		# one - and this is the number that tells them apart.
+		if [[ -f $RUNS/$id/console.log ]]; then
+			local quiet=$(($(date +%s) - $(stat -c %Y "$RUNS/$id/console.log")))
+			if ((quiet < 90)); then
+				printf '  last output %ss ago\n' "$quiet"
+			else
+				printf '  last output %sm ago - thinking, or stuck\n' "$((quiet / 60))"
+			fi
+		fi
 		printf '  %s' "$backend"
 		[[ $parent != "-" && -n $parent ]] && printf ', stops with %s' "$parent"
 		echo
@@ -3711,7 +3764,12 @@ cmd_logs() {
 	# emulates none of them, so it logs a bus error per probe. Harmless, and
 	# noise in the one place anyone looks to see what an agent is doing.
 	# --all keeps them for when the VMM itself is the thing being debugged.
-	local -a filter=(grep -av "bus_error: MissingAddressRange")
+	# --line-buffered, because with -f this filter is the only thing between
+	# a live VM and whoever is watching. grep block-buffers when its stdout is
+	# a pipe, so a reader like fctop gets one burst and then silence until
+	# another 4K of console has piled up - a log that looks frozen while the
+	# agent is working.
+	local -a filter=(grep -a --line-buffered -v "bus_error: MissingAddressRange")
 	((RAW_LOGS)) && filter=(cat)
 	if ((follow)); then
 		tail -n "$lines" -f "$newest/console.log" | "${filter[@]}"

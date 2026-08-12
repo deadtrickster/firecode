@@ -329,6 +329,50 @@ main() {
 		mkdir -p "$home/.config/opencode"
 		cp -a "$CONFIG_MNT/opencode-config/." "$home/.config/opencode/"
 	fi
+	# Authenticating through the host: point the provider at the relay and give
+	# it a placeholder key. opencode reads an endpoint only from its config
+	# file, never from the environment, so the config has to be written here -
+	# the port is per run and the config drive is shared between runs.
+	#
+	# Merged into whichever file it already uses, so the host's MCP servers and
+	# provider settings survive. JSON is valid JSONC, so writing JSON back into
+	# a .jsonc file is fine; comments in the original do not survive it.
+	if [[ -n ${FIRECODE_XAI_BASE_URL:-} ]] && command -v python3 >/dev/null 2>&1; then
+		mkdir -p "$home/.config/opencode" "$home/.local/share/opencode"
+		# An api-type entry, not oauth. Without a credential of some kind
+		# opencode never contacts the provider at all - it sends nothing and
+		# waits - and an oauth entry would have it try to refresh, which is the
+		# thing that must not happen in here. The key is a placeholder; the
+		# relay discards it and authenticates with the host's own token.
+		printf '%s\n' '{"xai":{"type":"api","key":"firecode-relay-placeholder"}}' \
+			>"$home/.local/share/opencode/auth.json"
+		chmod 600 "$home/.local/share/opencode/auth.json"
+		local occonf="$home/.config/opencode/opencode.jsonc"
+		[[ -f $occonf ]] || occonf="$home/.config/opencode/opencode.json"
+		# Both passed on the command line: the env file is sourced, so its
+		# variables are set in this shell but not exported to a child.
+		FIRECODE_OCCONF=$occonf FIRECODE_XAI_BASE_URL=$FIRECODE_XAI_BASE_URL \
+			python3 - <<-'PY' && log "opencode reaches xAI through the host - no credentials in this VM"
+				import json, os, re
+				path = os.environ["FIRECODE_OCCONF"]
+				try:
+				    text = open(path).read()
+				    # Line comments only: enough for a hand-written config, and a
+				    # failure here just means starting from an empty one.
+				    conf = json.loads(re.sub(r'(?m)^\s*//.*$', '', text) or "{}")
+				except (OSError, ValueError):
+				    conf = {}
+				xai = conf.setdefault("provider", {}).setdefault("xai", {})
+				opts = xai.setdefault("options", {})
+				opts["baseURL"] = os.environ["FIRECODE_XAI_BASE_URL"]
+				# Not a secret, and worth nothing outside this VM. opencode refuses
+				# to use a provider with no credential at all, and the relay throws
+				# away whatever arrives and authenticates with the host's own token.
+				opts["apiKey"] = "firecode-relay-placeholder"
+				with open(path, "w") as fh:
+				    json.dump(conf, fh, indent=2)
+			PY
+	fi
 	chown -R "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" \
 		"$home/.local" "$home/.config" 2>/dev/null || true
 	if [[ -f $CONFIG_MNT/claude.json ]]; then
