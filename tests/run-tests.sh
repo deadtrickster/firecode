@@ -288,6 +288,26 @@ test_results_come_back() {
 	else
 		no "the original project did not get it" "NEWFILE.txt leaked into the source tree"
 	fi
+
+	# A result is mostly the project it came from, and a full second copy of
+	# it per run is what turns a project directory into landfill. What came
+	# back unchanged should cost nothing.
+	local a b
+	a=$(stat -c %i "$project/README.md" 2>/dev/null)
+	b=$(stat -c %i "$result/README.md" 2>/dev/null)
+	if [[ -n $a && $a == "$b" ]]; then
+		ok "an unchanged file is not a second copy"
+	else
+		no "an unchanged file is not a second copy" "inodes $a vs $b"
+	fi
+	# ...but what the run actually wrote has to be its own file, or writing
+	# to the result would write to the project.
+	if [[ $(stat -c %h "$result/NEWFILE.txt" 2>/dev/null) == "1" ]]; then
+		ok "and what changed is a file of its own"
+	else
+		no "and what changed is a file of its own" \
+			"NEWFILE.txt has $(stat -c %h "$result/NEWFILE.txt" 2>/dev/null) links"
+	fi
 	rm -rf "$result"
 }
 

@@ -148,3 +148,5 @@ These are what the tests assert, and what any implementation has to hold:
 6. The host's project directory is not modified by a run that was not asked to
    write back.
 7. A restored VM does not modify the drives its checkpoint was taken from.
+8. A result directory costs what the run changed, not what the project weighs -
+   and what the run changed is a file of its own, not shared with the project.

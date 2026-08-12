@@ -767,6 +767,50 @@ require_vm_socket() {
 	die "more than one VM is running - name one with --project (running:$running)"
 }
 
+# What a run actually changed, as paths relative to the project.
+changed_files() {
+	local src=$1 out=$2
+	diff -rq --exclude=.git "$src" "$out" 2>/dev/null |
+		sed -e "s|^Files ${src}/||" -e 's| and .* differ$||' \
+			-e "s|^Only in ${out}/*|+ |" -e 's|: |/|' \
+			-e "s|^Only in ${src}/*|- |" |
+		grep -v '^$' || true
+}
+
+# A result directory is mostly the project it came from - one file changed out
+# of a hundred megabytes is the normal case - and a full copy of it beside
+# every run is what turns a project directory into landfill.
+#
+# So the files that came back identical become hardlinks to the ones already
+# on disk. The directory still looks and diffs exactly the same; it just stops
+# costing anything.
+#
+# The tradeoff is real and worth stating out loud: a hardlink is the same
+# inode, so writing to one of those files *in place* writes to the project
+# too. Editors that save by writing a temp file and renaming it - which is
+# most of them, Emacs included - break the link first and are safe. sed -i and
+# a shell append are not.
+link_unchanged() {
+	local src=$1 out=$2 rel linked=0 saved=0 sz
+	[[ -d $src && -d $out ]] || return 0
+
+	while IFS= read -r -d '' f; do
+		rel=${f#"$out"/}
+		[[ -f "$src/$rel" ]] || continue
+		# Same file on both sides, so keep one of them.
+		cmp -s "$f" "$src/$rel" || continue
+		sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+		if ln -f "$src/$rel" "$f" 2>/dev/null; then
+			linked=$((linked + 1))
+			saved=$((saved + sz))
+		fi
+	done < <(find "$out" -type f -not -path "$out/.git/*" -print0)
+
+	((linked)) || return 0
+	printf '%s of it is hardlinked to the project (%s files unchanged)\n' \
+		"$(numfmt --to=iec "$saved" 2>/dev/null || echo "$saved bytes")" "$linked"
+}
+
 # --- who owns what ------------------------------------------------------
 #
 # A run owns a VMM, a few relay processes, a tap, a jail directory and a lock.
@@ -2471,8 +2515,13 @@ EOF
 			echo
 			return $rc
 		fi
+		local saved
+		saved=$(link_unchanged "$WORKDIR" "$out_dir")
+
 		echo
 		echo "  result:  $out_dir"
+		[[ -n $saved ]] && echo "           $saved"
+		echo "  changed: $(changed_files "$WORKDIR" "$out_dir" | head -5 | tr '\n' ' ')"
 		echo "  diff:    diff -ru --exclude=.git '$WORKDIR' '$out_dir' | less"
 		[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
 		if ((STATE_PERSISTENT)); then

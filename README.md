@@ -468,7 +468,12 @@ logs stay. Layers, state and snapshots are never touched by `gc`.
 
 - Your host credentials go into the VM. That is what makes the agent able to
   work. The isolation is of the host filesystem, not of your API keys.
-- The result directory is a full copy of the project, not a patch.
+- The result directory looks like a full copy of the project, but the files
+  that came back unchanged are hardlinks to the ones already on disk, so it
+  costs what the run actually changed. Diff it, read it, delete it freely.
+  Editing one of those files *in place* edits the project, since they are the
+  same file - editors that save by rename (most, Emacs included) break the
+  link first and are safe; `sed -i` and shell appends are not.
 - Two runs at once on one project: the second gets a throwaway copy of the state
   drive and its session is not resumable. It says so at the time.
 - An OAuth refresh inside a VM rotates the token and that copy is discarded. If
