@@ -66,18 +66,28 @@ done
 printf 'OK\n'
 '''
 
-# Contents, of the file asked for and of its siblings in one go.
+# Contents, of the file asked for and - when it pays - of its siblings too.
 #
 # Siblings because of how these files are actually read: a dashboard walking
 # fifty threads' stat files wants fifty files from one directory, and asking
 # for them one at a time is fifty round trips per refresh. One call covers the
-# walk. The exclusions are the files that are enormous or block on a read.
+# walk.
+#
+# Only under a pid, though. The top of /proc holds a few hundred files, some of
+# them slow (timer_list, pagetypeinfo) and some enormous, so prefetching them
+# to answer a read of /proc/meminfo took longer than the exec timeout - and a
+# timeout falls through to the host, which answers the same question about the
+# wrong machine. One file is one file up there.
 READ = r'''
 set -u
 src=%s
 d=$(dirname "$src")
+case "$d" in
+*/[0-9]*) group="$d"/* ;;
+*) group="" ;;
+esac
 n=0
-for f in "$src" "$d"/*; do
+for f in "$src" $group; do
 	[ -f "$f" ] || continue
 	case "$f" in
 	*/kcore | */kpagecount | */kpageflags | */pagemap | */mem | */kmsg | */clear_refs) continue ;;
