@@ -508,6 +508,23 @@ test_shellcheck() {
 	else
 		ok "shellcheck not installed (skipped)"
 	fi
+	# What an agent is told, and when. The connect-time slot is small - a
+	# couple of thousand characters before a client truncates it - so the
+	# brief has to stay inside it and the real guide has to ride along with
+	# the first tool result instead.
+	local brief_size
+	brief_size=$(wc -c <"$ROOT/mcp/brief.md" 2>/dev/null || echo 99999)
+	if ((brief_size < 2000)); then
+		ok "the connect-time brief fits in the budget ($brief_size chars)"
+	else
+		no "the connect-time brief fits in the budget" "$brief_size chars, limit 2000"
+	fi
+	if [[ -s $ROOT/mcp/guide.md ]]; then
+		ok "there is a full guide to send after it"
+	else
+		no "there is a full guide to send after it"
+	fi
+
 	if python3 -m py_compile "$ROOT/mcp/firecode-spawn.py" 2>/dev/null; then
 		ok "the spawn server parses"
 	else

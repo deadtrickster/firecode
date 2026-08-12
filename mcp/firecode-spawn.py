@@ -20,6 +20,7 @@ Speaks streamable HTTP MCP on 127.0.0.1 and depends on nothing outside the
 standard library.
 """
 
+import hashlib
 import json
 import os
 import shlex
@@ -33,6 +34,35 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "firecode-spawn", "version": "1.0.0"}
+
+GUIDE_URI = "firecode://guide"
+
+
+def _load(name):
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+                  "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+# Two documents, because the client budgets them differently.
+#
+# The brief is handed over when a client connects, and that slot is small -
+# a couple of thousand characters before it is truncated or crowds out the
+# work. So it says only what changes behaviour in the first minute.
+#
+# The guide is the real thing, and it rides along with the first tool result,
+# where there is room. An agent that has called a tool has committed to using
+# this server and can afford to read how it works.
+#
+# Both are files rather than string literals: they are read by something that
+# cannot ask a follow-up question, so they have to be reviewable in a diff.
+GUIDE_RAW = _load("guide.md")
+GUIDE_REVISION = hashlib.sha256(GUIDE_RAW).hexdigest()[:12] if GUIDE_RAW else "none"
+GUIDE = GUIDE_RAW.decode("utf-8", "replace").replace("{{REVISION}}", GUIDE_REVISION)
+BRIEF = _load("brief.md").decode("utf-8", "replace").strip()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIRECODE = os.path.join(ROOT, "bin", "firecode")
@@ -512,6 +542,25 @@ class Handler(BaseHTTPRequestHandler):
         reply = self._dispatch(req)
         self._send(200, json.dumps(reply).encode())
 
+    # One per server process, and a server process is one client session, so
+    # "first call of the session" and "first of the process" are the same.
+    _guide_sent = False
+
+    def _wrap(self, text):
+        """A tool result, carrying the guide the first time and its revision
+        always.
+
+        The revision goes on every result rather than only the first, because
+        an agent whose context was compacted has lost the guide without any way
+        to notice - a revision that no longer matches the one it remembers is
+        that missing signal."""
+        blocks = [{"type": "text", "text": f"{text}\n\nguide_revision: {GUIDE_REVISION}"}]
+        cls = type(self)
+        if GUIDE and not cls._guide_sent:
+            cls._guide_sent = True
+            blocks.append({"type": "text", "text": GUIDE})
+        return blocks
+
     def _dispatch(self, req):
         rid = req.get("id")
         method = req.get("method", "")
@@ -527,9 +576,26 @@ class Handler(BaseHTTPRequestHandler):
         if method == "initialize":
             return ok({
                 "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": {"tools": {"listChanged": False},
+                                 "resources": {"listChanged": False}},
                 "serverInfo": SERVER_INFO,
+                "instructions": BRIEF,
             })
+
+        # The guide, for a client that wants it again - after a compaction, or
+        # when a result's revision stops matching the copy it is reasoning from.
+        if method == "resources/list":
+            return ok({"resources": [{
+                "uri": GUIDE_URI,
+                "name": "How to work inside firecode VMs",
+                "mimeType": "text/markdown",
+            }]})
+
+        if method == "resources/read":
+            if params.get("uri") != GUIDE_URI:
+                return err(-32602, f"no such resource: {params.get('uri')}")
+            return ok({"contents": [{"uri": GUIDE_URI, "mimeType": "text/markdown",
+                                     "text": GUIDE}]})
 
         if method == "ping":
             return ok({})
@@ -545,10 +611,9 @@ class Handler(BaseHTTPRequestHandler):
                                  caller_run=_peer_run_id(
                                      self.client_address,
                                      self.server.server_address[1]))
-                return ok({"content": [{"type": "text", "text": str(text)}]})
+                return ok({"content": self._wrap(str(text))})
             except Exception as exc:  # reported to the caller, not a crash
-                return ok({"content": [{"type": "text", "text": f"error: {exc}"}],
-                           "isError": True})
+                return ok({"content": self._wrap(f"error: {exc}"), "isError": True})
 
         return err(-32601, f"method not found: {method}")
 

@@ -247,6 +247,19 @@ main() {
 	hostname firecode 2>/dev/null || true
 	printf '127.0.0.1 localhost firecode\n::1 localhost\n' >/etc/hosts
 
+	# Tracing, where the kernel has it. The stock firecracker kernel has none
+	# of this and these mounts simply fail; the one firecode builds has
+	# ftrace, kprobes, uprobes and BTF, and having to remember to mount them
+	# is exactly the kind of ceremony that stops anyone from tracing anything.
+	if grep -q tracefs /proc/filesystems 2>/dev/null; then
+		mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+		mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true
+		# Readable by the agent, which does not run as root - it is a VM, the
+		# thing being protected from is on the other side of the kernel.
+		chmod -R a+rX /sys/kernel/tracing 2>/dev/null || true
+		log "tracing available: $(cat /sys/kernel/tracing/available_tracers 2>/dev/null)"
+	fi
+
 	setup_network
 	setup_relays
 
