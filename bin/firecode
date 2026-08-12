@@ -55,6 +55,10 @@ PARENT_RUN=""
 # milliseconds and restores a snapshot in sixty - and libvirt/qemu for the one
 # thing it cannot: there is no PCI bus in a firecracker VM, so no GPU either.
 VMM="${FIRECODE_VMM:-firecracker}"
+VECTORIZED=0
+HYBRID=0
+PCORES=""
+VPMU=0
 GPU_PCI=""
 LIBVIRT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 RESUME_TREE=auto
@@ -854,6 +858,51 @@ disk_mounts() {
 	printf '%s' "${out# }"
 }
 
+# What this machine can and cannot tell you about code that measures itself.
+#
+# Two facts decide it, and both are invisible from inside a VM - which is the
+# problem, because a benchmark that cannot see them still produces numbers.
+#
+#   hybrid cores   P-cores and E-cores have different vector throughput, so an
+#                  unpinned run is timing whichever core it happened to land
+#                  on. Two runs of identical code differ by more than most
+#                  optimisations do.
+#   the vPMU       cycles, instructions, cache misses. KVM turns it off on
+#                  hybrid parts - a vCPU can migrate between core types whose
+#                  PMUs differ - so no hypervisor here can offer it, whatever
+#                  enable_pmu says.
+cpu_topology() {
+	HYBRID=0
+	PCORES=""
+	if [[ -r /sys/devices/cpu_core/cpus ]]; then
+		PCORES=$(cat /sys/devices/cpu_core/cpus)
+		[[ -d /sys/devices/cpu_atom ]] && HYBRID=1
+	fi
+	VPMU=0
+	if [[ $(cat /sys/module/kvm/parameters/enable_pmu 2>/dev/null) == Y ]]; then
+		VPMU=1
+	fi
+	# Explicit, because a function ending in a test returns that test's
+	# result - and a false one ends the whole run under set -e, with nothing
+	# printed and nothing actually wrong. Third time in this codebase.
+	return 0
+}
+
+# Expand "0-7" or "0-3,8" into the individual cpu numbers.
+cpu_list() {
+	local spec=$1 part lo hi out=""
+	for part in ${spec//,/ }; do
+		if [[ $part == *-* ]]; then
+			lo=${part%-*}
+			hi=${part#*-}
+			for ((i = lo; i <= hi; i++)); do out="$out $i"; done
+		else
+			out="$out $part"
+		fi
+	done
+	echo "${out# }"
+}
+
 # The discrete GPU, and every function that shares its IOMMU group.
 #
 # The group is the unit a host can let go of, not the device: everything in it
@@ -915,7 +964,10 @@ spec = {"name": name, "mem_mib": int(mem), "vcpus": int(vcpu), "kernel": kernel,
         "pci": [a for a in gpu.split(",") if a],
         # A session connection runs qemu as the caller and has no security
         # driver to tell anything to.
-        "seclabel": not os.environ.get("FIRECODE_LIBVIRT_SESSION")}
+        "seclabel": not os.environ.get("FIRECODE_LIBVIRT_SESSION"),
+        # Which physical cores the vcpus are nailed to, when the run cares
+        # about how long things take.
+        "pin": [int(c) for c in os.environ.get("FIRECODE_PIN", "").split() if c]}
 if tap:
     spec["mac"] = "06:00:ac:10:%02x:02" % int(os.environ.get("NET_SLOT", "0"))
 with open(spec_path, "w") as fh:
@@ -2451,6 +2503,14 @@ launch() {
 			WANT_KERNEL="$2"
 			shift 2
 			;;
+		--vectorized)
+			# For work whose whole point is how fast it runs. Pins the VM to
+			# performance cores, sizes it to them, and says up front which of
+			# the measurements this machine can actually support - because a
+			# benchmark that silently lost its counters still prints numbers.
+			VECTORIZED=1
+			shift
+			;;
 		--vmm)
 			VMM="$2"
 			[[ $VMM == firecracker || $VMM == libvirt ]] ||
@@ -3098,6 +3158,31 @@ launch() {
 		log "disk: $host_path attached as $NEXT_DEV$([[ $disk_ro == true ]] && echo " (read-only)")"
 	done
 
+	# Decided here, before the machine is described: the vcpu count below and
+	# the command that launches the VMM both depend on it.
+	local -a pin_cpus=()
+	if ((VECTORIZED)); then
+		cpu_topology
+		if [[ -n $PCORES ]]; then
+			read -ra pin_cpus <<<"$(cpu_list "$PCORES")"
+			# More vcpus than performance cores would put some of the work on
+			# an E-core, which is the thing being avoided.
+			if ((VCPU > ${#pin_cpus[@]})); then
+				log "sizing down to ${#pin_cpus[@]} vcpu: that is how many performance cores there are"
+				VCPU=${#pin_cpus[@]}
+			fi
+			pin_cpus=("${pin_cpus[@]:0:VCPU}")
+			log "pinned to performance cores ${pin_cpus[*]}"
+		fi
+		((HYBRID)) && log "hybrid cpu: E-cores excluded, they vectorise differently"
+		if ((VPMU)); then
+			log "hardware counters available: perf stat -e cycles,instructions"
+		else
+			log "no hardware counters in a VM here - KVM disables the vPMU$( ((HYBRID)) && echo " on hybrid parts")"
+			log "  wall-clock and perf record -e cpu-clock work; IPC and cache misses need the host"
+		fi
+	fi
+
 	# pci=off is right for firecracker, whose devices are all virtio-mmio, and
 	# fatal under qemu, where every one of them is virtio-pci: the guest comes
 	# up unable to see its own root disk. Same kernel, opposite argument.
@@ -3190,6 +3275,7 @@ EOF
 	# therefore no way to hand a GPU to a VM. Everything above this line is
 	# shared, which is the whole reason a second backend is affordable.
 	if [[ $VMM == libvirt ]]; then
+		((${#pin_cpus[@]})) && export FIRECODE_PIN="${pin_cpus[*]}"
 		libvirt_boot "$drives_joined" "$boot_args" "$cid" "$RUN_DIR/console.log"
 		return $?
 	fi
@@ -3199,15 +3285,22 @@ EOF
 	# process itself - defence in depth against a VMM escape, and the only
 	# part that needs root. Without it you still get a real VM.
 	local -a cmd=()
+	# taskset rather than a config knob: firecracker has no cpu affinity
+	# setting, and the vcpu threads inherit the process's.
+	local -a pin_prefix=()
+	((${#pin_cpus[@]})) && pin_prefix=(taskset -c "$(
+		IFS=,
+		echo "${pin_cpus[*]}"
+	)")
 	if ((NOJAIL)); then
 		log "WARNING: --no-jail, the VMM runs unconfined on the host"
 		if ((restoring)); then
-			cmd=("$FC" --api-sock firecracker.socket)
+			cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket)
 		else
-			cmd=("$FC" --api-sock firecracker.socket --config-file vm-config.json)
+			cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket --config-file vm-config.json)
 		fi
 	else
-		cmd=(${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
+		cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
 	fi
 
 	if ((restoring)); then

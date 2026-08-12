@@ -72,6 +72,20 @@ ENABLE=(
 	DEBUG_INFO DEBUG_INFO_DWARF5 DEBUG_INFO_BTF DEBUG_FS
 	PERF_EVENTS STACKTRACE MAGIC_SYSRQ
 	DEBUG_KERNEL KALLSYMS KALLSYMS_ALL
+	MODULES MODULE_UNLOAD
+)
+
+# What has to be OFF for an out-of-tree module to work at all.
+#
+# TRIM_UNUSED_KSYMS drops every exported symbol that nothing built in refers
+# to. It is a sensible size win for an appliance kernel and fatal here: a GPU
+# driver is out of tree by definition, so the symbols it needs are exactly the
+# ones nothing in tree uses, and they are gone before it ever gets to compile.
+# The failure arrives as "unknown symbol" at load time, long after the build
+# looked like it worked.
+DISABLE=(
+	TRIM_UNUSED_KSYMS
+	MODULE_SIG_FORCE
 )
 
 mkdir -p "$IMAGES"
@@ -91,6 +105,7 @@ docker run --rm \
 	-e VERSION="$VERSION" -e MAJOR="$MAJOR" \
 	-e OUT_NAME="$(basename "$OUT")" \
 	-e ENABLE="${ENABLE[*]}" \
+	-e DISABLE="${DISABLE[*]}" \
 	-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
 	"$BUILDER" bash -euo pipefail -c '
 	cd /tmp
@@ -103,6 +118,9 @@ docker run --rm \
 	for opt in $ENABLE; do
 		./scripts/config --enable "$opt"
 	done
+	for opt in $DISABLE; do
+		./scripts/config --disable "$opt"
+	done
 	# Asked for, but not at the price of a kernel that cannot boot: anything
 	# these options need gets pulled in, and anything unavailable is dropped,
 	# by the kernel own dependency resolver rather than by this script.
@@ -113,9 +131,24 @@ docker run --rm \
 		grep -q "^CONFIG_$opt=y" .config || missing="$missing $opt"
 	done
 	[ -z "$missing" ] || { echo "[kernel] refused to enable:$missing" >&2; exit 1; }
+	# And the one that has to be absent rather than present.
+	if grep -q "^CONFIG_TRIM_UNUSED_KSYMS=y" .config; then
+		echo "[kernel] TRIM_UNUSED_KSYMS survived: out-of-tree modules will not load" >&2
+		exit 1
+	fi
 
 	echo "[kernel] compiling with $(nproc) jobs (this is the slow part)"
 	make -j"$(nproc)" vmlinux
+
+	# Module.symvers, which is what an out-of-tree module is linked against.
+	# It falls out of `make modules` and not out of `make vmlinux`, so a build
+	# that only wanted a kernel never produces it - and a module built without
+	# it compiles cleanly, warns once about "Symbol version dump is missing",
+	# and then cannot resolve a single kernel symbol at load time.
+	#
+	# Nothing here is configured as a module, so this is quick; it is modpost
+	# over the built-in objects that matters.
+	make -j"$(nproc)" modules
 
 	# perf, from the same tree.
 	#
@@ -132,6 +165,7 @@ docker run --rm \
 	if make -C tools/perf -j"$(nproc)" \
 		NO_LIBTRACEEVENT=1 NO_LIBELF=0 NO_JVMTI=1 NO_LIBBPF=1 \
 		NO_LIBPYTHON=1 NO_LIBPERL=1 NO_SLANG=1 NO_LIBCAP=1 \
+		NO_JEVENTS=1 \
 		LDFLAGS=-static >/tmp/perf-build.log 2>&1; then
 		cp tools/perf/perf "/out/perf-$VERSION"
 		chown "$HOST_UID:$HOST_GID" "/out/perf-$VERSION"
@@ -144,6 +178,16 @@ docker run --rm \
 	# DWARF was needed to generate BTF and is dead weight afterwards - it is
 	# a third of a gigabyte that firecracker would parse and never load.
 	# .BTF survives strip --strip-debug because the kernel actually maps it.
+	# The tree an out-of-tree module is built against. No distribution ships
+	# headers for a kernel built here, so a guest that wants to compile a
+	# driver has nothing to compile against unless it comes from this build.
+	# Object files are dropped; the built host tools under scripts/ are not,
+	# because a module build runs them.
+	echo "[kernel] packing the build tree for module builds"
+	tar --exclude="*.o" --exclude="*.cmd" --exclude=".tmp_*" --exclude="*.ko" \
+		-C /tmp -cJf "/out/kernel-build-$VERSION.tar.xz" "linux-$VERSION"
+	chown "$HOST_UID:$HOST_GID" "/out/kernel-build-$VERSION.tar.xz"
+
 	strip --strip-debug vmlinux -o "/out/$OUT_NAME.tmp"
 	chown "$HOST_UID:$HOST_GID" "/out/$OUT_NAME.tmp"
 	mv -f "/out/$OUT_NAME.tmp" "/out/$OUT_NAME"

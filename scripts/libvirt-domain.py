@@ -43,6 +43,18 @@ def build(spec):
     ET.SubElement(dom, "memory", unit="MiB").text = str(spec["mem_mib"])
     ET.SubElement(dom, "vcpu").text = str(spec["vcpus"])
 
+    # Pinned vCPUs, when asked for.
+    #
+    # A vector kernel's timing is only meaningful if it ran on the same core
+    # each time. Unpinned, the scheduler moves a vCPU between physical cores
+    # mid-measurement - across cache boundaries, and on a hybrid part between
+    # cores with different vector throughput entirely - and two runs of
+    # identical code differ by more than the change being measured.
+    if spec.get("pin"):
+        tune = ET.SubElement(dom, "cputune")
+        for vcpu, cpu in enumerate(spec["pin"]):
+            ET.SubElement(tune, "vcpupin", vcpu=str(vcpu), cpuset=str(cpu))
+
     # Boot the kernel directly, exactly as firecracker does - same image, same
     # initramfs, same command line. A bootloader would mean a different root
     # assembly path, and then the two backends would be running different
@@ -56,6 +68,17 @@ def build(spec):
     features = ET.SubElement(dom, "features")
     ET.SubElement(features, "acpi")
     ET.SubElement(features, "apic")
+    # A virtual PMU, which is the whole point of this backend for anyone
+    # measuring code rather than just running it: cycles, instructions, cache
+    # misses, branch mispredicts. firecracker masks CPUID leaf 0xA outright and
+    # cannot be asked for them at all.
+    #
+    # It also needs the host to allow it - kvm's enable_pmu is a load-time
+    # parameter and ships off on some distributions - and that is invisible
+    # from in here: the guest simply comes up with no cpu PMU and perf reports
+    # <not supported> for every hardware event.
+    if spec.get("pmu", True):
+        ET.SubElement(features, "pmu", state="on")
 
     # host-passthrough so the guest sees the real CPU. firecracker masks a
     # great deal by default - which is why perf finds no PMU there - and the
