@@ -27,19 +27,30 @@ def main(argv):
     uds, port, cwd = argv[0], int(argv[1]), argv[2]
     command = " ".join(argv[3:])
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(15)
-    sock.connect(uds)
-    sock.sendall(b"CONNECT %d\n" % port)
-    reply = b""
-    while not reply.endswith(b"\n"):
-        chunk = sock.recv(1)
-        if not chunk:
-            raise SystemExit("the guest closed the connection during the handshake")
-        reply += chunk
-    if not reply.startswith(b"OK"):
-        raise SystemExit(f"guest refused the connection: {reply!r}")
-    sock.settimeout(None)
+    # Two ways to reach the same guest listener, because the two hypervisors
+    # expose vsock differently. firecracker multiplexes it over a unix socket
+    # and wants "CONNECT <port>" first; qemu gives the host a real AF_VSOCK
+    # socket and the guest is addressed by cid. The guest side is identical
+    # either way, which is what makes one guest image serve both.
+    if uds.startswith("cid:"):
+        sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        sock.connect((int(uds[4:]), port))
+        sock.settimeout(None)
+    else:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        sock.connect(uds)
+        sock.sendall(b"CONNECT %d\n" % port)
+        reply = b""
+        while not reply.endswith(b"\n"):
+            chunk = sock.recv(1)
+            if not chunk:
+                raise SystemExit("the guest closed the connection during the handshake")
+            reply += chunk
+        if not reply.startswith(b"OK"):
+            raise SystemExit(f"guest refused the connection: {reply!r}")
+        sock.settimeout(None)
 
     # base64, because a command is not a line: sent raw, anything containing a
     # newline was cut at the first one and the remainder ran anyway.

@@ -51,6 +51,12 @@ SYNC_BACK=1
 FAST=0
 REFRESH=0
 PARENT_RUN=""
+# Which hypervisor. firecracker for everything it can do - it starts in
+# milliseconds and restores a snapshot in sixty - and libvirt/qemu for the one
+# thing it cannot: there is no PCI bus in a firecracker VM, so no GPU either.
+VMM="${FIRECODE_VMM:-firecracker}"
+GPU_PCI=""
+LIBVIRT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
@@ -729,15 +735,47 @@ session_name() {
 # The socket of a running VM, for a given project or for the only one there
 # is. A socket file outlives the VM that made it, so only one with something
 # listening counts.
+# Is anything listening on that address. Two kinds, because the two backends
+# expose the same guest ports differently.
+vm_reachable() {
+	local addr=$1
+	if [[ $addr == cid:* ]]; then
+		python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect((int(sys.argv[1]), int(sys.argv[2])))
+except OSError:
+    sys.exit(1)
+' "${addr#cid:}" "$EXEC_PORT" 2>/dev/null
+		return $?
+	fi
+	[[ -S $addr ]] || return 1
+	socat -u /dev/null "UNIX-CONNECT:$addr" 2>/dev/null
+}
+
 live_vm_socket() {
 	local want=${1:-}
 	local -a socks=() names=()
 	local r sock proj
 	for r in "$RUNS"/*/; do
 		[[ -f $r/jail ]] || continue
-		sock="$(cat "$r/jail")/firecracker-vsock.sock"
-		[[ -S $sock ]] || continue
-		socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null || continue
+		# Where this VM's channels are. A unix socket under firecracker, a
+		# vsock cid under libvirt - the guest listens on the same ports either
+		# way, so everything downstream of this line is identical.
+		if [[ -f $r/vsock ]]; then
+			sock=$(cat "$r/vsock")
+		else
+			sock="$(cat "$r/jail")/firecracker-vsock.sock"
+		fi
+		# Ask whoever owns the VM, not the address: a finished run's recorded
+		# cid answers as soon as a later VM is given the same one.
+		if [[ -f $r/domain ]]; then
+			libvirt_alive "$(cat "$r/domain")" "$(cat "$r/libvirt-uri" 2>/dev/null)" || continue
+		else
+			vm_reachable "$sock" || continue
+		fi
 		proj=$(cat "$r/project" 2>/dev/null || echo "")
 		[[ -n $want && $proj != "$want" ]] && continue
 		# Appended together, always: the two are read by index below, and a
@@ -751,6 +789,14 @@ live_vm_socket() {
 	# question, and a die here would end the process mid-question.
 	if ((${#socks[@]} == 1)); then
 		echo "${socks[0]}"
+		return 0
+	fi
+	# Several runs, all for the project that was asked for. That is not
+	# ambiguity worth refusing over - it is one project with old run
+	# directories behind it - so the newest wins. Refusing here is what left
+	# `up` polling for its own VM, which was running the whole time.
+	if [[ -n $want ]] && ((${#socks[@]} > 1)); then
+		echo "${socks[-1]}"
 		return 0
 	fi
 	# Several are up and none was named, so the directory you are standing in
@@ -808,6 +854,124 @@ disk_mounts() {
 	printf '%s' "${out# }"
 }
 
+# The discrete GPU, and every function that shares its IOMMU group.
+#
+# The group is the unit a host can let go of, not the device: everything in it
+# is passed through together or none of it is. A card whose group holds a bus
+# controller cannot be given to a VM without giving away that too, and that is
+# the usual reason passthrough is not possible on a given machine.
+gpu_auto() {
+	local addr group members=""
+	addr=$(lspci -D 2>/dev/null | grep -iE "vga|3d controller" |
+		grep -vi "intel" | head -1 | cut -d' ' -f1)
+	[[ -n $addr ]] || return 0
+	group=$(readlink -f "/sys/bus/pci/devices/$addr/iommu_group" 2>/dev/null)
+	if [[ -n $group ]]; then
+		local d
+		for d in "$group"/devices/*; do
+			members="$members,$(basename "$d")"
+		done
+		members=${members#,}
+	fi
+	echo "${members:-$addr}"
+}
+
+# Boot the same guest under libvirt.
+#
+# The drive list is firecracker's, translated: same files, same order, because
+# the guest finds several of them by position. The channels are the same ports
+# on the same vsock, reached as AF_VSOCK here rather than through a unix
+# socket - the guest cannot tell the difference and does not have to.
+libvirt_boot() {
+	# The drive list is read back from vm-config.json rather than passed in:
+	# one place decides what a VM has and in what order, and both backends
+	# read that same decision.
+	local cmdline=$2 cid=$3 console=$4
+	command -v virsh >/dev/null 2>&1 || die "libvirt is not installed - no virsh"
+
+	local spec="$RUN_DIR/domain.json" xml="$RUN_DIR/domain.xml"
+	local name="firecode-${RUN_ID#firecode-}"
+	# Read by the spec writer below, so it has to be set before it runs.
+	[[ $LIBVIRT_URI == *session* ]] && export FIRECODE_LIBVIRT_SESSION=1
+
+	# The drive list, rebuilt from the same JSON firecracker was given, so
+	# there is exactly one place that decides what a VM has and in what order.
+	python3 - "$spec" "$name" "$MEM" "$VCPU" "$KERNEL" "$INITRD" "$cmdline" \
+		"$cid" "$console" "$JAIL_DIR" "${TAP_DEV:-}" "${GPU_PCI:-}" <<'PY'
+import json, os, sys
+spec_path, name, mem, vcpu, kernel, initrd, cmdline, cid, console, jail, tap, gpu = sys.argv[1:13]
+drives = []
+with open(os.path.join(jail, "vm-config.json")) as fh:
+    cfg = json.load(fh)
+for d in cfg["drives"]:
+    p = d["path_on_host"]
+    if not os.path.isabs(p):
+        p = os.path.join(jail, p)
+    drives.append({"path": p, "readonly": bool(d.get("is_read_only")),
+                   "block": os.path.exists(p) and os.stat(p).st_mode & 0o170000 == 0o060000})
+spec = {"name": name, "mem_mib": int(mem), "vcpus": int(vcpu), "kernel": kernel,
+        "initrd": initrd, "cmdline": cmdline, "cid": int(cid), "console_log": console,
+        "drives": drives, "tap": tap or None,
+        "pci": [a for a in gpu.split(",") if a],
+        # A session connection runs qemu as the caller and has no security
+        # driver to tell anything to.
+        "seclabel": not os.environ.get("FIRECODE_LIBVIRT_SESSION")}
+if tap:
+    spec["mac"] = "06:00:ac:10:%02x:02" % int(os.environ.get("NET_SLOT", "0"))
+with open(spec_path, "w") as fh:
+    json.dump(spec, fh, indent=2)
+PY
+
+	python3 "$SCRIPTS/libvirt-domain.py" "$spec" >"$xml" || die "could not build the domain"
+	[[ -n ${GPU_PCI:-} ]] && log "passing through $GPU_PCI - the host must have released it"
+
+	# qemu runs as root under qemu:///system and would create this 0600
+	# root-owned, leaving the console unreadable by the person who asked for
+	# the VM - which is the only place a boot failure is explained.
+	: >"$console"
+	chmod 0666 "$console" 2>/dev/null || true
+
+	log "starting under libvirt ($VCPU vcpu, ${MEM}M)"
+	# Transient: defined only while it runs, so a killed firecode leaves no
+	# domain behind to be started again later by something that has forgotten
+	# what it was for.
+	virsh -c "$LIBVIRT_URI" create "$xml" >/dev/null ||
+		die "libvirt refused the domain - see $xml"
+	printf '%s\n' "$name" >"$RUN_DIR/domain"
+	printf '%s\n' "$LIBVIRT_URI" >"$RUN_DIR/libvirt-uri"
+
+	local rc=0
+	# The VM outlives this call the way firecracker's does; the caller waits
+	# on the guest answering, not on the VMM starting.
+	while virsh -c "$LIBVIRT_URI" domstate "$name" 2>/dev/null | grep -q running; do
+		sleep 1
+	done
+	log "the domain stopped"
+	return $rc
+}
+
+# Is that domain running, asked of libvirt rather than of the guest.
+#
+# Probing the address cannot answer it. A cid identifies a VM only while that
+# VM exists, and a run directory outlives its VM - so four finished runs that
+# each recorded cid:3 all "answer" as soon as some later VM takes cid 3 again,
+# and a lookup that wanted exactly one match finds four and refuses. Which is
+# what made `up` wait forever with its VM already running.
+libvirt_alive() {
+	local name=$1 uri=${2:-$LIBVIRT_URI}
+	[[ -n $name ]] || return 1
+	# The connection is half the domain's identity: the same name under
+	# qemu:///session and qemu:///system are different domains, and asking the
+	# wrong one reports a running VM as gone.
+	virsh -c "$uri" domstate "$name" 2>/dev/null | grep -q running
+}
+
+libvirt_down() {
+	local name=$1 uri=${2:-$LIBVIRT_URI}
+	[[ -n $name ]] || return 0
+	virsh -c "$uri" destroy "$name" >/dev/null 2>&1 || true
+}
+
 # What a running VM is, in facts rather than in some tool's vocabulary.
 #
 # Anything that wants to look at a process inside a VM needs the same three
@@ -847,9 +1011,12 @@ cmd_info() {
 	ip=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
 		"ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null |
 		tr -cd '0-9.')
+	# Matched on the address, not the jail directory: a libvirt VM is reached
+	# by cid, and dirname of "cid:3" is not anything.
 	local r
 	for r in "$RUNS"/*/; do
-		[[ -f $r/jail && $(cat "$r/jail") == "$jail" ]] || continue
+		[[ -f $r/vsock && $(cat "$r/vsock") == "$sock" ]] ||
+			{ [[ -f $r/jail && $(cat "$r/jail") == "$jail" ]] || continue; }
 		run=$(basename "${r%/}")
 		project=$(cat "$r/project" 2>/dev/null)
 		break
@@ -2227,6 +2394,11 @@ cleanup_run() {
 	# for whatever ignores the request.
 	if [[ -n $RUN_ID ]]; then stop_children "$RUN_ID" || true; fi
 	if [[ -n $VM_PID ]]; then kill "$VM_PID" 2>/dev/null || true; fi
+	# A libvirt domain is not a child of this process, so nothing above
+	# reaches it.
+	if [[ -n $RUN_DIR && -f $RUN_DIR/domain ]]; then
+		libvirt_down "$(cat "$RUN_DIR/domain")" "$(cat "$RUN_DIR/libvirt-uri" 2>/dev/null)" || true
+	fi
 	# And everything this run owns, including any VM started on its behalf.
 	# Killing the pid above only ever reached the VMM this process started;
 	# a child VM belongs to a different firecode and would have survived.
@@ -2277,6 +2449,21 @@ launch() {
 		--kernel)
 			# "debug" for the traceable one, or a path to any vmlinux.
 			WANT_KERNEL="$2"
+			shift 2
+			;;
+		--vmm)
+			VMM="$2"
+			[[ $VMM == firecracker || $VMM == libvirt ]] ||
+				die "--vmm takes firecracker or libvirt"
+			shift 2
+			;;
+		--gpu)
+			# A PCI address, or "auto" for the discrete card. Implies libvirt:
+			# firecracker has no PCI bus to put it on.
+			GPU_PCI="$2"
+			[[ $GPU_PCI == auto ]] && GPU_PCI=$(gpu_auto)
+			[[ -n $GPU_PCI ]] || die "--gpu auto found no discrete GPU"
+			VMM=libvirt
 			shift 2
 			;;
 		--refresh)
@@ -2505,6 +2692,12 @@ launch() {
 	# apart by something other than "the only one".
 	printf '%s\n' "$WORKDIR" >"$RUN_DIR/project"
 	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
+	# How to reach this VM's channels, whichever backend started it.
+	if [[ $VMM == libvirt ]]; then
+		printf 'cid:%s\n' "$((3 + ${NET_SLOT:-0}))" >"$RUN_DIR/vsock"
+	else
+		printf '%s\n' "$JAIL_DIR/firecracker-vsock.sock" >"$RUN_DIR/vsock"
+	fi
 
 	# The cgroup this run owns. Nested inside the parent's when this VM was
 	# asked for by another one, which is what makes the parent's teardown
@@ -2905,7 +3098,11 @@ launch() {
 		log "disk: $host_path attached as $NEXT_DEV$([[ $disk_ro == true ]] && echo " (read-only)")"
 	done
 
-	local boot_args="console=ttyS0 reboot=k panic=1 pci=off"
+	# pci=off is right for firecracker, whose devices are all virtio-mmio, and
+	# fatal under qemu, where every one of them is virtio-pci: the guest comes
+	# up unable to see its own root disk. Same kernel, opposite argument.
+	local boot_args="console=ttyS0 reboot=k panic=1"
+	[[ $VMM == firecracker ]] && boot_args="$boot_args pci=off"
 	boot_args="$boot_args firecode.lower=$dev_lower firecode.upper=$dev_upper"
 	((QUIET_BOOT)) && boot_args="$boot_args quiet loglevel=3 systemd.show_status=false"
 
@@ -2986,6 +3183,15 @@ EOF
 		jargs+=(-- --api-sock /firecracker.socket)
 	else
 		jargs+=(-- --api-sock /firecracker.socket --config-file /vm-config.json)
+	fi
+
+	# The other backend. Same guest, same drives, same channels - only the
+	# thing that boots them differs, because firecracker has no PCI bus and
+	# therefore no way to hand a GPU to a VM. Everything above this line is
+	# shared, which is the whole reason a second backend is affordable.
+	if [[ $VMM == libvirt ]]; then
+		libvirt_boot "$drives_joined" "$boot_args" "$cid" "$RUN_DIR/console.log"
+		return $?
 	fi
 
 	# The VM boundary is Firecracker and KVM either way. The jailer adds a
@@ -3171,7 +3377,12 @@ live_runs() {
 		proj=$(cat "$d/project" 2>/dev/null || echo "?")
 		parent=$(cat "$d/parent" 2>/dev/null || echo "-")
 		cg=$(cat "$d/cgroup" 2>/dev/null || echo "")
-		if [[ -n $cg ]]; then
+		# A libvirt domain is not in our cgroup - libvirt places qemu in its
+		# own machine slice - so the cgroup says nothing about whether it is
+		# alive. Ask the VM instead, which works for either backend.
+		if [[ -f $d/domain ]]; then
+			libvirt_alive "$(cat "$d/domain")" "$(cat "$d/libvirt-uri" 2>/dev/null)" || continue
+		elif [[ -n $cg ]]; then
 			cg_alive "$cg/vm" || continue
 		else
 			# No cgroup for this run, so fall back to asking the VM itself.
@@ -3426,7 +3637,7 @@ doctor)
 	;;
 list | ls)
 	shift
-	cmd_list
+	cmd_list "$@"
 	;;
 extract)
 	shift
