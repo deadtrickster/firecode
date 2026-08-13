@@ -2957,6 +2957,20 @@ launch() {
 		mode=interactive
 	fi
 
+	# An unattended agent with no route to a model is a VM that boots, sits
+	# there, and tells you nothing. --no-net removes the internet, which is a
+	# perfectly good thing to want, but the agent still has to reach a model
+	# from somewhere - the relay and --api-base both arrive over vsock and so
+	# survive --no-net. Without one of them there is nothing to wait for, and
+	# waiting is exactly what it looks like from outside.
+	if ((NONET)) && [[ $mode == auto ]] && [[ $AGENT == claude || $AGENT == opencode ]] &&
+		((AUTH_RELAY == 0)) && [[ -z $API_BASE ]]; then
+		die "--no-net leaves this agent with no way to reach a model, so the run
+       would boot and hang with nothing to show for it.
+       Add --auth-relay (the model API through this host, no credentials in
+       the VM), or --api-base URL for a local one, or drop --no-net."
+	fi
+
 	# Continuing a conversation but starting from the pristine host tree would
 	# be nonsense: the agent would be told it already made changes that are
 	# not there. So --continue/--resume carries the working tree forward too.

@@ -125,7 +125,8 @@ class Runs:
     def active(self):
         return [r for r in self.runs.values() if r["state"] == "running"]
 
-    def spawn(self, project, task, timeout=None, resume=None, parent_run=None):
+    def spawn(self, project, task, timeout=None, resume=None, parent_run=None,
+              verify=None, agent=None, model=None):
         with self.lock:
             if project not in self.cfg.projects:
                 raise ValueError(
@@ -145,22 +146,53 @@ class Runs:
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, run_id + ".log")
 
-            cmd = [FIRECODE, self.cfg.agent,
+            # Which agent, and through it which provider. opencode speaks
+            # several, so the choice is a per-call one: the same task can go to
+            # the subscription model, to grok, or to something local, and
+            # comparing them is the point of being able to say.
+            which = (agent or self.cfg.agent).strip()
+            if which not in ("claude", "opencode"):
+                raise ValueError(f"unknown agent {which!r} - claude or opencode")
+
+            cmd = [FIRECODE, which,
                    "--workdir", workdir,
                    "--timeout", str(int(timeout or self.cfg.default_timeout)),
+                   # Credentials stay on this machine whichever agent runs.
+                   # For a subscription login it is not a preference: a copy
+                   # inside a VM refreshes, rotates, and leaves the host
+                   # holding a token that has already been spent.
+                   "--auth-relay",
                    "--no-mcp"]
             # Tied to whoever asked, so it cannot outlive them unnoticed.
             if parent_run:
                 cmd += ["--parent-run", parent_run]
+            # The gate, if the caller set one: run by the harness after the
+            # agent exits, and its status becomes the run's. Without it the
+            # only report on a run is the report of the thing being reported
+            # on.
+            if verify:
+                cmd += ["--verify", verify]
             for port in self.cfg.host_ports:
                 cmd += ["--host-port", str(port)]
             cmd += self.cfg.extra_args
-            cmd += ["--", "-p", task, "--dangerously-skip-permissions",
-                    # No MCP of any kind in the child, so it cannot reach this
-                    # server and start VMs of its own.
-                    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
-            if resume:
-                cmd += ["--resume", resume]
+            if which == "opencode":
+                # opencode's own shape: a subcommand and provider/model, and
+                # no claude flags at all. Its model must be given or it picks
+                # from the provider's list - which is how a run once went to a
+                # video generation model and died in eleven seconds.
+                cmd += ["--", "run"]
+                if model:
+                    cmd += ["-m", model]
+                cmd += [task]
+            else:
+                cmd += ["--", "-p", task, "--dangerously-skip-permissions",
+                        # No MCP of any kind in the child, so it cannot reach
+                        # this server and start VMs of its own.
+                        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+                if model:
+                    cmd += ["--model", model]
+                if resume:
+                    cmd += ["--resume", resume]
 
             log = open(log_path, "wb")
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
@@ -276,7 +308,14 @@ def build_tools(cfg):
                 "Run one command in a project's running VM and return its "
                 "output and exit status. The exit status is the command's own, "
                 "so a failing test suite and one that could not start are "
-                "distinguishable."),
+                "distinguishable.\n\n"
+                "This blocks until the command finishes, and your client will "
+                "give up on the call long before the VM does - a slow command "
+                "here comes back to you as a transport timeout while it keeps "
+                "running inside, which reads like a hang and is not one. For "
+                "anything that may take minutes: vm_serve to start it and "
+                "vm_logs to read it, or spawn if what you want is an agent "
+                "doing the work rather than a command."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -411,6 +450,28 @@ def build_tools(cfg):
             },
         },
         {
+            "name": "vm_say",
+            "description": (
+                "Say something to a run that is already going - a correction, "
+                "a constraint you forgot, a fact it is missing. It arrives as "
+                "another user turn at the end of whatever the agent is doing "
+                "now, and appears in the run's own log next to what it did "
+                "with it.\n\n"
+                "Use it sparingly and concretely. Every message is a turn the "
+                "run spends reading you instead of working, and 'keep going' "
+                "costs the same as a fact. Name the thing: which function does "
+                "not exist, which file it has rewritten three times, which "
+                "command to run."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "message": {"type": "string"},
+                },
+                "required": ["project", "message"],
+            },
+        },
+        {
             "name": "vm_stop",
             "description": "Stop something started by vm_serve. The VM keeps running.",
             "inputSchema": {
@@ -451,6 +512,37 @@ def build_tools(cfg):
                                 "description": "Seconds before it is stopped."},
                     "resume": {"type": "string",
                                "description": "Session id to continue."},
+                    "agent": {
+                        "type": "string",
+                        "enum": ["claude", "opencode"],
+                        "description": (
+                            "Which agent runs the task. Defaults to this "
+                            "server's configured one. opencode is the way to "
+                            "reach another provider - grok, a local model - "
+                            "so use it when the point is to compare, or when "
+                            "the task suits a different model."),
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Model for that agent. For opencode it is "
+                            "provider/model, e.g. 'xai/grok-build-0.1', and "
+                            "giving one matters: with no model it picks from "
+                            "the provider's list and may choose something "
+                            "that cannot write code at all."),
+                    },
+                    "verify": {
+                        "type": "string",
+                        "description": (
+                            "A command that decides whether the work counts - "
+                            "'./run-tests.sh', 'cargo test', 'make "
+                            "installcheck'. Run by the harness inside the VM "
+                            "after the agent exits, in the project as it will "
+                            "be handed back, and its exit status becomes the "
+                            "run's. Say in `task` that you are running it, so "
+                            "the agent can aim at it. Without this you are "
+                            "taking the agent's word for its own work."),
+                    },
                 },
                 "required": ["project", "task"],
             },
@@ -663,6 +755,15 @@ def call_tool(cfg, runs, name, args, caller_run=None):
             return explain(f"Resetting {args['project']}", out, rc)
         return f"{args['project']} is back at its checkpoint."
 
+    if name == "vm_say":
+        path = _project_path(cfg, args["project"])
+        rc, out = _firecode(["say", "--project", path, args["message"]], timeout=120)
+        if rc != 0:
+            return explain(f"Saying something to {args['project']}", out, rc)
+        return (f"Said it. {args['project']} takes it at the end of its "
+                f"current turn; vm_watch until it has, and read what it did "
+                f"rather than assuming it complied.")
+
     if name == "vm_watch":
         path = _project_path(cfg, args["project"])
         # Capped, because this holds a request open: a caller that asks for an
@@ -774,10 +875,19 @@ def call_tool(cfg, runs, name, args, caller_run=None):
     if name == "spawn":
         run_id = runs.spawn(args["project"], args["task"],
                             args.get("timeout"), args.get("resume"),
-                            parent_run=caller_run)
+                            parent_run=caller_run, verify=args.get("verify"),
+                            agent=args.get("agent"), model=args.get("model"))
+        gate = args.get("verify")
         return (f"started {run_id} on {args['project']}. "
                 f"It runs unattended and shuts down when done. "
-                f"Check with status({run_id}).")
+                f"Check with status({run_id}).\n"
+                + (f"Its work is judged by `{gate}`, which this harness runs "
+                   f"after the agent exits - so status() tells you whether the "
+                   f"work passed, not whether the agent thought so."
+                   if gate else
+                   "No verify command was given, so the only report on this run "
+                   "will be the agent's own. If there is any way to check the "
+                   "work by running it, pass it as `verify` next time."))
 
     if name == "status":
         if args.get("run_id"):

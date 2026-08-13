@@ -22,7 +22,14 @@
     18080
   ],
   "agent": "claude",
-  "extra_args": [],
+  "_extra_args_note": [
+    "Flags added to every spawned run. --no-net is worth having: the model is",
+    "reached through the host over vsock, which needs no network, so the VM",
+    "gets neither internet nor credentials and can still do the work. Give it",
+    "enough memory - an agent is a node process, and 1024 is where it dies of",
+    "memory rather than of anything you wanted to learn."
+  ],
+  "extra_args": ["--mem", "4096", "--no-net"],
   "datasets": {
     "tpcc": {
       "path": "/dev/vg/tpcc-snap",

@@ -59,6 +59,114 @@ for work you do not need to watch. A spawned agent cannot spawn further VMs.
 
 Do not infer success from output text when a number is right there.
 
+## Recipes
+
+Whole jobs, start to finish. Copy the shape, not the words.
+
+### Hand off a build and know whether it worked
+
+The point is `verify`. Without it the only report on the run is the report of
+the thing being reported on, and agents overstate - two runs here shipped work
+that could not be loaded at all and called it a success.
+
+```
+spawn   project=lab
+        task="Write X. Provide an executable ./run-tests.sh at the project
+              root that starts a fresh interpreter, loads the system from the
+              delivered files, exercises <the behaviour that matters>, and
+              exits 0 only if it actually happened. I run that script after
+              you exit - it decides whether this counts."
+        verify="./run-tests.sh"
+        timeout=10800
+status  run_id=...        → passed/failed by the script, not by the agent
+output  run_id=...        → what it said, and .firecode-verify.log has the proof
+```
+
+Name the gate in `task` as well as in `verify`. An agent that knows the
+command can aim at it; one that does not finds out after it has stopped.
+
+### Watch a long run without polling
+
+```
+vm_watch  project=lab  quiet_for=480  timeout=900
+```
+
+Returns when the VM exits, when it has printed nothing for eight minutes, or
+after fifteen. Do not wrap this in a loop of your own - one call is one look,
+and a sleep-and-check loop is slower news for more calls.
+
+### Interject when it is stuck
+
+Watch, read, then say one specific thing:
+
+```
+vm_watch  project=lab  quiet_for=300
+vm_say    project=lab  message="sb-bsd-sockets has no make-sockaddr-inet.
+                                Check what exists with apropos, then make
+                                ./run-tests.sh pass - that is what decides
+                                this run."
+vm_watch  project=lab  until="run-tests.sh"
+```
+
+Then read what it did. A message is not compliance: note when it ignored you,
+because that is the useful observation.
+
+### Run something slow
+
+`vm_in` blocks, and your client gives up on the call long before the VM does.
+A build or a suite that runs for minutes returns to you as a transport
+timeout while it carries on running inside - which reads like a hang and is
+not one. Do not retry it; you will start a second copy.
+
+```
+vm_serve project=lab  name=build  command="cargo build --release"
+vm_logs  project=lab  name=build  lines=40
+vm_ps    project=lab                      → whether it is still going
+```
+
+And when the slow thing is an agent rather than a command, that is what
+`spawn` is: it returns a run id immediately and `status` collects it.
+
+### Run a service and reach it from outside
+
+```
+vm_up    project=lab
+vm_serve project=lab  name=api  command="./target/release/api --port 8080"
+vm_ps    project=lab                  → listening on 0.0.0.0:8080, VM at 172.16.1.2
+vm_logs  project=lab  name=api  lines=50
+```
+
+Tell the human `http://172.16.1.2:8080`, never `localhost` - for them that is
+a different machine.
+
+### Reproduce a finding against a known state
+
+```
+vm_up         project=lab
+vm_in         project=lab  command="./seed-fixture.sh"     # expensive, once
+vm_checkpoint project=lab                                   # freeze it here
+vm_in         project=lab  command="./repro.sh"            → fails, as reported
+vm_reset      project=lab                                   # back in ~60ms
+vm_in         project=lab  command="./repro.sh --with-fix" → and again, clean
+```
+
+Every attempt starts from the same state, so a difference between two runs is
+the change and not the leftovers.
+
+### Several projects at once
+
+```
+vm_list                    → which VMs exist, and which of them are yours
+spawn project=alpha task=... verify="make test"
+spawn project=beta  task=... verify="make test"
+vm_watch project=alpha timeout=900
+vm_watch project=beta  timeout=900
+```
+
+Stopping a VM that belongs to another run is allowed - you may be
+orchestrating across projects - but it is somebody's work in progress. Read
+`vm_ps` first and say what you stopped.
+
 ## Checkpoints: the thing worth learning
 
 A VM's whole state - memory, processes, filesystem - can be frozen and restored

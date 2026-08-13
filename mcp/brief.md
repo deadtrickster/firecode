@@ -3,13 +3,13 @@ kernel, its own root - so what happens in one cannot reach the machine you are
 running on. Inside, you are root and nothing is restricted.
 
 **The full guide arrives with your first tool result** - how VMs are addressed,
-what survives what, and how to trace a process inside one. Read it before
-concluding anything about a run.
+what survives what, and recipes for whole jobs: handing off a build, watching
+it, interjecting, reproducing a finding. Read it before concluding anything.
 
 Until then:
 
-- **Projects are names, not paths.** `list_projects` says which exist. A path
-  you invent will be refused, and that refusal is the boundary working.
+- **Projects are names, not paths.** `list_projects` says which exist; an
+  invented path is refused, and that refusal is the boundary working.
 - **`vm_up` then `vm_in`, not `spawn`, when you will run more than one thing.**
   A VM stays up between calls; `spawn` pays for a boot every time.
 - **`vm_in` returns the command's own exit status.** A failing test suite and a
@@ -21,13 +21,15 @@ Until then:
 - **Real data is attached, not copied.** `vm_up` takes `datasets`; a terabyte
   costs what a megabyte does. It is *mounted*, not loaded - point the server's
   own config at that path or it starts empty and tells you nothing.
-- **If you are timing something, take the minimum of several runs** and check
-  the host is not busy. A mean or median here measures the machine's mood, not
-  your code, and hardware counters may not exist at all. The guide says how.
-- **A VM you started stops when you stop**, so nothing leaks if you forget -
-  but tell a finished VM `vm_down` anyway.
-- **What you write stays in that VM** unless it is the project directory, which
-  is copied back when the VM stops.
+- **If you are timing something, take the minimum of several runs.** A mean
+  here measures the machine's mood, not your code, and hardware counters may
+  not exist at all. The guide says how.
+- **`spawn` takes a `verify` command.** I run it after the agent exits and its
+  status decides the run. Without one you have only the agent's word for its
+  own work.
+- **A VM you started stops when you stop** - still, `vm_down` when done.
+- **What you write stays in that VM** except the project directory, copied out
+  at shutdown.
 
 Every result carries `guide_revision`. If it differs from the guide you were
 given, re-read `firecode://guide` and say so.
