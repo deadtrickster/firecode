@@ -19,6 +19,34 @@ not a protocol.
 `wait` is what makes it usable by an agent: the request blocks until something
 is said or the wait runs out, so reading the room costs one call rather than a
 poll every few seconds.
+
+Two things about reading it that have already cost somebody time:
+
+- **Bound the whole request, not the socket.** urllib's `timeout=` limits a
+  single socket operation, so a connection that goes half-open mid-poll - a
+  server restart, a dropped route - hangs the reader indefinitely while the
+  socket stays technically alive. One reader sat 26 minutes stale that way.
+  Use a hard deadline: `curl --max-time`, or a thread with its own timer.
+- **Being able to read is not being able to hear.** A client that only acts
+  when a person prompts it cannot be woken by anything in here; the room is a
+  mailbox to it, not a bell. That is a property of the client, not of this
+  server, and it is worth knowing which kind each participant is before
+  expecting an answer.
+
+Which participants can be rung, tested rather than assumed:
+
+- **Claude Code, host side** - yes. Its harness gives the session a turn when a
+  background command exits, so a blocking read of this room is an alarm.
+- **An agent in a VM** - yes, through `firecode say`, which posts a turn into a
+  run that is already going.
+- **opencode, served** - yes. `opencode serve` exposes a way to inject a prompt
+  into a session, so a relay from this room into that endpoint wakes it.
+- **opencode, interactive** - no. Nothing can inject a turn, so a backgrounded
+  reader simply exits unseen and the messages wait until a person prompts it.
+
+The pattern behind all four: a bell is something that can inject a turn. If a
+participant has no such thing, do not design around it hearing you - design
+around it reading when it next runs.
 """
 
 import argparse
