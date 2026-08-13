@@ -65,6 +65,13 @@ VERIFY_TIMEOUT="${FIRECODE_VERIFY_TIMEOUT:-1800}"
 AUTH_RELAY=0
 AUTH_RELAY_PORT=""
 AUTH_RELAY_PID=""
+# Which provider the relay is standing in for. Worked out from the model that
+# was asked for, not from the agent's name: opencode speaks several, and
+# relaying one while withholding the credentials of another leaves a run with
+# neither.
+RELAY_PROVIDER=""
+#: providers auth-relay.py knows how to authenticate as
+RELAY_KNOWS="claude xai"
 API_BASE=""
 HYBRID=0
 PCORES=""
@@ -419,7 +426,7 @@ config_fingerprint() {
 	# *is*. Without this a relayed run reuses a drive some earlier plain run
 	# built, finds the credentials it was meant not to have, and rotates them
 	# - the exact failure the relay exists to prevent.
-	parts+=("relay:$AUTH_RELAY")
+	parts+=("relay:$AUTH_RELAY:$RELAY_PROVIDER")
 	# The briefing every agent in here is given. It is baked into CLAUDE.md and
 	# AGENTS.md on this drive, so editing it has to rebuild the drive - or the
 	# change lands nowhere and the next run is briefed with the old text.
@@ -491,17 +498,53 @@ build_config_drive() {
 	# talk to anything live elsewhere: credentials under the data directory,
 	# providers and MCP servers under the config directory. Without these it
 	# starts up with no provider at all.
-	if ((AUTH_RELAY)) && [[ $AGENT == opencode ]]; then
-		# Same reason as claude's .credentials.json above, and one more that
-		# is specific to a subscription login: opencode refreshes on startup,
-		# xAI rotates the pair, and the guest's copy of the new one dies with
-		# the VM - leaving the host holding a refresh token that has already
-		# been spent. One run in a VM and the desktop needs a re-login.
-		log "  opencode authenticates through this host - no credentials in the VM"
+	if ((AUTH_RELAY)) && [[ $AGENT == opencode && -f $OPENCODE_SHARE/auth.json ]]; then
+		# Only the relayed provider is withheld, and the rest travel.
+		#
+		# Withholding the whole file was too blunt: a run using one provider
+		# through the relay still needs its other credentials, and an api key
+		# does not rotate, so keeping it out buys nothing and costs the run
+		# everything. What must not travel is the login the relay is standing
+		# in for - opencode refreshes it on startup, the provider rotates the
+		# pair, and the guest's copy of the new one dies with the VM, leaving
+		# this host holding a token that has already been spent.
+		mkdir -p "$stage/opencode-share"
+		FIRECODE_RELAYED="$RELAY_PROVIDER" python3 -c '
+import json, os, sys
+d = json.load(open(sys.argv[1]))
+gone = os.environ["FIRECODE_RELAYED"]
+kept = {k: v for k, v in d.items() if k != gone}
+json.dump(kept, open(sys.argv[2], "w"), indent=2)
+print(" ".join(sorted(kept)) or "none")
+' "$OPENCODE_SHARE/auth.json" "$stage/opencode-share/auth.json" >/dev/null 2>&1 ||
+			cp -f "$OPENCODE_SHARE/auth.json" "$stage/opencode-share/auth.json"
+		chmod 600 "$stage/opencode-share/auth.json" 2>/dev/null || true
+		log "  $RELAY_PROVIDER goes through this host - the VM gets no credentials for it"
 	elif [[ -f $OPENCODE_SHARE/auth.json ]]; then
 		mkdir -p "$stage/opencode-share"
 		cp -f "$OPENCODE_SHARE/auth.json" "$stage/opencode-share/auth.json"
 		log "  opencode credentials: $(python3 -c 'import json,sys; print(", ".join(json.load(open(sys.argv[1]))))' "$OPENCODE_SHARE/auth.json" 2>/dev/null || echo "present")"
+		# A subscription login is rotating state, and this copy is a second
+		# writer. The unattended opencode path replaces it with a placeholder
+		# and a relay; every other path - an interactive session, a persistent
+		# VM someone later runs opencode inside - still gets the real thing,
+		# and refreshing it in there spends the host's token. Cheap to say,
+		# expensive to discover.
+		local oauth_providers
+		oauth_providers=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(" ".join(k for k, v in d.items()
+                if isinstance(v, dict) and v.get("type") == "oauth"))
+' "$OPENCODE_SHARE/auth.json" 2>/dev/null || true)
+		if [[ -n $oauth_providers ]]; then
+			log "  WARNING: $oauth_providers is a subscription login, and it is going into"
+			log "           this VM as-is. Anything that runs opencode in there can refresh"
+			log "           it, which rotates the token and leaves this host holding a spent"
+			log "           one. 'firecode opencode --auth-relay' avoids that; other paths"
+			log "           cannot, because a relay serves one provider and this VM has no"
+			log "           agent to name it."
+		fi
 	else
 		log "  opencode has no saved credentials on the host"
 	fi
@@ -511,6 +554,51 @@ build_config_drive() {
 		# is what decides providers and MCP servers.
 		rsync -a --copy-unsafe-links --exclude=node_modules \
 			"$OPENCODE_CONF"/ "$stage/opencode-config"/ 2>/dev/null || true
+
+		# Take out the MCP servers that cannot exist in a VM.
+		#
+		# Claude's config gets this treatment already; opencode's was copied
+		# verbatim, so an opencode started in a guest tried to exec binaries
+		# living on the host filesystem - a venv, a wrapper in ~/.local/bin -
+		# and to dial the spawn server's port, which is deliberately not
+		# relayed. It gets no useful error out of any of that; it just takes a
+		# long time not working, which is how the first attempt to run
+		# opencode inside a VM here looked like a hang.
+		local occ dropped
+		for occ in "$stage/opencode-config/opencode.jsonc" \
+			"$stage/opencode-config/opencode.json"; do
+			[[ -f $occ ]] || continue
+			dropped=$(FIRECODE_OCC="$occ" FIRECODE_SPAWN_PORT="${SPAWN_PORT:-9770}" python3 -c '
+import json, os, re, sys
+path = os.environ["FIRECODE_OCC"]
+try:
+    conf = json.loads(re.sub(r"(?m)^\s*//.*$", "", open(path).read()) or "{}")
+except ValueError:
+    raise SystemExit                      # not ours to rewrite
+
+mcp = conf.get("mcp") or {}
+gone = []
+for name, cfg in list(mcp.items()):
+    if not isinstance(cfg, dict):
+        continue
+    # A local server is a binary on the host, at a path the guest does not
+    # have. The command is not shipped, so the entry cannot work.
+    if cfg.get("type") == "local":
+        gone.append(name + " (host binary)")
+        del mcp[name]
+    # And the one port a guest is never given, because a VM that could reach
+    # the spawn server could start VMs of its own.
+    elif cfg.get("type") == "remote" and os.environ["FIRECODE_SPAWN_PORT"] in (cfg.get("url") or ""):
+        gone.append(name + " (not reachable from a guest, by design)")
+        del mcp[name]
+if gone:
+    conf["mcp"] = mcp
+    with open(path, "w") as fh:
+        json.dump(conf, fh, indent=2)
+    print(", ".join(gone))
+' 2>/dev/null || true)
+			[[ -n $dropped ]] && log "  dropped from opencode config in the guest: $dropped"
+		done
 	fi
 	# opencode reads AGENTS.md where claude reads CLAUDE.md, so the same
 	# briefing has to be put somewhere else entirely or opencode runs with no
@@ -2588,11 +2676,15 @@ massage_args() {
 		# and leave a fifth of it as headroom for the reply.
 		if [[ -n $API_BASE && " ${in[*]} " != *" --autocompact "* ]]; then
 			local n_ctx window
-			n_ctx=$(curl -s -m 3 "${API_BASE%/}/props" 2>/dev/null |
+			# Asked of the server, or told to us. A proxy in front of the model
+			# usually does not carry /props through, and there is no other way
+			# to find out - so FIRECODE_MODEL_CTX is how you say what the thing
+			# behind it can hold.
+			n_ctx=${FIRECODE_MODEL_CTX:-$(curl -s -m 3 "${API_BASE%/}/props" 2>/dev/null |
 				python3 -c 'import json,sys
 d = json.load(sys.stdin)
 g = d.get("default_generation_settings") or {}
-print(g.get("n_ctx") or d.get("n_ctx") or "")' 2>/dev/null || true)
+print(g.get("n_ctx") or d.get("n_ctx") or "")' 2>/dev/null || true)}
 			if [[ $n_ctx =~ ^[0-9]+$ ]] && ((n_ctx >= 125000)); then
 				window=$((n_ctx * 4 / 5))
 				((window > 1000000)) && window=1000000
@@ -2604,6 +2696,12 @@ print(g.get("n_ctx") or d.get("n_ctx") or "")' 2>/dev/null || true)
 				# out hours in.
 				log "warning: this model's context is $n_ctx, below the 100k floor for"
 				log "         auto-compaction - a long run will end on a 400 from the server"
+			else
+				# Said out loud, because the silent version of this is a run
+				# that dies of a full context four hours in.
+				log "warning: $API_BASE did not say how much context it has, so the agent"
+				log "         will compact against its own model's window, which is not this"
+				log "         one. Set FIRECODE_MODEL_CTX=<tokens> to size it properly."
 			fi
 		fi
 	elif [[ $agent == opencode ]]; then
@@ -3098,6 +3196,38 @@ launch() {
 	trap cleanup_run EXIT INT TERM PIPE HUP
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
+
+	# Which provider is being stood in for, decided before anything is staged.
+	#
+	# This used to be read off the agent's name - opencode meant xai - which
+	# is wrong as soon as opencode is pointed at any of the other providers it
+	# speaks. The run then got a relay for a provider it was not using and had
+	# the credentials for the one it was using withheld, so it had neither.
+	# The model argument says which one it is, so ask that.
+	if ((AUTH_RELAY)); then
+		if [[ $AGENT == claude ]]; then
+			RELAY_PROVIDER=claude
+		else
+			local prev=""
+			for a in ${agent_args+"${agent_args[@]}"}; do
+				if [[ $prev == -m || $prev == --model ]]; then
+					RELAY_PROVIDER=${a%%/*}
+					break
+				fi
+				prev=$a
+			done
+			# No model said, so the provider is whatever opencode picks -
+			# unknowable here. xai is the one this harness has a relay for,
+			# and naming it is better than silently relaying nothing.
+			[[ -n $RELAY_PROVIDER ]] || RELAY_PROVIDER=xai
+		fi
+		if [[ " $RELAY_KNOWS " != *" $RELAY_PROVIDER "* ]]; then
+			log "no relay for $RELAY_PROVIDER - its credentials go into the VM as they are"
+			log "  (the relay speaks $RELAY_KNOWS; an api key does not rotate, an oauth login does)"
+			AUTH_RELAY=0
+		fi
+	fi
+
 	if ((DRY_RUN)); then
 		log "dry run: nothing built, nothing booted"
 		return 0
@@ -3130,8 +3260,8 @@ launch() {
 	if ((AUTH_RELAY)); then
 		# Which credentials are being kept out of the VM depends on which agent
 		# is going to ask for them.
-		local relay_provider=claude
-		[[ $AGENT == opencode ]] && relay_provider=xai
+		# Decided from the model asked for, before the config drive was built.
+		local relay_provider=${RELAY_PROVIDER:-claude}
 
 		# A free port, never one that is already answering.
 		#
@@ -3306,7 +3436,7 @@ launch() {
 		# writes the config around it at boot. It cannot come off the config
 		# drive: that drive is shared between runs and keyed by content, and
 		# the port is per run.
-		if ((AUTH_RELAY)) && [[ $AGENT == opencode && -z $API_BASE ]]; then
+		if ((AUTH_RELAY)) && [[ $AGENT == opencode && $RELAY_PROVIDER == xai && -z $API_BASE ]]; then
 			echo "FIRECODE_XAI_BASE_URL='http://localhost:$AUTH_RELAY_PORT/v1'"
 		fi
 		echo "FIRECODE_EXTRA='${extra_spec[*]-}'"
@@ -3454,6 +3584,33 @@ launch() {
 		log "new workspace layer (what gets installed here stays here)"
 		ensure_layer "$SLUG" >/dev/null
 	}
+
+	# Check the one image that is both written to and kept.
+	#
+	# This was checked only when it was somebody else's layer being inherited
+	# read-only, on the reasoning that a dirty journal cannot be replayed on a
+	# read-only mount. But a read-write mount replays it happily, and a run
+	# whose VM was killed rather than shut down - a timeout, a cancel, a
+	# closed pipe - leaves exactly that. The replay goes through, nothing
+	# complains, and the damage shows up two runs later as
+	# "freeing already freed block; block bitmap corrupt" in a boot log nobody
+	# reads. This layer is where installed toolchains live, so what it loses
+	# is discovered much later, as a package that is mysteriously not there.
+	#
+	# -p only fixes what is safe to fix without asking. Exit 1 means it
+	# repaired something, which is worth knowing but not worth stopping for;
+	# 4 and up means it will not touch it, and booting over that is how the
+	# corruption compounds.
+	local fsck_rc=0
+	sbin e2fsck -p "$workspace_layer" >"$RUN_DIR/layer-fsck.log" 2>&1 || fsck_rc=$?
+	if ((fsck_rc == 1)); then
+		log "repaired the workspace layer (it was left dirty by an earlier run)"
+	elif ((fsck_rc >= 4)); then
+		log "WARNING: this workspace's layer is damaged and e2fsck -p will not"
+		log "         repair it unattended: $RUN_DIR/layer-fsck.log"
+		log "         fix it with: e2fsck -y $workspace_layer"
+		log "         or start over with: firecode --fresh-root ..."
+	fi
 
 	# --- jail: everything the VM touches has to live inside the chroot
 	local f

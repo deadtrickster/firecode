@@ -577,8 +577,8 @@ logs stay. Layers, state and snapshots are never touched by `gc`.
   link first and are safe; `sed -i` and shell appends are not.
 - Two runs at once on one project: the second gets a throwaway copy of the state
   drive and its session is not resumable. It says so at the time.
-- An OAuth refresh inside a VM rotates the token and that copy is discarded. If
-  the provider invalidates the old one, the host needs a re-auth.
+- An OAuth refresh inside a VM rotates the token and that copy is discarded, so
+  the host is left holding a spent one and needs a re-auth. `--auth-relay`
+  is the way out: the model is reached through this host and the VM holds no
+  credential for that provider at all.
 - x86_64 only.
-- Firecracker snapshots are not wired up. "Resume" means the agent's session,
-  tree and layer, not a suspended VM.

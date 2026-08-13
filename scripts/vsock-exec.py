@@ -10,6 +10,7 @@ usage: vsock-exec.py <uds> <port> <cwd|-> <command...>
 
 import base64
 import os
+import shlex
 import socket
 import sys
 
@@ -25,7 +26,19 @@ def main(argv):
         print(__doc__)
         return 2
     uds, port, cwd = argv[0], int(argv[1]), argv[2]
-    command = " ".join(argv[3:])
+
+    # One argument is a shell command; several are words.
+    #
+    # Everything used to be joined with spaces and handed to bash -lc, so
+    # `firecode in touch "my file"` made two files - the quoting the caller
+    # wrote was gone by the time the guest saw it. Joining is still right for
+    # a single argument, which is how anyone writes a pipeline, but when the
+    # caller passed separate words they meant separate words, so those are
+    # quoted back into a command that means what was typed.
+    if len(argv) == 4:
+        command = argv[3]
+    else:
+        command = " ".join(shlex.quote(a) for a in argv[3:])
 
     # Two ways to reach the same guest listener, because the two hypervisors
     # expose vsock differently. firecracker multiplexes it over a unix socket
