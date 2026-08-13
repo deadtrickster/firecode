@@ -76,12 +76,6 @@ if [[ -n ${ANTHROPIC_BASE_URL:-} ]]; then
 	log "model API reached through the host - no real credentials in this VM"
 fi
 
-declare -a CMD=()
-if [[ -n ${FIRECODE_TIMEOUT:-} && ${FIRECODE_TIMEOUT} != 0 ]]; then
-	CMD=(timeout --signal=TERM --kill-after=30s "$FIRECODE_TIMEOUT")
-fi
-CMD+=("$AGENT" "${ARGS[@]}")
-
 # An unattended agent prints nothing until it finishes, which for a job
 # measured in hours means a console showing one line and no way to tell working
 # from wedged. Asked for its events as they happen, it says what it is doing;
@@ -96,7 +90,126 @@ if [[ $AGENT == claude ]] && [[ ${FIRECODE_MODE:-} == auto ]] &&
 	for a in "${ARGS[@]}"; do
 		[[ $a == -p || $a == --print ]] && STREAM=1
 	done
-	((STREAM)) && CMD+=(--output-format stream-json --verbose)
+fi
+
+# The prompt moves out of the command line and onto stdin.
+#
+# --input-format stream-json makes stdin the only source of user turns: the
+# text after -p is then read by nobody, and a run started that way sits waiting
+# for a first message that never comes. So the prompt is taken out of the
+# arguments here and written into the inbox as the first turn, which is also
+# what makes every later turn from `firecode say` land in the same place.
+PROMPT=""
+declare -a AGENT_ARGS=()
+if ((STREAM)); then
+	skip=0
+	for a in "${ARGS[@]}"; do
+		if ((skip)); then
+			skip=0
+			PROMPT=$a
+			continue
+		fi
+		if [[ $a == -p || $a == --print ]]; then
+			AGENT_ARGS+=("$a")
+			skip=1
+			continue
+		fi
+		AGENT_ARGS+=("$a")
+	done
+else
+	AGENT_ARGS=("${ARGS[@]}")
+fi
+
+declare -a CMD=()
+if [[ -n ${FIRECODE_TIMEOUT:-} && ${FIRECODE_TIMEOUT} != 0 ]]; then
+	CMD=(timeout --signal=TERM --kill-after=30s "$FIRECODE_TIMEOUT")
+fi
+CMD+=("$AGENT" ${AGENT_ARGS+"${AGENT_ARGS[@]}"})
+((STREAM)) && CMD+=(--output-format stream-json --verbose --input-format stream-json)
+
+# The run can be spoken to while it runs.
+#
+# An unattended agent started on /dev/null is a thing you can watch and not a
+# thing you can answer - and half of what a person wants to say to a six-hour
+# run is a correction that arrives in minute ten. With stream-json input the
+# agent takes further user turns on stdin, so stdin is a fifo and `firecode
+# say` writes a turn into it.
+#
+# Held open by this shell for as long as the agent runs: a fifo with no writer
+# reads EOF, and an agent whose stdin closed will not take another word.
+# opencode has no stdin channel - `run` is one shot and its --port listens for
+# nothing - but it will attach to a server and take another message into a
+# session that is already working. So an unattended run gets a server of its
+# own, works through it, and `firecode say` posts into the same session.
+SAY_PORT=${FIRECODE_OPENCODE_PORT:-4096}
+SESSION_FILE=/tmp/firecode-agent-session
+if [[ $AGENT == opencode && ${FIRECODE_MODE:-} == auto ]] &&
+	[[ " ${ARGS[*]} " != *" --attach "* ]] && command -v curl >/dev/null 2>&1; then
+	rm -f "$SESSION_FILE"
+	if [[ $RUN_USER == root ]]; then
+		env "${ENV[@]}" opencode serve --port "$SAY_PORT" >/tmp/firecode-opencode-serve.log 2>&1 &
+	else
+		runuser -u "$RUN_USER" -- env "${ENV[@]}" opencode serve --port "$SAY_PORT" \
+			>/tmp/firecode-opencode-serve.log 2>&1 &
+	fi
+	OC_SERVER=$!
+	waited=0
+	while ((waited < 100)) && ! curl -s -m 1 "http://127.0.0.1:$SAY_PORT/session" >/dev/null 2>&1; do
+		sleep 0.2
+		waited=$((waited + 1))
+	done
+	if curl -s -m 2 "http://127.0.0.1:$SAY_PORT/session" >/dev/null 2>&1; then
+		# Attach the run itself, so its session lives on that server where a
+		# later message can reach it.
+		declare -a with_attach=()
+		for a in "${AGENT_ARGS[@]}"; do
+			with_attach+=("$a")
+			[[ $a == run ]] && with_attach+=(--attach "http://127.0.0.1:$SAY_PORT")
+		done
+		AGENT_ARGS=("${with_attach[@]}")
+		CMD=()
+		if [[ -n ${FIRECODE_TIMEOUT:-} && ${FIRECODE_TIMEOUT} != 0 ]]; then
+			CMD=(timeout --signal=TERM --kill-after=30s "$FIRECODE_TIMEOUT")
+		fi
+		CMD+=("$AGENT" "${AGENT_ARGS[@]}")
+		log "this run can be spoken to: firecode say <text>"
+		# The session does not exist until the run has created it, so its id is
+		# picked up in the background rather than waited for here.
+		(
+			for _ in $(seq 1 120); do
+				sid=$(curl -s -m 2 "http://127.0.0.1:$SAY_PORT/session" 2>/dev/null |
+					python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print(sorted(d, key=lambda s: s.get("time", {}).get("created", 0))[-1]["id"] if d else "")' 2>/dev/null)
+				if [[ -n $sid ]]; then
+					echo "$sid" >"$SESSION_FILE"
+					chmod 666 "$SESSION_FILE" 2>/dev/null
+					break
+				fi
+				sleep 1
+			done
+		) &
+	else
+		log "opencode server did not come up - this run cannot be spoken to"
+		kill "$OC_SERVER" 2>/dev/null || true
+		OC_SERVER=""
+	fi
+fi
+
+INBOX=/tmp/firecode-agent-inbox
+if ((STREAM)); then
+	rm -f "$INBOX"
+	if mkfifo "$INBOX" 2>/dev/null; then
+		chmod 666 "$INBOX"
+		# Opened read-write and never used: holding the descriptor is the
+		# whole point. It keeps a writer on the fifo so the agent's stdin
+		# never reaches EOF between turns.
+		# shellcheck disable=SC2034  # held open deliberately, not read
+		exec {INBOX_FD}<>"$INBOX"
+	else
+		log "no inbox: could not create $INBOX - this run cannot be spoken to"
+		INBOX=""
+	fi
 fi
 
 narrate() {
@@ -155,14 +268,36 @@ if ((STREAM)); then
 	chmod 666 "$RAW" 2>/dev/null || true
 	tail -n +1 -F "$RAW" 2>/dev/null | narrate &
 	NARRATOR=$!
+	# The first turn is the prompt the run was started with; anything `firecode
+	# say` writes later arrives on the same channel. json.dumps rather than
+	# hand-quoting, because a prompt is arbitrary text - quotes, newlines,
+	# backslashes - and one wrong escape makes the whole run a parse error.
+	if [[ -n $INBOX && -n $PROMPT ]]; then
+		FIRECODE_MSG=$PROMPT python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({
+    "type": "user",
+    "message": {"role": "user", "content": os.environ["FIRECODE_MSG"]},
+}) + "\n")
+' >"$INBOX"
+	fi
 	if [[ $RUN_USER == root ]]; then
-		env "${ENV[@]}" "${CMD[@]}" </dev/null >"$RAW" 2>&1 || rc=$?
+		env "${ENV[@]}" "${CMD[@]}" <"${INBOX:-/dev/null}" >"$RAW" 2>&1 || rc=$?
 	else
-		runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" </dev/null >"$RAW" 2>&1 || rc=$?
+		runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" \
+			<"${INBOX:-/dev/null}" >"$RAW" 2>&1 || rc=$?
 	fi
 	# Let it drain what is left before it goes.
 	sleep 1
 	kill "$NARRATOR" 2>/dev/null || true
+elif [[ -n ${OC_SERVER:-} ]]; then
+	if [[ $RUN_USER == root ]]; then
+		env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
+	else
+		runuser -u "$RUN_USER" -- env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
+	fi
+	kill "$OC_SERVER" 2>/dev/null || true
+	rm -f "$SESSION_FILE"
 elif [[ $RUN_USER == root ]]; then
 	env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
 else

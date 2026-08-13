@@ -1978,6 +1978,80 @@ cmd_in() {
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
 }
 
+# Say something to a run that is already going.
+#
+# An unattended agent used to be a thing you could watch and not a thing you
+# could answer, so a correction that occurred to you in minute ten waited for
+# the run to end and then needed a whole new run. The agent takes further user
+# turns on stdin, the entrypoint gives it a fifo, and this writes into it.
+cmd_say() {
+	local want=""
+	while [[ ${1:-} == --* ]]; do
+		case "$1" in
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		*) break ;;
+		esac
+	done
+	if (($# > 1)) && live_vm_socket "$1" >/dev/null 2>&1; then
+		want="$1"
+		shift
+	fi
+	[[ $# -gt 0 ]] || die "usage: firecode say [VM] <text...>"
+
+	local sock text
+	sock=$(require_vm_socket "$want")
+	text="$*"
+
+	# Encoded on the way in and decoded in the guest, because this is arbitrary
+	# text crossing a shell: a quote or a newline in a correction would
+	# otherwise end up as a syntax error in the command that carries it.
+	local encoded
+	encoded=$(printf '%s' "$text" | base64 -w0)
+	local out
+	# Two agents, two channels. claude takes further turns on stdin, so there
+	# is a fifo to write a message into. opencode takes them through the
+	# server its run is attached to, addressed to that run's session. Which
+	# one is here is a question about this VM, so the guest answers it.
+	out=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "
+inbox=/tmp/firecode-agent-inbox
+session=/tmp/firecode-agent-session
+msg=\$(printf '%s' '$encoded' | base64 -d)
+if [ -p \$inbox ]; then
+    FIRECODE_MSG=\$msg python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({\"type\": \"user\",
+    \"message\": {\"role\": \"user\", \"content\": os.environ[\"FIRECODE_MSG\"]}}) + \"\\n\")
+' > \$inbox
+    echo sent
+elif [ -s \$session ]; then
+    # Detached, because this call waits for the whole reply - which for a
+    # session that is in the middle of something is however long that takes,
+    # and saying something should not block on being answered. The reply
+    # arrives in the run's own output either way.
+    setsid nohup opencode run --attach http://127.0.0.1:\${FIRECODE_OPENCODE_PORT:-4096} \
+        --session \"\$(cat \$session)\" \"\$msg\" >>/tmp/firecode-say.log 2>&1 &
+    sleep 1
+    echo sent
+else
+    echo 'no inbox'
+    exit 3
+fi
+" 2>&1) || true
+
+	case "$out" in
+	*sent*) log "said it - the agent takes it at the end of its current turn" ;;
+	*"no inbox"*)
+		die "this run has no inbox - only an unattended claude run started by
+       this harness takes further turns (an interactive session is already
+       yours: use 'firecode enter')"
+		;;
+	*) die "could not reach the agent: $out" ;;
+	esac
+}
+
 cmd_down() {
 	local want=""
 	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
@@ -3935,6 +4009,7 @@ firecode - run a coding agent in a Firecracker microVM
                                  --project DIR picks which VM, --cwd DIR where
   firecode ps                    what every VM is doing right now
   firecode logs [-f]             what it has printed, agent output included
+  firecode say [VM] <text>       another turn for a run that is still going
   firecode down                  stop it, copying the work back out
   firecode checkpoint            freeze the running VM as it is now, so that
                                  up --fast brings it back in ~60ms
@@ -4033,6 +4108,10 @@ ps)
 logs)
 	shift
 	cmd_logs "$@"
+	;;
+say | tell)
+	shift
+	cmd_say "$@"
 	;;
 stop)
 	# docker's word for it; firecode's is down.
