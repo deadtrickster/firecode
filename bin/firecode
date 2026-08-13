@@ -2573,6 +2573,39 @@ massage_args() {
 		((has_print)) || out+=(-p)
 		# The whole point of the VM is that the agent does not need to ask.
 		((has_perm)) || out+=(--dangerously-skip-permissions)
+
+		# Compact against the window the model actually has.
+		#
+		# --autocompact defaults to "auto", sized from the model the client
+		# believes it is talking to. Pointed at a local server that is not
+		# that model, the belief is wrong in the dangerous direction: it keeps
+		# appending until the server rejects the request outright, and a run
+		# ends at "request (262310 tokens) exceeds the context" with hours of
+		# work and no compaction ever attempted. That is how the second qwen
+		# experiment here died, four minutes from finishing.
+		#
+		# llama.cpp says its real size on /props, so ask rather than guess,
+		# and leave a fifth of it as headroom for the reply.
+		if [[ -n $API_BASE && " ${in[*]} " != *" --autocompact "* ]]; then
+			local n_ctx window
+			n_ctx=$(curl -s -m 3 "${API_BASE%/}/props" 2>/dev/null |
+				python3 -c 'import json,sys
+d = json.load(sys.stdin)
+g = d.get("default_generation_settings") or {}
+print(g.get("n_ctx") or d.get("n_ctx") or "")' 2>/dev/null || true)
+			if [[ $n_ctx =~ ^[0-9]+$ ]] && ((n_ctx >= 125000)); then
+				window=$((n_ctx * 4 / 5))
+				((window > 1000000)) && window=1000000
+				out+=(--autocompact "$window")
+				log "local model context $n_ctx - compacting at $window"
+			elif [[ $n_ctx =~ ^[0-9]+$ ]]; then
+				# --autocompact will not go below 100k, so a smaller server
+				# cannot be accommodated - say so rather than let the run find
+				# out hours in.
+				log "warning: this model's context is $n_ctx, below the 100k floor for"
+				log "         auto-compaction - a long run will end on a 400 from the server"
+			fi
+		fi
 	elif [[ $agent == opencode ]]; then
 		case "${in[0]:-}" in
 		run | serve | models | auth | providers | agent | session | stats | \
@@ -3910,7 +3943,20 @@ cmd_ps() {
 		# one - and this is the number that tells them apart.
 		if [[ -f $RUNS/$id/console.log ]]; then
 			local quiet=$(($(date +%s) - $(stat -c %Y "$RUNS/$id/console.log")))
-			if ((quiet < 90)); then
+			# "thinking, or stuck" is the honest answer only while the answer
+			# is genuinely unknown. Once the agent has reported a result it is
+			# neither: it has finished and is holding the inbox open in case
+			# anyone still wants to say something, and saying "stuck" about a
+			# run that is counting down to its own shutdown is just wrong.
+			local finished=""
+			[[ -n $addr ]] && finished=$(python3 "$SCRIPTS/vsock-exec.py" "$addr" "$EXEC_PORT" - \
+				'test -p /tmp/firecode-agent-inbox &&
+				 tail -c 4000 /tmp/firecode-agent-stream.jsonl 2>/dev/null |
+				 grep -q "\"type\":\"result\"" && echo waiting' 2>/dev/null || true)
+			if [[ $finished == *waiting* ]]; then
+				printf '  agent finished %ss ago - inbox open, it exits when nobody speaks\n' \
+					"$quiet"
+			elif ((quiet < 90)); then
 				printf '  last output %ss ago\n' "$quiet"
 			else
 				printf '  last output %sm ago - thinking, or stuck\n' "$((quiet / 60))"

@@ -34,7 +34,63 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "firecode-spawn", "version": "1.0.0"}
+
+
+def _source_stamp():
+    """When this process's code and config were read off disk.
+
+    Everything here is loaded once at startup: the module, and the config in
+    main(). Edit either and the running server keeps doing what it was doing,
+    silently - so an agent can read the fix in the file, call the tool, get
+    the old behaviour, and have nothing to tell it why. The file on disk lies
+    about the running system, which is worse than the file being wrong.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        newest = max(os.path.getmtime(os.path.join(here, f))
+                     for f in os.listdir(here) if f.endswith((".py", ".md")))
+    except (OSError, ValueError):
+        newest = 0
+    return {"loaded_at": time.time(), "source_mtime": newest}
+
+
+STAMP = _source_stamp()
+SERVER_INFO = {
+    "name": "firecode-spawn",
+    "version": "1.0.0",
+    "loaded": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(STAMP["loaded_at"])),
+}
+
+
+def staleness_note(config_path=None):
+    """Whether this process is still the code and config on disk.
+
+    Checked per call rather than at startup, because the interesting moment is
+    the one where someone has just edited a file and is about to test it.
+    """
+    stale = []
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        newest = max(os.path.getmtime(os.path.join(here, f))
+                     for f in os.listdir(here) if f.endswith((".py", ".md")))
+        if newest > STAMP["loaded_at"]:
+            stale.append("its own source")
+    except (OSError, ValueError):
+        pass
+    if config_path:
+        try:
+            if os.path.getmtime(config_path) > STAMP["loaded_at"]:
+                stale.append("its config")
+        except OSError:
+            pass
+    if not stale:
+        return ""
+    return ("\n\nNOTE: this server has been running since "
+            + SERVER_INFO["loaded"] + " and " + " and ".join(stale)
+            + " changed on disk after that. It is still running the old "
+            "version - what you read in the files is not what answered you. "
+            "Restart it (firecode spawn-server) before concluding anything "
+            "about a fix.")
 
 GUIDE_URI = "firecode://guide"
 
@@ -223,7 +279,12 @@ class Runs:
         with self.lock:
             run["exit_code"] = code
             run["finished"] = time.time()
-            run["state"] = "finished" if run["state"] == "running" else run["state"]
+            # "finished" for a run that failed is a lie a caller has to catch
+            # by noticing exit_code separately - and one that read "finished,
+            # result_dir: null" and moved on is how a failure gets reported
+            # upwards as a success.
+            if run["state"] == "running":
+                run["state"] = "finished" if code == 0 else "failed"
             run["result_dir"] = self._parse_result_dir(run["log"])
 
     @staticmethod
@@ -246,7 +307,47 @@ class Runs:
             out["seconds"] = round(run["finished"] - run["started"], 1)
         else:
             out["seconds"] = round(time.time() - run["started"], 1)
+        if run["state"] == "failed":
+            out.update(self._why_failed(run))
         return out
+
+    @staticmethod
+    def _why_failed(run):
+        """A reason, and whether trying the same thing again could work.
+
+        A caller told only "failed, exit 1" has to go and read a log on a
+        machine it may not be on. These are the failures this server actually
+        produces, so it can say which one happened.
+        """
+        tail = ""
+        try:
+            with open(run["log"], errors="replace") as fh:
+                tail = fh.read()[-4000:]
+        except OSError:
+            pass
+
+        if "no way to reach a model" in tail:
+            return {"why": "the VM had no route to a model - offline, and no relay",
+                    "fix": "the spawn server passes --auth-relay itself; if you see "
+                           "this, the running server predates that and needs a restart",
+                    "retry": "not until that is fixed"}
+        if "VERIFICATION FAILED" in tail:
+            return {"why": "the agent finished, and the verify command failed",
+                    "fix": "read .firecode-verify.log in the result directory - the "
+                           "work exists, it just does not pass",
+                    "retry": "yes, with a task that says what failed"}
+        if "hit the" in tail and "timeout" in tail:
+            return {"why": "the agent ran out of time",
+                    "fix": "a larger timeout, or a smaller task",
+                    "retry": "yes"}
+        if "another run holds this project's state drive" in tail:
+            return {"why": "another run had this project, so this one got a private "
+                           "copy and could not resume anything",
+                    "fix": "wait for the other run, or use a different project",
+                    "retry": "yes, once the other one is done"}
+        return {"why": f"exit {run['exit_code']} - see the log",
+                "fix": f"read {run['log']}",
+                "retry": "unknown"}
 
     def cancel(self, run_id):
         run = self.runs.get(run_id)
@@ -1042,7 +1143,9 @@ class Handler(BaseHTTPRequestHandler):
         an agent whose context was compacted has lost the guide without any way
         to notice - a revision that no longer matches the one it remembers is
         that missing signal."""
-        blocks = [{"type": "text", "text": f"{text}\n\nguide_revision: {GUIDE_REVISION}"}]
+        stale = staleness_note(getattr(type(self).cfg, "path", None))
+        blocks = [{"type": "text",
+                   "text": f"{text}{stale}\n\nguide_revision: {GUIDE_REVISION}"}]
         cls = type(self)
         if GUIDE and not cls._guide_sent:
             cls._guide_sent = True

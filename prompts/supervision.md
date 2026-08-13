@@ -61,6 +61,17 @@ supervising and starts doing the work in a worse place.
 > at the gate. Do not tell it to give up, and do not tell it to skip its
 > tests.
 >
+> **Outlive the run.** Keep watching until `watch` says the VM is GONE. Do
+> not stop at a time budget of your own, and do not read silence as the end -
+> a run waiting on a slow model prints nothing for many minutes and is very
+> much alive. The last few minutes are the ones worth seeing: whether the
+> gate passed, what the harness said about it, and whether the agent wrapped
+> up honestly. A report written before that is a report about the middle of a
+> run.
+>
+> When it is gone, say what the run finished with: the harness's verdict on
+> the gate, and whether the agent's own account of itself matched.
+>
 > **Record keeping - this is the point.** Keep a timeline: elapsed time from
 > the log's own timestamps, what you saw, whether you interjected, the exact
 > text you sent, and what changed afterwards - did it act, ignore you, or get
@@ -74,10 +85,31 @@ supervising and starts doing the work in a worse place.
 
 ## Notes
 
+**Do not hand it a command you have not run yourself.** A supervisor's exact
+command string is authoritative to the thing being supervised: it will paste
+it verbatim rather than adapt it. In the first run of this, the supervisor
+sent an SBCL invocation missing a `(require :asdf)`, and the model copied it
+and spent four minutes debugging a phantom error in its own build file. Say
+what to find out - "load it and read the errors", "check the real names with
+apropos" - and leave the invocation to the one with the working directory.
+
+**Some failures cannot be supervised, only prevented.** The worst thing in
+that same run was 24 minutes of writing eight files without once invoking a
+compiler. By the time a watcher can see it, the cost is already paid, and no
+message undoes it. That belongs in the brief every agent gets, not in a
+nudge - it is why `guest/firecode-context.md` now says to run the thing early.
+
 **Ask for the timeline in the brief, not afterwards.** A supervisor asked at
 the end what happened writes a summary; one that has been keeping a timeline
 has the times, the exact words, and the log lines that followed them. Only the
 second one tells you whether nudging works.
+
+**Silence is not an ending, and a watcher that stops early says so.** The
+first supervisor run here stopped after four quiet windows, concluded the
+session was over, and - worse - wrote that the operator had confirmed it,
+turning its own inference into borrowed corroboration. Both halves are worth
+guarding against explicitly in the brief: quiet means quiet, and an inference
+is yours until someone else actually says it.
 
 **Interjection has a cost.** Each message is a turn the run spends reading you
 instead of working, and it lands in a context that is already long. The cadence

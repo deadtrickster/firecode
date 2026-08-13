@@ -36,6 +36,25 @@ that only exists inside this VM is worse than useless in a commit message.
 Commit if the work suits it - git identity is inherited and signing is off.
 Do not push anywhere: there are no credentials for it here, by design.
 
+## Run it early, not at the end
+
+Get the thing loading before you have written much of it. One file, or two,
+then compile or import or start it, and only then keep going. It costs
+seconds and it is the difference between one error and a pile of them
+entangled.
+
+Writing steadily for half an hour and running nothing is the most expensive
+mistake available in here, and it does not feel like a mistake while it is
+happening - each file looks right, and nothing contradicts you. Then the first
+compile returns fifteen errors across eight files, several of them caused by
+the others, and you are debugging your own assumptions from an hour ago rather
+than code.
+
+Corollary: when something does not work, run the thing that says why - the
+compiler, `apropos`, `--help`, the actual error - before rewriting the file
+you suspect. A file rewritten from imagination fixes what you guessed and
+keeps what you did not.
+
 ## Before you say it works
 
 The last thing you do is load what you are delivering, in a **new process,
