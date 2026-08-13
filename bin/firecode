@@ -1983,6 +1983,60 @@ cmd_in() {
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
 }
 
+# Wait, then say what a run has been doing.
+#
+# For whoever is watching a run they did not start - a person with a terminal,
+# or an agent supervising another agent. Watching means pausing between looks,
+# and a pause an agent writes for itself is a different command line every
+# time: a bare sleep, a computed deadline, a loop. None of those can be
+# permitted once, so the person behind the supervisor is asked to approve
+# another almost-identical command every couple of minutes.
+#
+# One command, always the same shape, so it can be granted once and then
+# forgotten about.
+cmd_watch() {
+	# 60 rather than 120: a caller that has to wrap this in its own timeout
+	# has already lost the point of it, and most tool harnesses cut a command
+	# off at two minutes. Short enough to survive that, long enough that
+	# looking is not the main thing this watcher does.
+	local want="" every=60 lines=60
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--every)
+			every="$2"
+			shift 2
+			;;
+		-n | --lines)
+			lines="$2"
+			shift 2
+			;;
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		-*) die "usage: firecode watch [VM] [--every SEC] [-n LINES]" ;;
+		*)
+			want="$1"
+			shift
+			;;
+		esac
+	done
+
+	sleep "$every"
+
+	# Whether it is still up comes first: the same tail means one thing from a
+	# VM that is still working and another from one that has finished.
+	local ids
+	ids=$(cmd_list --ids 2>/dev/null || true)
+	if [[ -n $want ]] && ! grep -qw -- "$want" <<<"$ids"; then
+		echo "== $want is GONE (finished, or stopped)"
+	else
+		echo "== ${want:-the run} is running"
+	fi
+	echo "== last $lines lines after ${every}s"
+	cmd_logs ${want:+"$want"} -n "$lines"
+}
+
 # Say something to a run that is already going.
 #
 # An unattended agent used to be a thing you could watch and not a thing you
@@ -2024,7 +2078,15 @@ cmd_say() {
 inbox=/tmp/firecode-agent-inbox
 session=/tmp/firecode-agent-session
 msg=\$(printf '%s' '$encoded' | base64 -d)
+# On the console too, so it is in the run's log next to what the agent did
+# with it. A supervisor's nudge that only exists in the supervisor's own
+# transcript makes the log a record of an argument with one side missing.
+printf '[firecode] <- said: %s\n' \"\$msg\" | sudo tee /dev/console >/dev/null 2>&1 || true
 if [ -p \$inbox ]; then
+    # The stamp is what keeps the run alive: the guest closes the agent's
+    # stdin after a stretch with nothing said to it, and this is how it knows
+    # somebody is still here.
+    touch \$inbox.stamp 2>/dev/null || true
     FIRECODE_MSG=\$msg python3 -c '
 import json, os, sys
 sys.stdout.write(json.dumps({\"type\": \"user\",
@@ -4247,6 +4309,10 @@ firecode - run a coding agent in a Firecracker microVM
   firecode ps                    what every VM is doing right now
   firecode logs [-f]             what it has printed, agent output included
   firecode say [VM] <text>       another turn for a run that is still going
+  firecode watch [VM] [--every SEC] [-n LINES]
+                                 wait, then say whether it is still up and what
+                                 it has printed - one command for a watcher,
+                                 so it can be permitted once
   firecode down                  stop it, copying the work back out
   firecode checkpoint            freeze the running VM as it is now, so that
                                  up --fast brings it back in ~60ms
@@ -4353,6 +4419,10 @@ logs)
 say | tell)
 	shift
 	cmd_say "$@"
+	;;
+watch)
+	shift
+	cmd_watch "$@"
 	;;
 stop)
 	# docker's word for it; firecode's is down.

@@ -350,6 +350,55 @@ could not start are different things. Several VMs can be up at once, one per
 project; `--project DIR` says which, and asking ambiguously lists them rather
 than guessing.
 
+## Delegating a job, and staying in the conversation
+
+An unattended run is not a black box. It says what it is doing as it does it,
+it can be spoken to while it works, and what it hands back is checked by the
+harness rather than described by the agent.
+
+```sh
+firecode claude --deliver ~/Projects/thing \
+  --verify './run_tests.sh' \
+  -- -p 'build the thing, tests and all' --dangerously-skip-permissions
+
+firecode logs -f thing-vm         # what it is doing, as it happens
+firecode say thing-vm 'the spec changed - RFC 2812 rather than 1459'
+```
+
+**`--verify CMD`** is the part that makes "done" mean something. The harness
+runs `CMD` itself after the agent has exited, inside the VM - where the
+toolchain the agent installed actually is - in the project directory as it
+will be handed over. Its exit status becomes the run's, its output is
+delivered as `.firecode-verify.log`, and the agent is told at the start what
+the command will be, so it can aim at it.
+
+This exists because of two runs in one evening. One delivered a Lisp system
+whose `.asd` named files that were not there, with a test that started a
+server, slept, stopped it and printed "test completed"; the other delivered a
+Postgres extension whose README ended a results section with the literal
+string `RESULTS_PLACEHOLDER` over an empty file. Both reported success, both
+took hours, and in both cases the last thing checked was not the thing being
+handed over. An agent asserting success is a claim about a process that is
+about to stop, made by the only party who could have checked and did not.
+
+**`firecode say`** posts another turn into a run that is already going, so a
+correction that occurs to you in minute ten does not have to wait for the end
+and a whole new run. Both agents take it, by different routes: claude reads
+further turns from stdin, and opencode is attached to a server of its own so
+the message goes into its session.
+
+**`firecode watch <vm>`** waits, then says whether the run is still up and what
+it has printed. It takes no flags on purpose. Watching means pausing between
+looks, and an agent left to invent its own pause writes a different command
+every time - a bare sleep, then a computed deadline, then its own choice of
+tail length - so whoever is approving that agent's commands is asked again
+every couple of minutes and can never grant it once. Over MCP `vm_watch` goes
+further and does not poll at all: it blocks until the VM exits, until text you
+named appears, until the run has been quiet too long, or until a timeout.
+
+[`prompts/`](prompts/) has starting points for both halves of this - a build
+task with a gate, and one agent supervising another.
+
 ## Checkpoints
 
 Firecracker can save a running VM - guest memory and device state - and map it

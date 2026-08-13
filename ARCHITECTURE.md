@@ -290,12 +290,27 @@ These are what the tests assert, and what any implementation has to hold:
     or a disk explicitly attached writable.
 12. A tool pointed at the guest's `/proc` describes the guest; one pointed at
     the host's describes the host; neither silently becomes the other.
+13. Whether a run succeeded is decided by something the harness ran, not by
+    what the agent said about it. `--verify` runs after the agent has exited,
+    in the project as it will be handed over, and its status is the run's.
+14. A command meant to be run repeatedly - by a person, or by an agent
+    watching another agent - is complete in its defaults. Anything a caller
+    has to assemble is a different command line every time, which cannot be
+    granted once and so turns supervision into a stream of permission
+    prompts. `firecode watch <vm>` takes no flags for a reason.
 
 ## Known limits
 
 Stated because each one is quiet rather than loud, and an agent that does not
 know them will produce confident wrong answers:
 
+- A VM spawned through the MCP server **by a caller on the host** has no
+  parent run, so invariant 2 does not reach it. Ownership is worked out from
+  the cgroup the caller's connection came from, and a host process is not in
+  one - which is correct, since there is no parent VM to belong to, but it
+  means such a VM is not killed transitively by anything. It still cleans up
+  after itself when its own run ends. Called from inside a guest, the lineage
+  is there and invariant 2 holds.
 - No hardware counters in a VM on this hybrid host, by any hypervisor.
 - No GPU under firecracker at all; passthrough is exclusive, so one VM has the
   card and the host does not.

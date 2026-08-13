@@ -381,6 +381,36 @@ def build_tools(cfg):
             },
         },
         {
+            "name": "vm_watch",
+            "description": (
+                "Wait for a run to do something, then return what it did. "
+                "This call blocks until one of: the VM exits, the text in "
+                "`until` appears in its output, it has printed nothing for "
+                "`quiet_for` seconds, or `timeout` is reached - and it hands "
+                "back why it returned plus the tail of the console.\n\n"
+                "Use this instead of polling. A loop that sleeps and checks "
+                "burns a call every interval, gets slower news, and - when a "
+                "person is approving your commands - asks them to approve "
+                "another almost-identical one every time. One blocking call "
+                "per look is the whole interface."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "enum": projects},
+                    "timeout": {"type": "integer",
+                                "description": "Seconds to wait. Default 300, max 900."},
+                    "quiet_for": {"type": "integer",
+                                  "description": ("Return early if nothing has been "
+                                                  "printed for this long - which is how "
+                                                  "a stuck run looks.")},
+                    "until": {"type": "string",
+                              "description": "Return early when this text appears."},
+                    "lines": {"type": "integer", "description": "Tail to return. Default 60."},
+                },
+                "required": ["project"],
+            },
+        },
+        {
             "name": "vm_stop",
             "description": "Stop something started by vm_serve. The VM keeps running.",
             "inputSchema": {
@@ -632,6 +662,39 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         if rc != 0:
             return explain(f"Resetting {args['project']}", out, rc)
         return f"{args['project']} is back at its checkpoint."
+
+    if name == "vm_watch":
+        path = _project_path(cfg, args["project"])
+        # Capped, because this holds a request open: a caller that asks for an
+        # hour gets fifteen minutes and can ask again.
+        limit = min(int(args.get("timeout", 300)), 900)
+        quiet_for = int(args.get("quiet_for", 0))
+        until = args.get("until") or ""
+        lines = int(args.get("lines", 60))
+
+        def tail():
+            return _firecode(["logs", "--project", path, "-n", str(lines)],
+                             timeout=60)[1] or ""
+
+        started = time.time()
+        seen = tail()
+        last_change = started
+        while time.time() - started < limit:
+            time.sleep(5)
+            now = tail()
+            running = path in (_firecode(["list", "--ids"], timeout=60)[1] or "")
+            if not running:
+                return f"{args['project']}: the VM has exited.\n\n{now}"
+            if until and until in now and until not in seen:
+                return (f"{args['project']}: saw {until!r} after "
+                        f"{int(time.time() - started)}s.\n\n{now}")
+            if now != seen:
+                seen, last_change = now, time.time()
+            elif quiet_for and time.time() - last_change >= quiet_for:
+                return (f"{args['project']}: nothing printed for "
+                        f"{int(time.time() - last_change)}s - it may be stuck, or "
+                        f"thinking, or waiting on something. vm_ps says which.\n\n{now}")
+        return (f"{args['project']}: still going after {limit}s.\n\n{tail()}")
 
     if name in ("vm_serve", "vm_logs", "vm_ps", "vm_stop"):
         path = _project_path(cfg, args["project"])
