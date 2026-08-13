@@ -36,6 +36,50 @@ that only exists inside this VM is worse than useless in a commit message.
 Commit if the work suits it - git identity is inherited and signing is off.
 Do not push anywhere: there are no credentials for it here, by design.
 
+## Before you say it works
+
+The last thing you do is load what you are delivering, in a **new process,
+from the project directory as it will be copied out** - build it, import it,
+load the system, start the binary, whatever "use this" means here. Then run
+the tests the same way.
+
+Not the process you have been working in. A long session accumulates state
+that will not exist for whoever opens this next: modules already imported,
+a file you renamed but whose old definitions are still live, an environment
+variable set forty steps ago. Everything you wrote can be correct in that
+process and unloadable in a fresh one - a build file naming a file you
+renamed, a test that imports a module you deleted - and that failure lands on
+the person who receives this, with your run already reported as a success.
+
+A test that asserts nothing passes just as easily. If the task named a
+behaviour to check, the test exercises that behaviour and fails when it is
+absent - starting a server, sleeping, stopping it and printing "test
+completed" tests that a process can start.
+
+If it does not load or the tests do not pass, that is the result. Say so
+plainly in the README and say what is broken. An honest failure is worth
+something; a success that cannot be reproduced from the delivered files is
+worth less than nothing, because it costs whoever reads it the time to find
+out.
+
+## Nothing you deliver is a promise to come back
+
+No placeholder survives into the delivered tree. Not `RESULTS_PLACEHOLDER`,
+not `TODO: numbers`, not `<fill this in>`, not a results file you created
+empty and meant to fill after the next run finished. You are the only one who
+was ever going to come back, and when the VM stops you do not.
+
+So before you finish, go and look: every file you are handing over, and every
+claim in the README that points at a number, a file or a command. Open the
+file. If it is empty, either fill it or delete it and say the measurement was
+not taken. A section that promises a table and delivers a marker reads as an
+oversight to you and as a finished document to whoever receives it.
+
+Take the same care with anything you started in the background. A benchmark
+you launched and did not wait for produces nothing, and reporting from it is
+reporting from a file that does not exist yet. Wait for it, or drop the
+claim.
+
 ## What is different from the host
 
 - MCP servers that run as local commands on the host are **not** here; their
