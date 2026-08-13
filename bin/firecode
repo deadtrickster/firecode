@@ -2105,6 +2105,151 @@ cmd_in() {
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
 }
 
+# The room.
+#
+# Every agent here works alone by construction - one per VM, one per session -
+# which is the point and also the blind spot: two of them can spend an hour on
+# the same wrong assumption without ever finding out. This is a place to say
+# something to all of them at once, and to hear what they have said.
+#
+#   firecode chat serve              start it (once, on the host)
+#   firecode chat 'text'             say something
+#   firecode chat --read             everything said so far
+#   firecode chat --wait             block until somebody says something new
+cmd_chat() {
+	# 9761 rather than 9760: this machine's reranker has had 9760 since July,
+	# and a chat room that quietly answers 404 because it never started is
+	# worse than one on an odd port.
+	local port=${FIRECODE_CHAT_PORT:-9761} who=${FIRECODE_CHAT_NAME:-$(id -un)@host}
+	local mode=say since=0 wait=0
+	while [[ ${1:-} == -* || ${1:-} == serve ]]; do
+		case "${1:-}" in
+		serve)
+			mode=serve
+			shift
+			;;
+		--read)
+			mode="read"
+			shift
+			;;
+		--wait)
+			mode="read"
+			wait=${FIRECODE_CHAT_WAIT:-60}
+			shift
+			;;
+		--inbox)
+			# Blocks until somebody actually says something, then prints it
+			# and exits - which is what makes this usable as a notification
+			# rather than a poll. An agent whose harness tells it when a
+			# background command finishes gets told when the room speaks.
+			mode="inbox"
+			wait=${FIRECODE_CHAT_WAIT:-120}
+			shift
+			;;
+		--since)
+			since="$2"
+			shift 2
+			;;
+		--as)
+			who="$2"
+			shift 2
+			;;
+		--port)
+			port="$2"
+			shift 2
+			;;
+		*) die "usage: firecode chat [serve|--read|--wait|--as NAME] [text...]" ;;
+		esac
+	done
+
+	if [[ $mode == serve ]]; then
+		mkdir -p "$RUNS"
+		if ss -ltn 2>/dev/null | grep -q ":$port "; then
+			log "chat is already up on $port"
+			return 0
+		fi
+		setsid python3 "$SCRIPTS/chat.py" --port "$port" --log "$RUNS/chat.log" \
+			>"$RUNS/chat-server.log" 2>&1 &
+		disown 2>/dev/null || true
+		local waited=0
+		while ((waited < 40)) && ! ss -ltn 2>/dev/null | grep -q ":$port "; do
+			sleep 0.1
+			waited=$((waited + 1))
+		done
+		log "chat on port $port - give a VM --host-port $port and it can join"
+		return 0
+	fi
+
+	if [[ $mode == inbox ]]; then
+		# Its own mark, so the command never has to carry one.
+		#
+		# `--inbox --since 12` is a different command line every time it is
+		# used, which is exactly the thing that cannot be granted once and so
+		# asks the person behind the agent to approve another near-identical
+		# command every few minutes. The position belongs in a file, not in
+		# the argument list. One name, one mark, so two watchers reading the
+		# room do not consume each other's messages.
+		local mark_file="$RUNS/chat-mark-${who//[^A-Za-z0-9._-]/-}"
+		if ((since == 0)) && [[ -f $mark_file ]]; then
+			since=$(cat "$mark_file" 2>/dev/null || echo 0)
+			[[ $since =~ ^[0-9]+$ ]] || since=0
+		fi
+		# The server caps a single long-poll, so this repeats one until there
+		# is something to report or the whole wait runs out. Exit 0 with
+		# messages, 1 with none, so a caller can tell "nobody spoke" from
+		# "here is what was said" without parsing.
+		local deadline=$(($(date +%s) + ${FIRECODE_CHAT_DEADLINE:-1800})) out=""
+		while (($(date +%s) < deadline)); do
+			out=$(FIRECODE_CHAT_MARK="$mark_file" curl -s -m $((wait + 30)) \
+				"http://127.0.0.1:$port/messages?since=$since&wait=$wait" |
+				FIRECODE_CHAT_MARK="$mark_file" python3 -c '
+import json, os, sys, time
+d = json.load(sys.stdin)
+for m in d.get("messages", []):
+    stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
+    print("[%s] %s: %s" % (stamp, m["from"], m["text"]))
+if d.get("messages"):
+    # Written here rather than by the shell, so the mark only moves for
+    # messages that were actually printed.
+    with open(os.environ["FIRECODE_CHAT_MARK"], "w") as fh:
+        fh.write(str(d.get("last", 0)))' 2>/dev/null)
+			[[ -n $out ]] && {
+				printf '%s\n' "$out"
+				return 0
+			}
+		done
+		echo "nobody said anything (since id $since)"
+		return 1
+	fi
+
+	if [[ $mode == read ]]; then
+		curl -s -m $((wait + 30)) \
+			"http://127.0.0.1:$port/messages?since=$since&wait=$wait" |
+			python3 -c '
+import json, sys, time
+d = json.load(sys.stdin)
+for m in d.get("messages", []):
+    stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
+    print("[%s] %s: %s" % (stamp, m["from"], m["text"]))
+print("-- last id: %d" % d.get("last", 0))'
+		return 0
+	fi
+
+	[[ $# -gt 0 ]] || die "usage: firecode chat 'what you want to say'"
+	FIRECODE_CHAT_WHO="$who" FIRECODE_CHAT_TEXT="$*" python3 -c '
+import json, os, sys, urllib.request
+body = json.dumps({"from": os.environ["FIRECODE_CHAT_WHO"],
+                   "text": os.environ["FIRECODE_CHAT_TEXT"]}).encode()
+req = urllib.request.Request(sys.argv[1], data=body,
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        print("said (#%d)" % json.load(r)["id"])
+except Exception as exc:
+    sys.exit("chat is not answering on %s: %s" % (sys.argv[1], exc))
+' "http://127.0.0.1:$port/say"
+}
+
 # Wait, then say what a run has been doing.
 #
 # For whoever is watching a run they did not start - a person with a terminal,
@@ -4682,6 +4827,10 @@ say | tell)
 watch)
 	shift
 	cmd_watch "$@"
+	;;
+chat)
+	shift
+	cmd_chat "$@"
 	;;
 stop)
 	# docker's word for it; firecode's is down.
