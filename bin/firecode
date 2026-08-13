@@ -1917,6 +1917,27 @@ up_checkpoint() {
 	[[ -f $jail/.memcheck-stamp ]] || return 0
 	local -a w=()
 	mapfile -t w <"$jail/.memcheck-writables"
+
+	# Never replace a checkpoint that was not restored from.
+	#
+	# The stamp a checkpoint is keyed to covers host-side inputs - the config
+	# drive among them - so editing an agent briefing invalidates every
+	# project's checkpoint without touching a VM. --fast then boots normally,
+	# which is correct, and used to take a fresh checkpoint on the way, which
+	# is not: memcheck_save replaces the directory outright, so the fixture
+	# somebody spent an hour building was overwritten by a bare boot, and the
+	# only clue was that "back at the checkpoint" took nineteen seconds
+	# instead of two.
+	#
+	# Replacing one is what --refresh is for, and it should take saying so.
+	local dest
+	dest=$(cat "$jail/.memcheck-dir")
+	if [[ -d $dest ]] && ((REFRESH == 0)); then
+		log "this start did not restore, so the existing checkpoint is left alone"
+		log "  (it no longer matches this configuration - 'up --refresh' replaces it)"
+		rm -f "$jail"/.memcheck-*
+		return 0
+	fi
 	log "taking a checkpoint so the next start skips the boot"
 	if memcheck_save "$jail/firecracker.socket" "$jail" \
 		"$(cat "$jail/.memcheck-dir")" "$(cat "$jail/.memcheck-stamp")" "${w[@]}"; then
@@ -2023,8 +2044,21 @@ cmd_checkpoint() {
 	local sock jail
 	sock=$(require_vm_socket "$want")
 	jail=$(dirname "$sock")
-	[[ -f $jail/.memcheck-stamp ]] ||
-		die "this VM cannot be checkpointed - it was started by an older firecode"
+	# Two different reasons, and the message used to give the wrong one - it
+	# blamed an older firecode, which sent somebody looking for a version skew
+	# that did not exist. A VM that was restored, or that has already been
+	# checkpointed once since it started, has had these markers cleared.
+	if [[ ! -f $jail/.memcheck-stamp ]]; then
+		if [[ -f $jail/vmstate ]]; then
+			die "this VM was restored from a checkpoint, so it cannot be checkpointed
+       again. Take one from a VM that booted normally: firecode down, then
+       firecode up (without --fast), get it into the state you want, and
+       firecode checkpoint."
+		fi
+		die "this VM cannot be checkpointed - no checkpoint markers in its jail,
+       which means it was started by an older firecode, or it has already been
+       checkpointed since it started."
+	fi
 
 	local -a w=()
 	mapfile -t w <"$jail/.memcheck-writables"
@@ -3326,6 +3360,14 @@ launch() {
 		"$CFG_DRIVE" "$(layers_of_project "$SLUG")" ${early_layer:+"$early_layer"})
 	((REFRESH)) && rm -rf "$memdir"
 	((FAST)) && memcheck_valid "$memdir" "$memstamp" && restoring=1
+	# Why it is booting rather than restoring, at the moment it happens. This
+	# was silent, and a silent fallback is indistinguishable from a slow
+	# restore - which is how a checkpoint that had not restored for weeks went
+	# unnoticed while being overwritten each time.
+	if ((FAST)) && ((restoring == 0)) && [[ -d $memdir ]]; then
+		log "the checkpoint does not match this configuration, so this is a normal boot"
+		log "  (it was taken for a different config drive, project or base image)"
+	fi
 
 	# Continuing a conversation that only exists on the host means bringing
 	# the transcript in. Done once per project unless asked for again.
