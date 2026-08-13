@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -230,6 +231,12 @@ class Runs:
                 cmd += ["--verify", verify]
             for port in self.cfg.host_ports:
                 cmd += ["--host-port", str(port)]
+            # The room, so an agent in a VM is not the only one who cannot
+            # hear what everyone else has worked out. Costs nothing when the
+            # room is not running: the relay simply has nothing to connect to.
+            chat_port = os.environ.get("FIRECODE_CHAT_PORT", "9761")
+            if chat_port not in [str(p) for p in self.cfg.host_ports]:
+                cmd += ["--host-port", chat_port]
             cmd += self.cfg.extra_args
             if which == "opencode":
                 # opencode's own shape: a subcommand and provider/model, and
@@ -551,6 +558,47 @@ def build_tools(cfg):
             },
         },
         {
+            "name": "chat_say",
+            "description": (
+                "Say something in the room every agent on this machine shares. "
+                "Use it when you learn something the others would act on: a "
+                "verified defect, a run's verdict, a wrong assumption you just "
+                "corrected. Not for narration - the room is small and read by "
+                "working agents.\n\n"
+                "Pick a name and keep it. The default is the host user, which "
+                "everyone shares, so unnamed posters are indistinguishable."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "name": {"type": "string",
+                             "description": "Who is speaking, e.g. 'glm', 'reviewer'."},
+                },
+                "required": ["text"],
+            },
+        },
+        {
+            "name": "chat_wait",
+            "description": (
+                "Block until somebody else says something in the room, then "
+                "return it. Your own messages do not wake you, and where you "
+                "had read up to is remembered here under your name - so this "
+                "takes no cursor and can be called repeatedly with the same "
+                "arguments.\n\n"
+                "This is the one tailer. Do not write your own: three of them "
+                "existed for a while and one filtered the wrong name, hiding "
+                "the messages it was supposed to deliver."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "Your name in the room. Keep it stable."},
+                    "timeout": {"type": "integer",
+                                "description": "Seconds to wait. Default 300, max 900."},
+                },
+            },
+        },
+        {
             "name": "vm_say",
             "description": (
                 "Say something to a run that is already going - a correction, "
@@ -851,10 +899,85 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         # own copies of the drives rather than on what it wrote.
         path = _project_path(cfg, args["project"])
         _firecode(["down", "--project", path], timeout=180)
-        rc, out = _firecode(["up", "--fast", "--project", path], timeout=600)
+        # With the same flags it was brought up on.
+        #
+        # These were dropped here, which made a reset a different VM from the
+        # one being reset: a project configured --no-net came back with a
+        # network, and the checkpoint could never match because the stamp
+        # covers that shape - so every reset was a cold boot as well as a
+        # policy change. The config is the trust boundary; a reset does not
+        # get to leave it.
+        rc, out = _firecode(["up", "--fast", "--project", path] + cfg.extra_args,
+                            timeout=600)
         if rc != 0:
             return explain(f"Resetting {args['project']}", out, rc)
-        return f"{args['project']} is back at its checkpoint."
+        # Restored, or merely started? These are different machines, and this
+        # used to report the first whatever happened - so a caller that asked
+        # for a fixture back was told it had one when it had a fresh boot, and
+        # the only clue was that the call took twenty seconds rather than two.
+        if "restoring from a checkpoint" in out:
+            return f"{args['project']} is back at its checkpoint."
+        return (f"{args['project']} was restarted, but NOT from its checkpoint - "
+                f"there was none that matched, so this is a fresh boot and "
+                f"whatever state the checkpoint held is not here. The VM is "
+                f"usable; anything you were relying on from the fixture is not. "
+                f"vm_checkpoint after setting it up again, or take it on a VM "
+                f"started without --fast.")
+
+    if name in ("chat_say", "chat_wait"):
+        port = int(os.environ.get("FIRECODE_CHAT_PORT", "9761"))
+        base = f"http://127.0.0.1:{port}"
+        who = args.get("name") or (f"run-{caller_run}" if caller_run else "agent")
+
+        if name == "chat_say":
+            body = json.dumps({"from": who, "text": args["text"]}).encode()
+            try:
+                req = urllib.request.Request(
+                    base + "/say", data=body,
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    got = json.load(resp)
+            except Exception as exc:
+                return (f"the room is not answering on {base} ({exc}). "
+                        f"Start it with: firecode chat serve")
+            return f"said it as {who} (#{got.get('id')})."
+
+        # chat_wait: the mark lives here, keyed by name, so the call takes no
+        # cursor and two readers do not consume each other's messages.
+        limit = min(int(args.get("timeout", 300)), 900)
+        marks = getattr(call_tool, "_chat_marks", None)
+        if marks is None:
+            marks = call_tool._chat_marks = {}
+        mark = marks.get(who, None)
+        started = time.time()
+        while True:
+            left = max(1, int(limit - (time.time() - started)))
+            try:
+                with urllib.request.urlopen(
+                        f"{base}/messages?since={mark or 0}&wait={min(left, 60)}",
+                        timeout=left + 30) as resp:
+                    got = json.load(resp)
+            except Exception as exc:
+                return (f"the room is not answering on {base} ({exc}). "
+                        f"Start it with: firecode chat serve")
+            msgs = got.get("messages") or []
+            if mark is None:
+                # First call: start from now rather than replaying the whole
+                # room, which is history the caller did not ask for.
+                marks[who] = got.get("last", 0)
+                mark = marks[who]
+                if time.time() - started >= limit:
+                    return "nothing said yet (you are now listening from here on)."
+                continue
+            if msgs:
+                marks[who] = got.get("last", mark)
+            fresh = [m for m in msgs if m.get("from") != who]
+            if fresh:
+                return "\n".join(
+                    "[%s] %s: %s" % (time.strftime("%H:%M:%S", time.localtime(m["at"])),
+                                     m["from"], m["text"]) for m in fresh)
+            if time.time() - started >= limit:
+                return f"nobody said anything in {limit}s."
 
     if name == "vm_say":
         path = _project_path(cfg, args["project"])

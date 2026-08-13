@@ -2202,15 +2202,21 @@ cmd_chat() {
 		while (($(date +%s) < deadline)); do
 			out=$(FIRECODE_CHAT_MARK="$mark_file" curl -s -m $((wait + 30)) \
 				"http://127.0.0.1:$port/messages?since=$since&wait=$wait" |
-				FIRECODE_CHAT_MARK="$mark_file" python3 -c '
+				FIRECODE_CHAT_MARK="$mark_file" FIRECODE_CHAT_SELF="$who" python3 -c '
 import json, os, sys, time
 d = json.load(sys.stdin)
+me = os.environ.get("FIRECODE_CHAT_SELF", "")
 for m in d.get("messages", []):
+    # Not your own. Waiting on a room you also speak in means every message
+    # you send wakes you up to tell you what you just said, which for an
+    # agent costs a turn each time.
+    if m.get("from") == me:
+        continue
     stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
     print("[%s] %s: %s" % (stamp, m["from"], m["text"]))
 if d.get("messages"):
-    # Written here rather than by the shell, so the mark only moves for
-    # messages that were actually printed.
+    # The mark moves past everything that was read, including your own -
+    # otherwise the next call reads them again and skips them again forever.
     with open(os.environ["FIRECODE_CHAT_MARK"], "w") as fh:
         fh.write(str(d.get("last", 0)))' 2>/dev/null)
 			[[ -n $out ]] && {

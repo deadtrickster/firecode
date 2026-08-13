@@ -127,6 +127,21 @@ vm_ps    project=lab                      → whether it is still going
 And when the slow thing is an agent rather than a command, that is what
 `spawn` is: it returns a run id immediately and `status` collects it.
 
+### Run an agent inside a VM
+
+Use `spawn`. Not `vm_in` with an agent command in it.
+
+```
+spawn project=lab task="..." verify="./run-tests.sh"
+```
+
+An agent is not an ordinary command. claude in print mode wants its prompt on
+stdin under `--input-format stream-json`; opencode's `run` is driven through a
+server it attaches to, and a bare `opencode run` in an exec channel prints
+nothing at all and looks exactly like a hang. `spawn` sets all of that up.
+Somebody lost several minutes to the silent version of this before it was
+written down.
+
 ### Run a service and reach it from outside
 
 ```
