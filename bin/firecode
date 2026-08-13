@@ -3937,48 +3937,196 @@ cmd_gc() {
 	fi
 }
 
+# What a new setup is missing, and what to type to fix each thing.
+#
+# A tick beside a name is not much use to somebody who has never run this: the
+# useful part is which of these stops a run outright, which only costs a
+# convenience, and the one command that fixes it. So every check carries its
+# own fix, failures are separated from warnings, and anything that is present
+# says which one it found - a rootfs that exists but was built before the
+# guest scripts changed is a different problem from no rootfs at all.
+DOC_OK=0
+DOC_BAD=0
+DOC_WARN=0
+declare -a DOC_FIXES=()
+
+# doc_check <fail|warn> <label> <test> <detail-when-ok> <fix>
+doc_check() {
+	local severity=$1 label=$2 test=$3 detail=${4:-} fix=${5:-}
+	if eval "$test" >/dev/null 2>&1; then
+		printf '  ok    %-38s %s\n' "$label" "$detail"
+		DOC_OK=$((DOC_OK + 1))
+		return 0
+	fi
+	if [[ $severity == warn ]]; then
+		printf '  warn  %-38s %s\n' "$label" "${fix:+see below}"
+		DOC_WARN=$((DOC_WARN + 1))
+	else
+		printf '  FAIL  %-38s %s\n' "$label" "${fix:+see below}"
+		DOC_BAD=$((DOC_BAD + 1))
+	fi
+	[[ -n $fix ]] && DOC_FIXES+=("$label|$fix")
+	return 1
+}
+
+doc_info() { printf '  --    %-38s %s\n' "$1" "$2"; }
+
 cmd_doctor() {
-	local ok=0 bad=0
-	check() {
-		if eval "$2" >/dev/null 2>&1; then
-			printf '  ok    %s\n' "$1"
-			ok=$((ok + 1))
-		else
-			printf '  FAIL  %s\n' "$1"
-			bad=$((bad + 1))
-		fi
-	}
 	echo "firecode doctor"
-	check "kvm accessible (/dev/kvm)" "test -r /dev/kvm -a -w /dev/kvm"
-	check "firecracker installed" "test -x '$FC'"
-	check "jailer installed" "test -x '$JAILER'"
-	check "guest kernel present" "compgen -G '$IMAGES/vmlinux-*'"
-	check "guest rootfs built" "test -f '$IMAGES/agent-firecode.ext4'"
-	check "docker usable (for prepare)" "docker info"
-	check "mkfs.ext4 present" "command -v mkfs.ext4 || test -x /usr/sbin/mkfs.ext4"
-	check "debugfs present" "command -v debugfs || test -x /usr/sbin/debugfs"
-	check "socat present (MCP relay)" "command -v socat"
-	check "rsync present" "command -v rsync"
-	check "iptables present" "command -v iptables || test -x /usr/sbin/iptables"
+	echo
+	echo " virtualisation"
+	doc_check fail "kvm usable (/dev/kvm)" "test -r /dev/kvm -a -w /dev/kvm" \
+		"" "sudo usermod -aG kvm $(id -un)   # then log out and back in"
+	doc_check warn "vsock available" "test -e /dev/vhost-vsock" \
+		"$([[ -e /dev/vhost-vsock ]] && echo 'console and exec channels work')" \
+		"sudo modprobe vhost_vsock   # without it, no 'enter', 'in', 'ps' or 'say'"
+
+	echo
+	echo " firecode's own pieces"
+	doc_check fail "firecracker" "test -x '$FC'" \
+		"$("$FC" --version 2>/dev/null | head -1)" "firecode setup"
+	doc_check fail "jailer" "test -x '$JAILER'" "" "firecode setup"
+	doc_check fail "guest kernel" "compgen -G '$IMAGES/vmlinux-*'" \
+		"$(basename "$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -printf '%T@ %p\n' 2>/dev/null |
+			sort -rn | head -1 | cut -d' ' -f2-)" 2>/dev/null)" \
+		"firecode setup"
+	doc_check fail "guest rootfs" "test -f '$IMAGES/agent-firecode.ext4'" \
+		"$(du -h "$IMAGES/agent-firecode.ext4" 2>/dev/null | cut -f1)" \
+		"firecode prepare        # needs docker, but no root"
+	doc_check warn "docker (only for prepare)" "docker info" "" \
+		"install docker and add yourself to the docker group - only 'prepare' needs it"
+
+	echo
+	echo " host tools"
+	doc_check fail "mkfs.ext4" "command -v mkfs.ext4 || test -x /usr/sbin/mkfs.ext4" \
+		"" "sudo apt install e2fsprogs"
+	doc_check fail "debugfs" "command -v debugfs || test -x /usr/sbin/debugfs" \
+		"" "sudo apt install e2fsprogs   # reads guest disks without mounting them"
+	doc_check fail "socat" "command -v socat" "" \
+		"sudo apt install socat   # every host port a guest reaches goes through it"
+	doc_check fail "rsync" "command -v rsync" "" "sudo apt install rsync"
+	doc_check fail "python3" "command -v python3" \
+		"$(python3 -V 2>&1 | cut -d' ' -f2)" "sudo apt install python3"
+	doc_check warn "iptables" "command -v iptables || test -x /usr/sbin/iptables" \
+		"" "sudo apt install iptables   # guests have no network without it"
+	doc_check warn "curl" "command -v curl" "" "sudo apt install curl"
+
+	echo
+	echo " privileges - each of these is a prompt you would otherwise get every run"
 	# The jailer specifically, not sudo in general: a correctly scoped rule
 	# grants this one binary, so `sudo -n true` failing proves nothing.
-	check "jailer runs without a password" "sudo -n '$JAILER' --version"
-	check "a tap is ready (firecode net-setup)" "ip link show fccode1"
-	check "claude on host" "command -v claude"
+	doc_check warn "jailer runs unprompted" "sudo -n '$JAILER' --version" "" \
+		"sudo $SCRIPTS/install-privileged.sh   # or run with --no-jail"
+	doc_check warn "a tap is ready" "ip link show fccode1" \
+		"$(ip -o link show 2>/dev/null | grep -c fccode) tap(s)" \
+		"sudo $ROOT/bin/firecode net-setup --count 4"
+	# Delegation is what lets a run put its VM in its own cgroup and kill the
+	# whole tree at the end - including any VM the agent started itself.
+	local cg
+	cg="/sys/fs/cgroup$(awk -F: '/^0::/{print $3}' /proc/self/cgroup 2>/dev/null)"
+	doc_check warn "cgroup delegation" "test -w '$cg/cgroup.subtree_control'" \
+		"$(basename "$cg")" \
+		"systemd should delegate this to your user session - without it a child VM can outlive its parent"
+
 	echo
-	echo "  $ok ok, $bad failed"
-	if ! sudo -n "$JAILER" --version >/dev/null 2>&1; then
+	echo " agents"
+	doc_check warn "claude" "command -v claude" "$(claude --version 2>/dev/null)" \
+		"install Claude Code on the host - the VM runs the host's binary"
+	doc_check warn "opencode" "command -v opencode" "$(opencode --version 2>/dev/null)" \
+		"install opencode on the host if you want to run it in a VM"
+	doctor_credentials
+
+	echo
+	echo " capacity"
+	doc_info "memory" "$(free -g 2>/dev/null | awk '/^Mem:/{print $7" GB available of "$2" GB"}')"
+	doc_info "disk for images and state" \
+		"$(df -h "$IMAGES" 2>/dev/null | awk 'NR==2{print $4" free of "$2}')"
+	# The same test the rest of the harness uses: the kernel publishes a
+	# separate PMU per core type, which is the only honest signal that this is
+	# a hybrid part - /proc/cpuinfo does not say so.
+	doc_info "cpu" "$(nproc) threads$([[ -d /sys/devices/cpu_atom ]] &&
+		echo ", hybrid P+E - measure with --vectorized")"
+
+	echo
+	printf '  %d ok, %d warning(s), %d failure(s)\n' "$DOC_OK" "$DOC_WARN" "$DOC_BAD"
+	if ((${#DOC_FIXES[@]})); then
 		echo
-		echo "  Jailed runs will prompt for a password. To stop that:"
-		echo "      sudo $SCRIPTS/install-privileged.sh"
-		echo "  Or skip the jailer entirely with --no-jail."
+		echo "  what to do:"
+		local entry
+		for entry in "${DOC_FIXES[@]}"; do
+			printf '    %s\n        %s\n' "${entry%%|*}" "${entry#*|}"
+		done
 	fi
-	if ! ip link show fccode1 >/dev/null 2>&1; then
+	if ((DOC_BAD == 0 && DOC_WARN == 0 && ${#DOC_FIXES[@]} == 0)); then
 		echo
-		echo "  Networking will need root on every run. To stop that:"
-		echo "      sudo $ROOT/bin/firecode net-setup --count 4"
+		echo "  Nothing missing. Try: firecode claude -p 'say hello'"
+	elif ((DOC_BAD == 0)); then
+		echo
+		echo "  Nothing here stops a run. Try: firecode claude -p 'say hello'"
 	fi
-	((bad == 0))
+	((DOC_BAD == 0))
+}
+
+# Credentials are the one part where "present" is not the same as "usable",
+# and where the wrong arrangement is silent until a run has already burned it.
+doctor_credentials() {
+	if [[ -f $CLAUDE_HOME/.credentials.json ]]; then
+		local exp
+		exp=$(python3 -c '
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1])).get("claudeAiOauth") or {}
+except Exception:
+    print("unreadable")
+    raise SystemExit
+at = d.get("expiresAt")
+if not at:
+    print("no expiry recorded")
+elif at / 1000 < time.time():
+    print("EXPIRED")
+else:
+    print("valid for %d min" % ((at / 1000 - time.time()) / 60))
+' "$CLAUDE_HOME/.credentials.json" 2>/dev/null || echo unknown)
+		if [[ $exp == EXPIRED ]]; then
+			printf '  warn  %-38s %s\n' "claude credentials" "expired on the host"
+			DOC_WARN=$((DOC_WARN + 1))
+			DOC_FIXES+=("claude credentials|run 'claude' on the host once to refresh, then use --auth-relay so the VM never holds a token")
+		else
+			printf '  ok    %-38s %s\n' "claude credentials" "$exp"
+			DOC_OK=$((DOC_OK + 1))
+		fi
+	else
+		printf '  warn  %-38s %s\n' "claude credentials" "none on the host"
+		DOC_WARN=$((DOC_WARN + 1))
+		DOC_FIXES+=("claude credentials|log in with 'claude' on the host - a VM cannot log in for you")
+	fi
+
+	[[ -f $OPENCODE_SHARE/auth.json ]] || return 0
+	local kind
+	kind=$(python3 -c '
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+for name, v in d.items():
+    if not isinstance(v, dict):
+        continue
+    if v.get("type") == "oauth":
+        at = (v.get("expires") or 0) / 1000
+        state = "expired" if at and at < time.time() else "valid"
+        print("%s: subscription login, %s" % (name, state))
+    else:
+        print("%s: api key" % name)
+' "$OPENCODE_SHARE/auth.json" 2>/dev/null | tr '\n' '; ')
+	printf '  ok    %-38s %s\n' "opencode credentials" "${kind:-present}"
+	DOC_OK=$((DOC_OK + 1))
+	# A subscription login rotates on refresh, so a copy inside a VM spends
+	# the host's token. The relay is the whole answer, and it is worth saying
+	# before a run does it rather than after.
+	if [[ $kind == *"subscription login"* ]]; then
+		DOC_FIXES+=("opencode credentials|a subscription login rotates when it refreshes, so run opencode with --auth-relay - a copy in a VM leaves the host holding a spent token")
+		if [[ $kind == *expired* ]]; then
+			DOC_FIXES+=("opencode credentials (expired)|opencode auth login")
+		fi
+	fi
 }
 
 usage() {

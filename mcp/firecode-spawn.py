@@ -394,7 +394,9 @@ def build_tools(cfg):
         },
         {
             "name": "vm_list",
-            "description": "The VMs running now, and which project each is for.",
+            "description": ("The VMs running now, which project each is for, "
+                            "and which of them are yours - the rest belong to "
+                            "other runs and are working on something."),
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
@@ -684,7 +686,9 @@ def call_tool(cfg, runs, name, args, caller_run=None):
 
     if name == "vm_list":
         rc, out = _firecode(["list"], timeout=60)
-        return out or "(nothing running)"
+        if not out:
+            return "(nothing running)"
+        return out + _ownership_note(caller_run)
 
     if name == "list_projects":
         if not cfg.projects:
@@ -726,6 +730,38 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         return runs.cancel(args["run_id"])
 
     raise ValueError(f"no such tool {name!r}")
+
+
+def _ownership_note(caller_run):
+    """Who each VM belongs to, said plainly rather than enforced.
+
+    Stopping another project's VM is allowed: an agent may legitimately be
+    orchestrating across projects, and a rule that forbade it would break that
+    for the sake of a mistake that is better prevented by knowing. So this
+    says which of these are yours and which are somebody else's work, and
+    leaves the decision where it belongs.
+    """
+    if not caller_run:
+        return ("\n\nYou are on the host, so all of these are yours to stop. "
+                "A VM in this list may still be working - vm_ps before "
+                "stopping one.")
+    mine, others = [], []
+    for line in _firecode(["list", "--ids"], timeout=60)[1].splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        run_id, project = fields[0], fields[1]
+        # Yours by descent as well as by identity: a VM you spawned carries
+        # your run in its cgroup path, and it is still yours two levels down.
+        (mine if run_id == caller_run or caller_run in run_id
+         else others).append(f"{run_id} ({project})")
+    note = ["", "", f"You are {caller_run}."]
+    note.append("  yours:  " + (", ".join(mine) if mine else "none"))
+    note.append("  others: " + (", ".join(others) if others else "none"))
+    note.append("Stopping another's VM is permitted - you may be orchestrating "
+                "across projects - but it is somebody's work in progress, so "
+                "read vm_ps first and say what you stopped.")
+    return "\n".join(note)
 
 
 def _peer_run_id(client_address, server_port):
