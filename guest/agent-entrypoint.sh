@@ -197,15 +197,47 @@ print(sorted(d, key=lambda s: s.get("time", {}).get("created", 0))[-1]["id"] if 
 fi
 
 INBOX=/tmp/firecode-agent-inbox
+# Named here rather than where it is written, because the watcher below reads
+# it and a variable that is still empty when the watcher starts makes the
+# watcher a no-op - which is a run that never closes its own stdin and ends at
+# its timeout hours after it finished.
+RAW=/tmp/firecode-agent-stream.jsonl
 if ((STREAM)); then
-	rm -f "$INBOX"
+	rm -f "$INBOX" "$INBOX.stamp" "$INBOX.close"
 	if mkfifo "$INBOX" 2>/dev/null; then
 		chmod 666 "$INBOX"
-		# Opened read-write and never used: holding the descriptor is the
-		# whole point. It keeps a writer on the fifo so the agent's stdin
-		# never reaches EOF between turns.
-		# shellcheck disable=SC2034  # held open deliberately, not read
-		exec {INBOX_FD}<>"$INBOX"
+		# A separate process holds the write end, rather than this shell.
+		#
+		# Something has to, or the agent's stdin reaches EOF the moment the
+		# prompt has been written and it never takes another turn. But held
+		# forever it never *stops* taking turns either: an agent that has
+		# finished sits waiting for input that is not coming, and a run that
+		# took ten seconds ends at its timeout hours later. So the holder is
+		# a process that can be told to let go.
+		# Opened read-write, which is the only way to open a fifo without
+		# waiting: a plain > blocks until a reader arrives, and the reader is
+		# the agent, which this script has not started yet.
+		# shellcheck disable=SC2016  # $1 is the holder's own argument, not ours
+		setsid bash -c 'exec 3<>"$1"; while [[ ! -f "$1.close" ]]; do sleep 2; done' \
+			_ "$INBOX" >/dev/null 2>&1 &
+		INBOX_HOLDER=$!
+
+		# What tells it to let go: the agent has reported a result, and
+		# nothing has been said to it since. `firecode say` touches the stamp,
+		# so a conversation keeps the run alive and silence ends it.
+		(
+			# Long enough to say something into a run that has just finished,
+			# short enough that a ten-second job does not cost three minutes.
+			idle=${FIRECODE_INBOX_IDLE:-60}
+			while [[ ! -f "$INBOX.close" ]]; do
+				sleep 5
+				grep -q '"type":"result"' "$RAW" 2>/dev/null || continue
+				last=$(stat -c %Y "$INBOX.stamp" 2>/dev/null || echo 0)
+				quiet=$(stat -c %Y "$RAW" 2>/dev/null || echo 0)
+				((last > quiet)) && quiet=$last
+				(($(date +%s) - quiet >= idle)) && touch "$INBOX.close"
+			done
+		) &
 	else
 		log "no inbox: could not create $INBOX - this run cannot be spoken to"
 		INBOX=""
@@ -263,7 +295,6 @@ if ((STREAM)); then
 	# So the agent writes to a file it owns, and the narrator tails it. If the
 	# narrator dies, the run does not notice, and the raw stream is still on
 	# disk to read afterwards.
-	RAW=/tmp/firecode-agent-stream.jsonl
 	: >"$RAW"
 	chmod 666 "$RAW" 2>/dev/null || true
 	tail -n +1 -F "$RAW" 2>/dev/null | narrate &
@@ -272,6 +303,8 @@ if ((STREAM)); then
 	# say` writes later arrives on the same channel. json.dumps rather than
 	# hand-quoting, because a prompt is arbitrary text - quotes, newlines,
 	# backslashes - and one wrong escape makes the whole run a parse error.
+	# In the background: this write waits for the agent to open the other end,
+	# and the agent is started by the next statement.
 	if [[ -n $INBOX && -n $PROMPT ]]; then
 		FIRECODE_MSG=$PROMPT python3 -c '
 import json, os, sys
@@ -279,7 +312,7 @@ sys.stdout.write(json.dumps({
     "type": "user",
     "message": {"role": "user", "content": os.environ["FIRECODE_MSG"]},
 }) + "\n")
-' >"$INBOX"
+' >"$INBOX" &
 	fi
 	if [[ $RUN_USER == root ]]; then
 		env "${ENV[@]}" "${CMD[@]}" <"${INBOX:-/dev/null}" >"$RAW" 2>&1 || rc=$?
@@ -290,6 +323,9 @@ sys.stdout.write(json.dumps({
 	# Let it drain what is left before it goes.
 	sleep 1
 	kill "$NARRATOR" 2>/dev/null || true
+	touch "$INBOX.close" 2>/dev/null || true
+	[[ -n ${INBOX_HOLDER:-} ]] && kill "$INBOX_HOLDER" 2>/dev/null
+	rm -f "$INBOX" "$INBOX.stamp" "$INBOX.close"
 elif [[ -n ${OC_SERVER:-} ]]; then
 	if [[ $RUN_USER == root ]]; then
 		env "${ENV[@]}" "${CMD[@]}" </dev/null || rc=$?
@@ -311,5 +347,57 @@ fi
 echo
 log "agent exited with status $rc"
 echo "$rc" >"$PROJECT/.firecode-exit-status" 2>/dev/null || true
+
+# The gate.
+#
+# Run here rather than on the host because this is where the toolchain is: the
+# agent spent an hour installing a compiler, a database, a Lisp - and the same
+# check on the host would fail for want of all of it and prove nothing. Run
+# after the agent has exited, in the project directory as it will be handed
+# over, so nothing the agent's own process was holding can make it pass.
+#
+# Its output goes into the delivered tree. A verification whose result only
+# ever appeared on a console that scrolled away is worth about as much as the
+# claim it was meant to replace.
+if [[ -n ${FIRECODE_VERIFY:-} ]]; then
+	echo
+	log "verifying: $FIRECODE_VERIFY"
+	vrc=0
+	vlog="$PROJECT/.firecode-verify.log"
+	started=$SECONDS
+	{
+		echo "# firecode verification"
+		echo "# command: $FIRECODE_VERIFY"
+		echo "# run after the agent exited, in $PROJECT"
+		echo
+	} >"$vlog" 2>/dev/null || vlog=/tmp/firecode-verify.log
+	if [[ $RUN_USER == root ]]; then
+		timeout --signal=TERM --kill-after=30s "${FIRECODE_VERIFY_TIMEOUT:-1800}" \
+			env "${ENV[@]}" bash -lc "cd $(printf '%q' "$PROJECT") && $FIRECODE_VERIFY" \
+			</dev/null >>"$vlog" 2>&1 || vrc=$?
+	else
+		timeout --signal=TERM --kill-after=30s "${FIRECODE_VERIFY_TIMEOUT:-1800}" \
+			runuser -u "$RUN_USER" -- env "${ENV[@]}" \
+			bash -lc "cd $(printf '%q' "$PROJECT") && $FIRECODE_VERIFY" \
+			</dev/null >>"$vlog" 2>&1 || vrc=$?
+	fi
+	took=$((SECONDS - started))
+
+	# The last lines on the console, because a failure nobody sees is the
+	# problem this exists to solve. The whole output stays in the log.
+	tail -n 25 "$vlog" 2>/dev/null | sed 's/^/  /'
+	echo "$vrc" >"$PROJECT/.firecode-verify-status" 2>/dev/null || true
+	if ((vrc == 0)); then
+		log "verification passed in ${took}s"
+	elif ((vrc == 124)); then
+		log "verification hit its ${FIRECODE_VERIFY_TIMEOUT:-1800}s timeout - reported as a failure"
+	else
+		log "VERIFICATION FAILED (exit $vrc) after ${took}s - the full output is in .firecode-verify.log"
+	fi
+	# A failed check outranks a cheerful agent: what this run reports is
+	# whether the work can be used, not whether the agent thought so.
+	((vrc == 0)) || rc=$vrc
+fi
+
 sync
 exit "$rc"

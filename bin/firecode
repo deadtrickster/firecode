@@ -57,9 +57,14 @@ PARENT_RUN=""
 VMM="${FIRECODE_VMM:-firecracker}"
 VECTORIZED=0
 DELIVER=""
+# The command that decides whether the work is usable, run by the harness
+# after the agent has finished and before anything is handed back.
+VERIFY=""
+VERIFY_TIMEOUT="${FIRECODE_VERIFY_TIMEOUT:-1800}"
 # Authenticate guests through the host instead of copying a token into each.
 AUTH_RELAY=0
 AUTH_RELAY_PORT=""
+AUTH_RELAY_PID=""
 API_BASE=""
 HYBRID=0
 PCORES=""
@@ -2474,6 +2479,13 @@ relays_down() {
 		kill "$pid" 2>/dev/null || true
 	done
 	RELAY_PIDS=()
+	# The auth relay holds this machine's credentials and answers on a port.
+	# Leaving it behind is both a process nobody owns and a port the next run
+	# may draw and mistake for its own.
+	if [[ -n ${AUTH_RELAY_PID:-} ]]; then
+		kill "$AUTH_RELAY_PID" 2>/dev/null || true
+		AUTH_RELAY_PID=""
+	fi
 }
 
 # ---------------------------------------------------------------- arguments
@@ -2663,6 +2675,22 @@ launch() {
 			# and cannot rotate your desktop's login out from under it.
 			AUTH_RELAY=1
 			shift
+			;;
+		--verify)
+			# What must pass for the work to count, checked by the harness
+			# rather than reported by the agent.
+			#
+			# An agent saying "success" is a claim about a process that is
+			# about to stop, made by the only party who could have checked it
+			# and did not. Both runs that lied tonight lied in that gap. So
+			# this runs after the agent exits, in the project as it will be
+			# handed over, and its result is what firecode reports.
+			VERIFY="$2"
+			shift 2
+			;;
+		--verify-timeout)
+			VERIFY_TIMEOUT="$2"
+			shift 2
 			;;
 		--deliver)
 			# Where the work should end up when the run finishes. Without
@@ -2991,24 +3019,45 @@ launch() {
 	# it. Started here rather than by hand because it has to outlive nothing
 	# and be gone with the run.
 	if ((AUTH_RELAY)); then
-		AUTH_RELAY_PORT=${AUTH_RELAY_PORT:-$((9800 + RANDOM % 100))}
 		# Which credentials are being kept out of the VM depends on which agent
 		# is going to ask for them.
 		local relay_provider=claude
 		[[ $AGENT == opencode ]] && relay_provider=xai
-		if ! ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT "; then
-			setsid python3 "$SCRIPTS/auth-relay.py" --port "$AUTH_RELAY_PORT" \
-				--provider "$relay_provider" \
-				>"$RUN_DIR/auth-relay.log" 2>&1 &
-			disown 2>/dev/null || true
-			local waited=0
-			while ((waited < 40)) && ! ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT "; do
-				sleep 0.1
-				waited=$((waited + 1))
+
+		# A free port, never one that is already answering.
+		#
+		# This used to take a random port and reuse whatever was listening on
+		# it, which is only safe if every relay relays the same thing. Since
+		# they do not, a claude run could inherit an opencode run's relay and
+		# have its requests authenticated against xAI - which answers "Model
+		# not found: claude-opus-5" and looks like an outage rather than a
+		# mix-up.
+		if [[ -z $AUTH_RELAY_PORT ]]; then
+			local try=0
+			while ((try < 50)); do
+				AUTH_RELAY_PORT=$((9800 + RANDOM % 100))
+				ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT " || break
+				AUTH_RELAY_PORT=""
+				try=$((try + 1))
 			done
+			[[ -n $AUTH_RELAY_PORT ]] || die "no free relay port in 9800-9899"
 		fi
+		setsid python3 "$SCRIPTS/auth-relay.py" --port "$AUTH_RELAY_PORT" \
+			--provider "$relay_provider" \
+			>"$RUN_DIR/auth-relay.log" 2>&1 &
+		AUTH_RELAY_PID=$!
+		disown 2>/dev/null || true
+		local waited=0
+		while ((waited < 40)) && ! ss -ltn 2>/dev/null | grep -q ":$AUTH_RELAY_PORT "; do
+			sleep 0.1
+			waited=$((waited + 1))
+		done
+		# Its pid on disk as well as in a variable: the relay outlives the
+		# shell that started it, and something has to be able to end it after
+		# a run that died without cleaning up.
+		echo "$AUTH_RELAY_PID" >"$RUN_DIR/auth-relay.pid"
 		HOST_PORTS+=("$AUTH_RELAY_PORT")
-		log "authenticating through this host on port $AUTH_RELAY_PORT - the VM gets no token"
+		log "authenticating through this host on port $AUTH_RELAY_PORT ($relay_provider) - the VM gets no token"
 	fi
 
 	# nothing and exits 1, which under `set -e` takes the whole run down.
@@ -3166,8 +3215,36 @@ launch() {
 			echo "FIRECODE_GATEWAY=172.16.SLOT.1"
 			echo "FIRECODE_DNS='1.1.1.1 8.8.8.8'"
 		fi
+		if [[ -n $VERIFY ]]; then
+			echo "FIRECODE_VERIFY=$(printf '%q' "$VERIFY")"
+			echo "FIRECODE_VERIFY_TIMEOUT='$VERIFY_TIMEOUT'"
+		fi
+		# How long a finished run stays open to be spoken to. Worth raising
+		# when something is supervising the run and may want to interject.
+		[[ -n ${FIRECODE_INBOX_IDLE:-} ]] &&
+			echo "FIRECODE_INBOX_IDLE='$FIRECODE_INBOX_IDLE'"
 	} >"$ctl_stage/env"
-	cp -f "$GUEST/firecode-context.md" "$ctl_stage/context.md"
+	{
+		cat "$GUEST/firecode-context.md"
+		# Said here rather than left as a surprise: an agent that knows which
+		# command decides the outcome can aim at it, and one that does not
+		# finds out after it has stopped, which helps nobody.
+		if [[ -n $VERIFY ]]; then
+			cat <<-EOF
+
+				## What will be run after you finish
+
+				\`$VERIFY\`
+
+				The harness runs this itself once you exit, in the project
+				directory as it will be handed over, and its exit status is
+				what this run reports. You are not asked to trust it or to
+				remember it - run it yourself, as often as you like, and fix
+				what it says. A run whose agent claimed success and whose
+				verification failed is reported as a failure.
+			EOF
+		fi
+	} >"$ctl_stage/context.md"
 
 	# The guest scripts ride along on the control drive and take precedence
 	# over the copies baked into the image, so changing the harness does not
@@ -3632,6 +3709,18 @@ EOF
 		if [[ -f $st ]]; then
 			log "agent exit status: $(cat "$st")"
 			rm -f "$st"
+		fi
+		# Said last, because it is the part that decides whether any of this
+		# is worth reading. The log stays in the delivered tree either way.
+		local vst="$out_dir/.firecode-verify-status"
+		if [[ -f $vst ]]; then
+			if [[ $(cat "$vst") == 0 ]]; then
+				log "verification passed - see $out_dir/.firecode-verify.log"
+			else
+				log "VERIFICATION FAILED (exit $(cat "$vst")) - $out_dir/.firecode-verify.log"
+				log "  whatever the agent said about this run, the check did not pass"
+			fi
+			rm -f "$vst"
 		fi
 
 		# A run that changed nothing should not leave a copy of your project
@@ -4197,6 +4286,10 @@ options (before the agent's own arguments):
   --mem MB        guest memory                      (default: 4096)
   --vcpu N        guest cpus                        (default: 4)
   --timeout SEC   kill the agent after SEC seconds  (default: none)
+  --verify CMD    run CMD in the project after the agent exits, and report
+                  its result as the run's. The agent is told what it is.
+                  Output lands in the delivered tree as .firecode-verify.log
+  --verify-timeout SEC                              (default: 1800)
   --no-net        no network at all
   --no-jail       skip the jailer (still a real VM, less hardening, no root)
   --no-tmux       do not wrap an interactive session in byobu/tmux

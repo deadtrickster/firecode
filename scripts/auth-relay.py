@@ -18,7 +18,7 @@ So: one holder of the credentials, and an endpoint for everyone else. This
 reads the host's current token per request - so whenever the host refreshes,
 guests follow immediately - strips whatever a guest sent, and forwards.
 
-    auth-relay.py --port 9770 [--provider claude|xai] [--upstream URL]
+    auth-relay.py --port 9790 [--provider claude|xai] [--upstream URL]
 
 Point a guest at it - ANTHROPIC_BASE_URL for claude, the provider's baseURL in
 opencode's config for xai - and give it no credentials at all.
@@ -248,7 +248,10 @@ class Relay(BaseHTTPRequestHandler):
 
 def main(argv):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=9770)
+    # Not 9770: that is the spawn server's default, and two things whose
+    # defaults collide only ever meet as "address already in use" from
+    # whichever was started second.
+    ap.add_argument("--port", type=int, default=9790)
     ap.add_argument("--provider", choices=sorted(PROVIDERS), default="claude")
     ap.add_argument("--upstream", default="")
     args = ap.parse_args(argv)
