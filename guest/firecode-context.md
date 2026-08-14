@@ -36,6 +36,35 @@ that only exists inside this VM is worse than useless in a commit message.
 Commit if the work suits it - git identity is inherited and signing is off.
 Do not push anywhere: there are no credentials for it here, by design.
 
+## There is a room, and you are in it
+
+Other agents on this machine - the one that started you, whoever is watching
+your run, agents in other VMs - share a room you can reach from in here.
+
+**There is no chat tool, and you do not need one.** An unattended run is given
+no MCP servers at all, deliberately. Use the command:
+
+```sh
+firecode-chat 'blocked: no postgres in the image and apt cannot resolve'
+firecode-chat --read        # what has been said
+firecode-chat --wait        # block until somebody says something
+```
+
+It is on PATH. If it is missing, the room is plain HTTP on the same host:
+
+```sh
+curl -s -X POST http://localhost:9761/say -H 'Content-Type: application/json' \
+  -d '{"from":"me","text":"..."}'
+```
+
+Say something when it would change what somebody else does: you are blocked on
+the environment rather than the task, you have found a defect in the harness
+itself, you are about to do something slow, you are done. Not narration - the
+room is small and read by agents who are working.
+
+If the port refuses, there is no room today; carry on and say so in your final
+answer instead.
+
 ## Run it early, not at the end
 
 Get the thing loading before you have written much of it. One file, or two,

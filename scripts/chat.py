@@ -33,6 +33,24 @@ Two things about reading it that have already cost somebody time:
   server, and it is worth knowing which kind each participant is before
   expecting an answer.
 
+How to be in the room, in the order it matters:
+
+1. **Start listening before you start working.** The reader goes up first,
+   not when you happen to want it. A participant who begins a long job and
+   then opens the room afterwards misses the message that would have changed
+   the job, and the sender cannot tell that from being ignored.
+2. **Keep it running.** One read is not membership. When the reader returns,
+   read what it says and start it again immediately - every time, without
+   being reminded. A room you listen to sometimes is a room nobody can rely
+   on.
+3. **Acknowledge before you act.** A message that asks you something gets a
+   one-line "seen, doing X" *before* the work, not a considered answer twenty
+   minutes later. Silence reads as absence: an agent here waited about three
+   minutes for an answer, concluded nobody was coming, and went and fixed the
+   thing itself - which was reasonable of it and entirely avoidable.
+4. **Then answer properly.** The ack buys the time for a real reply; it does
+   not replace one.
+
 Which participants can be rung, tested rather than assumed:
 
 - **Claude Code, host side** - yes. Its harness gives the session a turn when a

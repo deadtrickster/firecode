@@ -1732,6 +1732,22 @@ memcheck_stamp() {
 	{
 		printf 'shape:%s:%s:%s\n' "$MEM" "$VCPU" "$NONET"
 		printf 'project:%s\n' "$(dir_fingerprint "$project" 2>/dev/null || echo none)"
+		# The agent's binary, not the drive that carries it.
+		#
+		# The config drive used to be stamped whole, which made this question
+		# "has anything on the host that feeds that drive moved" - credentials
+		# rotating, a briefing edited, a settings file touched. None of those
+		# describe guest memory, and all of them expired every checkpoint on
+		# the machine whenever they happened. The drive itself is pinned into
+		# the checkpoint now, so what is left to ask is whether the program
+		# that would run after a restore is the same one, and that is the
+		# binary.
+		local bin
+		bin=$(command -v "${AGENT:-claude}" 2>/dev/null || true)
+		if [[ -n $bin ]]; then
+			printf 'agent:%s:%s\n' "${AGENT:-claude}" \
+				"$(stat -Lc '%s:%Y' "$bin" 2>/dev/null || echo none)"
+		fi
 		for f in "$@"; do
 			# || continue rather than && printf: a missing file leaves the
 			# loop - and so the brace group - with a failing status, which
@@ -1786,6 +1802,25 @@ memcheck_save() {
 	# out costs nothing and keeps a 4G VM from being a 4G file.
 	fallocate -d "$tmp/mem" 2>/dev/null || true
 	printf '%s\n' "$stamp" >"$tmp/stamp"
+
+	# Pin the config drive this memory describes.
+	#
+	# It is read-only and shared between runs, so it was never copied - but
+	# it is also rebuilt whenever anything on the host that feeds it moves,
+	# and a rebuild replaces the file. A guest resumed against a different
+	# image than its memory describes is corruption, so the checkpoint used to
+	# be invalidated by the rebuild instead: editing an agent briefing expired
+	# every checkpoint on the machine, none of which had anything to do with
+	# it.
+	#
+	# A hard link costs nothing and pins the exact inode. The rebuild unlinks
+	# the shared name and writes a new file; this link keeps the old bytes
+	# alive for as long as the checkpoint wants them, and a restore attaches
+	# these rather than whatever the shared name points at now.
+	if [[ -n ${CFG_DRIVE:-} && -f $CFG_DRIVE ]]; then
+		ln "$CFG_DRIVE" "$tmp/roconfig.ext4" 2>/dev/null ||
+			cp --sparse=always "$CFG_DRIVE" "$tmp/roconfig.ext4" || return 1
+	fi
 
 	rm -rf "$dest"
 	mv "$tmp" "$dest"
@@ -2122,10 +2157,14 @@ cmd_chat() {
 	# worse than one on an odd port.
 	local port=${FIRECODE_CHAT_PORT:-9761} who=${FIRECODE_CHAT_NAME:-$(id -un)@host}
 	local mode=say since=0 wait=0
-	while [[ ${1:-} == -* || ${1:-} == serve ]]; do
+	while [[ ${1:-} == -* || ${1:-} == serve || ${1:-} == install ]]; do
 		case "${1:-}" in
 		serve)
 			mode=serve
+			shift
+			;;
+		install)
+			mode=install
 			shift
 			;;
 		--read)
@@ -2161,6 +2200,43 @@ cmd_chat() {
 		*) die "usage: firecode chat [serve|--read|--wait|--as NAME] [text...]" ;;
 		esac
 	done
+
+	if [[ $mode == install ]]; then
+		# A room that survives everything that started it.
+		#
+		# Run from a session, the room dies with the session - and the one
+		# thing a shared room must not be is as short-lived as its most
+		# talkative member. A user unit outlives sessions, reboots and the
+		# person who set it up, and needs no root.
+		local unit_dir="$HOME/.config/systemd/user"
+		mkdir -p "$unit_dir" "$RUNS"
+		cat >"$unit_dir/firecode-chat.service" <<-EOF
+			[Unit]
+			Description=firecode chat - the room agents on this machine talk in
+			Documentation=https://github.com/deadtrickster/firecode
+
+			[Service]
+			ExecStart=$(command -v python3) $SCRIPTS/chat.py --port $port --log $RUNS/chat.log
+			Restart=always
+			RestartSec=2
+			# Nothing here is secret, but nothing here needs privileges either.
+			NoNewPrivileges=true
+			PrivateTmp=false
+
+			[Install]
+			WantedBy=default.target
+		EOF
+		systemctl --user daemon-reload
+		systemctl --user enable --now firecode-chat.service
+		# Linger, or the room stops when the last login session ends - which
+		# is precisely when unattended runs are still going.
+		if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q "Linger=yes"; then
+			log "note: enable-linger is off, so this stops when your last session ends"
+			log "  fix with: sudo loginctl enable-linger $(id -un)"
+		fi
+		log "chat runs as a user service now: systemctl --user status firecode-chat"
+		return 0
+	fi
 
 	if [[ $mode == serve ]]; then
 		mkdir -p "$RUNS"
@@ -2221,6 +2297,13 @@ if d.get("messages"):
         fh.write(str(d.get("last", 0)))' 2>/dev/null)
 			[[ -n $out ]] && {
 				printf '%s\n' "$out"
+				# Said with the messages rather than in a document nobody
+				# rereads: an unanswered message is indistinguishable from an
+				# unread one, and the sender acts on that.
+				echo
+				echo "-- ack anything addressed to you before you work on it"
+				echo "-- ('firecode chat --as <you> \"seen, doing X\"'), then"
+				echo "-- start this waiter again so you stay in the room"
 				return 0
 			}
 		done
@@ -3437,6 +3520,19 @@ launch() {
 			[[ $line =~ ^[0-9]+$ ]] && HOST_PORTS+=("$line")
 		done <"$PORTS_FILE"
 	fi
+	# The room, when there is one.
+	#
+	# An agent in a VM is the participant with the most to say and the least
+	# ability to say it - it is the one doing the work. Spawned runs were
+	# given this port and runs started from the command line were not, which
+	# meant whether an agent could report being stuck depended on how somebody
+	# else had launched it. If nothing is listening, this costs one relay that
+	# never connects.
+	local chat_port=${FIRECODE_CHAT_PORT:-9761}
+	if ss -ltn 2>/dev/null | grep -q ":$chat_port "; then
+		HOST_PORTS+=("$chat_port")
+	fi
+
 	# The `|| true` is load-bearing: with nothing to forward, grep matches
 	# The relay, if asked for: a port on this host that guests reach through
 	# the same vsock relay as any other, and an ANTHROPIC_BASE_URL pointing at
@@ -3507,8 +3603,12 @@ launch() {
 	[[ -n $early_main && $early_main != "$WORKDIR" ]] &&
 		early_layer="$STATE_DIR/$(project_slug "$early_main")-layer.ext4"
 	memdir=$(memcheck_dir "$SLUG")
+	# No CFG_DRIVE here: the checkpoint pins its own copy of that drive, so a
+	# rebuilt one no longer means a stale checkpoint. What remains is the
+	# substrate the guest's memory actually describes - kernel, base image,
+	# the layers under it - plus the agent binary, handled inside.
 	memstamp=$(memcheck_stamp "$WORKDIR" "$KERNEL" "$INITRD" "$ROOTFS" \
-		"$CFG_DRIVE" "$(layers_of_project "$SLUG")" ${early_layer:+"$early_layer"})
+		"$(layers_of_project "$SLUG")" ${early_layer:+"$early_layer"})
 	((REFRESH)) && rm -rf "$memdir"
 	((FAST)) && memcheck_valid "$memdir" "$memstamp" && restoring=1
 	# Why it is booting rather than restoring, at the moment it happens. This
@@ -3683,7 +3783,7 @@ launch() {
 	# mean rebuilding a 6G rootfs.
 	local g
 	for g in firecode-setup.sh agent-entrypoint.sh profile.sh keydump.sh \
-		console.sh fileserver.sh execserver.sh; do
+		console.sh fileserver.sh execserver.sh chat-client.sh; do
 		install -m 0755 "$GUEST/$g" "$ctl_stage/$g"
 	done
 
@@ -3794,15 +3894,36 @@ launch() {
 	# repaired something, which is worth knowing but not worth stopping for;
 	# 4 and up means it will not touch it, and booting over that is how the
 	# corruption compounds.
+	# One writer, or a copy.
+	#
+	# The state drive has been flock-guarded for this reason since the
+	# beginning; the layer never was, and it is the drive an agent writes to
+	# most - every package it installs. Two runs on one project mounted the
+	# same ext4 read-write, which produced multiply-claimed blocks, a root
+	# that remounted read-only mid-boot, and a run that died twelve seconds in
+	# saying "mount point is not a directory". Nothing pointed at the cause.
+	if ((STATE_PERSISTENT == 0)); then
+		local shared=$workspace_layer
+		workspace_layer="$RUN_DIR/layer.ext4"
+		log "another run holds this workspace's layer - using a private copy"
+		log "  (what this VM installs will not be kept)"
+		cp --sparse=always "$shared" "$workspace_layer"
+	fi
+
 	local fsck_rc=0
 	sbin e2fsck -p "$workspace_layer" >"$RUN_DIR/layer-fsck.log" 2>&1 || fsck_rc=$?
 	if ((fsck_rc == 1)); then
 		log "repaired the workspace layer (it was left dirty by an earlier run)"
 	elif ((fsck_rc >= 4)); then
-		log "WARNING: this workspace's layer is damaged and e2fsck -p will not"
-		log "         repair it unattended: $RUN_DIR/layer-fsck.log"
-		log "         fix it with: e2fsck -y $workspace_layer"
-		log "         or start over with: firecode --fresh-root ..."
+		# Refuse rather than boot onto it. A damaged layer mounts read-only,
+		# so the root is read-only, so nothing that makes a VM usable works -
+		# and every symptom points somewhere else.
+		die "this workspace's layer is damaged and e2fsck -p will not repair it
+       unattended. The VM would boot with a read-only root and fail in
+       confusing ways, so this run stops here instead.
+         what happened: $RUN_DIR/layer-fsck.log
+         repair it:     e2fsck -y $workspace_layer
+         or start over: firecode --fresh-root ...   (installed packages are lost)"
 	fi
 
 	# --- jail: everything the VM touches has to live inside the chroot
@@ -3810,8 +3931,7 @@ launch() {
 	# The read-only drives are shared with the live project either way - the
 	# guest never writes to them, so there is nothing to diverge. A restore
 	# brings its own copies of the rest, and building them would be wasted.
-	local -a into_jail=("$KERNEL" "$INITRD" "$CFG_DRIVE"
-		${lower_drives+"${lower_drives[@]}"})
+	local -a into_jail=("$KERNEL" "$INITRD" ${lower_drives+"${lower_drives[@]}"})
 	((restoring)) || into_jail+=(
 		"$workspace_layer" "$src_drive" "$ctl_drive"
 		"$state_drive" ${extra_drives+"${extra_drives[@]}"}
@@ -3820,6 +3940,19 @@ launch() {
 		ln "$f" "$JAIL_DIR/$(basename "$f")" 2>/dev/null ||
 			cp "$f" "$JAIL_DIR/$(basename "$f")"
 	done
+
+	# The config drive, by content on a restore and by name always.
+	#
+	# A restored guest must see the drive its memory describes, and the
+	# snapshot refers to it by the name it had when it was taken - so the
+	# checkpoint's pinned copy goes in under that same name. Linking the
+	# current one here instead is how a rebuilt config drive would appear
+	# underneath a resumed guest, which is the corruption the stamp used to
+	# prevent by throwing the checkpoint away.
+	local cfg_source="$CFG_DRIVE"
+	((restoring)) && [[ -f $memdir/roconfig.ext4 ]] && cfg_source="$memdir/roconfig.ext4"
+	ln "$cfg_source" "$JAIL_DIR/$(basename "$CFG_DRIVE")" 2>/dev/null ||
+		cp "$cfg_source" "$JAIL_DIR/$(basename "$CFG_DRIVE")"
 
 	local extra_json="" i=0
 	for f in ${extra_drives+"${extra_drives[@]}"}; do
@@ -3872,6 +4005,8 @@ launch() {
 	next_dev
 	add_drive "src" "$src_drive" false
 	next_dev
+	# Always by its own name: the pinned copy is linked into the jail under
+	# exactly this basename, so the guest sees the right bytes either way.
 	add_drive "roconfig" "$CFG_DRIVE" true
 	next_dev
 	add_drive "control" "$ctl_drive" true
@@ -4085,8 +4220,20 @@ EOF
 		# Loading a snapshot is an API call, which means the VMM has to be
 		# running before the VM exists - so this path cannot hand the
 		# terminal straight to firecracker the way a cold boot does.
+		#
+		# Its serial input still has to stay open. A detached run has no
+		# terminal, so firecracker's console reader sees EOF immediately and
+		# ends its event loop - the VM resumes in 60ms and the VMM exits
+		# cleanly a moment later, which reads from outside as "restored, then
+		# died for no reason". A fifo held open here gives it a stdin that
+		# never ends and that nobody types into.
+		local serial_in="$JAIL_DIR/serial-in"
+		mkfifo "$serial_in" 2>/dev/null || true
+		# Held open and never written to: the descriptor is the point.
+		# shellcheck disable=SC2034  # kept open deliberately, not read
+		exec {SERIAL_FD}<>"$serial_in"
 		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
-			>"$RUN_DIR/console.log" 2>&1 &
+			<"$serial_in" >"$RUN_DIR/console.log" 2>&1 &
 		local vm_pid=$!
 		VM_PID=$vm_pid
 		memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1
