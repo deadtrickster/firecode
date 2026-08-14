@@ -15,6 +15,14 @@
   "projects": {
     "firecode": "~/Projects/firecode"
   },
+  "_scratch_note": [
+    "Where an agent may create a project of its own, with workspace_new.",
+    "Names are sanitised and confined to this directory, so the rule that a",
+    "caller never names a host path still holds. Leave it out to disable.",
+    "Without it, an agent whose work belongs nowhere borrows a configured",
+    "project and builds over whatever is already in it."
+  ],
+  "scratch_root": "/tmp/firecode-scratch",
   "max_concurrent": 2,
   "max_total": 20,
   "default_timeout": 3600,

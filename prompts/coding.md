@@ -44,6 +44,14 @@ after the agent has exited, in the project directory as it will be handed
 over, and its exit status becomes the run's. The agent is told the command up
 front, so it can aim at it.
 
+**Saying it in the prompt does not arm it.** The prompt is prose for the
+agent; `--verify` is a command for the harness. They are separate domains and
+neither stands in for the other. A run whose prompt opened with "I run
+./run-tests.sh after you exit and its exit status decides this run" - and
+which was started without `--verify` - reported success on a script that was
+not in the delivered tree. Put it in both places: in the flag so it is
+enforced, in the prompt so the work aims at it.
+
 **The gate must load from the delivered files.** That is the whole point. Two
 runs in one evening reported success on work that could not be loaded at all -
 one shipped an `.asd` naming files that were not there, the other a README

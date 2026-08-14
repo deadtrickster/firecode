@@ -136,6 +136,32 @@ class Config:
         for name, p in (raw.get("projects") or {}).items():
             self.projects[name] = os.path.abspath(os.path.expanduser(p))
 
+        # Somewhere an agent may make a workspace of its own.
+        #
+        # Every project here is a name the operator registered, which is the
+        # boundary that stops a caller packing an arbitrary directory into a
+        # VM it controls. But it also meant an agent that wanted a scratch box
+        # had to borrow whichever project existed - building over somebody
+        # else's tree, and over the next agent's - because the alternative was
+        # asking a human to edit a config file. A directory it may create
+        # inside, and only inside, keeps the boundary and removes the silly
+        # part.
+        scratch = raw.get("scratch_root") or ""
+        self.scratch_root = os.path.abspath(os.path.expanduser(scratch)) if scratch else ""
+
+        # The scratch directory is the registry.
+        #
+        # workspace_new used to register a name in this process only, which
+        # meant a restart forgot every workspace while leaving the directories
+        # on disk - so an agent that made one, and a run that was still using
+        # it, both found it missing from list_projects with the work sitting
+        # right there. What exists on disk is the truth; read it at startup.
+        if self.scratch_root and os.path.isdir(self.scratch_root):
+            for entry in sorted(os.listdir(self.scratch_root)):
+                path = os.path.join(self.scratch_root, entry)
+                if os.path.isdir(path) and entry not in self.projects:
+                    self.projects[entry] = path
+
         # Datasets are named for the same reason projects are: an agent asks
         # for "tpcc", never for a path or a device. Handing a caller-supplied
         # device to a VM would be handing it any disk on the machine.
@@ -308,6 +334,30 @@ class Runs:
     def view(self, run_id):
         run = self.runs.get(run_id)
         if not run:
+            # It may still have happened. Runs live in this process's memory,
+            # so a restart forgets every one of them while their logs sit on
+            # disk - and a caller polling a run it started ten minutes ago
+            # gets "no such run", which reads as "you invented that id" rather
+            # than "the server was restarted underneath you".
+            log = os.path.join(ROOT, "runs", "spawn", f"{run_id}.log")
+            if os.path.isfile(log):
+                tail = ""
+                try:
+                    with open(log, errors="replace") as fh:
+                        tail = fh.read()[-1500:]
+                except OSError:
+                    pass
+                return {
+                    "id": run_id,
+                    "state": "unknown - started by an earlier server process",
+                    "why": "this server was restarted after that run began, so "
+                           "its bookkeeping is gone. The log survives.",
+                    "log": log,
+                    "log_tail": tail,
+                    "fix": "read the log, or vm_list to see whether its VM is "
+                           "still up. A run that finished has its result "
+                           "directory beside the project either way.",
+                }
             raise ValueError(f"no such run {run_id!r}")
         out = {k: v for k, v in run.items() if not k.startswith("_") and k != "proc"}
         if run["finished"]:
@@ -381,7 +431,22 @@ class Runs:
 
 
 def build_tools(cfg):
-    projects = sorted(cfg.projects) or ["(none configured)"]
+    # Named in the description, not fixed as an enum.
+    #
+    # An enum is computed once, when this server starts, and a client caches
+    # the tool list from the same moment - so a project made later (or one the
+    # operator adds) cannot be named by a caller whose schema validator
+    # rejects it before the server is even asked. The server checks the name
+    # anyway, which is where the boundary actually lives; this only decides
+    # whether a caller can express it.
+    known = ", ".join(sorted(cfg.projects)) or "(none configured)"
+    project_field = {
+        "type": "string",
+        "description": (f"A project name. Configured now: {known}. "
+                        "list_projects is authoritative"
+                        + (", and workspace_new makes a new one."
+                           if cfg.scratch_root else ".")),
+    }
     datasets = sorted(cfg.datasets) or ["(none configured)"]
     return [
         {
@@ -397,7 +462,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "datasets": {
                         "type": "array",
                         "items": {"type": "string", "enum": datasets},
@@ -427,7 +492,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "command": {"type": "string"},
                     "cwd": {"type": "string",
                             "description": "Where to run it. Defaults to the project."},
@@ -442,7 +507,7 @@ def build_tools(cfg):
             "description": "Stop a project's VM, copying its work back out.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"project": {"type": "string", "enum": projects}},
+                "properties": {"project": dict(project_field)},
                 "required": ["project"],
             },
         },
@@ -456,7 +521,7 @@ def build_tools(cfg):
                 "reset to it before each run instead of rebuilding it."),
             "inputSchema": {
                 "type": "object",
-                "properties": {"project": {"type": "string", "enum": projects}},
+                "properties": {"project": dict(project_field)},
                 "required": ["project"],
             },
         },
@@ -468,7 +533,7 @@ def build_tools(cfg):
                 "checkpointed."),
             "inputSchema": {
                 "type": "object",
-                "properties": {"project": {"type": "string", "enum": projects}},
+                "properties": {"project": dict(project_field)},
                 "required": ["project"],
             },
         },
@@ -490,7 +555,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "name": {"type": "string",
                              "description": "Short name to refer to it by later."},
                     "command": {"type": "string"},
@@ -506,7 +571,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "name": {"type": "string"},
                     "lines": {"type": "integer", "description": "Default 50."},
                 },
@@ -523,7 +588,7 @@ def build_tools(cfg):
                 "anything from a timing."),
             "inputSchema": {
                 "type": "object",
-                "properties": {"project": {"type": "string", "enum": projects}},
+                "properties": {"project": dict(project_field)},
                 "required": ["project"],
             },
         },
@@ -543,7 +608,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "timeout": {"type": "integer",
                                 "description": "Seconds to wait. Default 300, max 900."},
                     "quiet_for": {"type": "integer",
@@ -555,6 +620,30 @@ def build_tools(cfg):
                     "lines": {"type": "integer", "description": "Tail to return. Default 60."},
                 },
                 "required": ["project"],
+            },
+        },
+        {
+            "name": "workspace_new",
+            "description": (
+                "Make a fresh, empty project of your own and get its name "
+                "back, usable anywhere a project is asked for.\n\n"
+                "Use it whenever the work is yours rather than an existing "
+                "project's - a build from scratch, an experiment, anything you "
+                "would otherwise put in somebody else's directory. The "
+                "alternative is what happens now: every agent borrows the one "
+                "configured project, builds over what the last one left, and "
+                "the copy-out mixes both.\n\n"
+                "It lives inside the operator's scratch directory and cannot "
+                "be made anywhere else. If this server has no scratch "
+                "directory the call says so, and the answer is a configured "
+                "project, not a path."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "What to call it - letters, digits, dot, dash."},
+                },
+                "required": ["name"],
             },
         },
         {
@@ -587,7 +676,25 @@ def build_tools(cfg):
                 "arguments.\n\n"
                 "This is the one tailer. Do not write your own: three of them "
                 "existed for a while and one filtered the wrong name, hiding "
-                "the messages it was supposed to deliver."),
+                "the messages it was supposed to deliver.\n\n"
+                "THIS BLOCKS YOUR TURN. It is for a deliberate short wait - "
+                "you have asked something and want the answer now. It is NOT "
+                "how to stay in the room: a call that blocks cannot also be "
+                "permanent, and a fifteen-minute one freezes you for fifteen "
+                "minutes.\n\n"
+                "To listen permanently, run this in a BACKGROUND SHELL "
+                "instead, and start it again each time it returns:\n"
+                "    firecode chat --inbox --as <your-name>\n"
+                "It blocks out there rather than in here, prints what was "
+                "said, and exits - which most harnesses turn into a "
+                "notification. Do not tail the log file: the room is a "
+                "service, the log is its record, and a tail gives you no "
+                "cursor and no filtering of your own messages.\n\n"
+                "Whichever you use: when a message asks you something, "
+                "chat_say a one-line acknowledgement BEFORE doing the work. "
+                "Silence is indistinguishable from absence - an agent here "
+                "waited three minutes for an answer, decided nobody was "
+                "coming, and went and fixed the thing itself."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -614,7 +721,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "message": {"type": "string"},
                 },
                 "required": ["project", "message"],
@@ -626,7 +733,7 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects},
+                    "project": dict(project_field),
                     "name": {"type": "string"},
                 },
                 "required": ["project", "name"],
@@ -653,14 +760,26 @@ def build_tools(cfg):
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string", "enum": projects,
-                                "description": "One of the configured projects."},
+                    "project": dict(project_field),
                     "task": {"type": "string",
                              "description": "What the agent should do."},
                     "timeout": {"type": "integer",
                                 "description": "Seconds before it is stopped."},
-                    "resume": {"type": "string",
-                               "description": "Session id to continue."},
+                    "resume": {
+                        "type": "string",
+                        "description": (
+                            "An AGENT SESSION id to continue - not a run id "
+                            "from this server. They are different namespaces "
+                            "and passing the wrong one fails instantly: the "
+                            "agent exits with 'requires a valid session ID' "
+                            "having taken zero turns, and the verify command "
+                            "then fails on a tree nobody touched, which reads "
+                            "as a broken build rather than a bad argument.\n\n"
+                            "If you only have a run id, do not pass this - "
+                            "spawn again with a task that says what is already "
+                            "there and what to change. The project directory "
+                            "is where the last run left it."),
+                    },
                     "agent": {
                         "type": "string",
                         "enum": ["claude", "opencode"],
@@ -688,9 +807,19 @@ def build_tools(cfg):
                             "installcheck'. Run by the harness inside the VM "
                             "after the agent exits, in the project as it will "
                             "be handed back, and its exit status becomes the "
-                            "run's. Say in `task` that you are running it, so "
-                            "the agent can aim at it. Without this you are "
-                            "taking the agent's word for its own work."),
+                            "run's.\n\n"
+                            "WRITING IT IN `task` DOES NOT ARM IT. The task is "
+                            "prose for the agent; this is a command for the "
+                            "harness. They are different domains and neither "
+                            "substitutes for the other - a run whose task said "
+                            "'I run ./run-tests.sh after you exit' and whose "
+                            "verify was empty reported success on a script "
+                            "that was not even in the delivered tree. Say it "
+                            "in both: here so it is enforced, in `task` so the "
+                            "agent knows what it is aiming at.\n\n"
+                            "Without this you are taking the agent's word for "
+                            "its own work, which is the one thing it cannot be "
+                            "relied on for."),
                     },
                 },
                 "required": ["project", "task"],
@@ -732,8 +861,64 @@ def build_tools(cfg):
 def _project_path(cfg, key):
     if key not in cfg.projects:
         raise ValueError(f"unknown project {key!r}. Known: "
-                         + (", ".join(sorted(cfg.projects)) or "(none)"))
+                         + (", ".join(sorted(cfg.projects)) or "(none)")
+                         + (". workspace_new makes a fresh one."
+                            if cfg.scratch_root else ""))
     return cfg.projects[key]
+
+
+def _offline_note(cfg):
+    """Say when a VM has no network, before somebody discovers it by probing.
+
+    An agent that finds only loopback, no interface to bring up and nothing
+    installed concludes the VM is broken - it has no way to see that this was
+    configured. One did exactly that, spent a while trying eth0, ens1, enp0s1,
+    then handed a build that needed a Go toolchain to another VM with the same
+    setting, because nothing said so there either.
+    """
+    if "--no-net" not in cfg.extra_args:
+        return ""
+    return ("\n\nThis VM has NO NETWORK - that is this server's configuration, "
+            "not a fault, so do not go looking for an interface to bring up. "
+            "Nothing can be downloaded in there: no apt, no pip, no go mod, no "
+            "cloning. Whatever the task needs must already be in the image, or "
+            "the operator has to drop --no-net from this server's config. The "
+            "model API still works: it comes over a relay on localhost, not "
+            "over a network.")
+
+
+def _workspace_new(cfg, name):
+    """A project of the caller's own, inside the scratch directory.
+
+    The name is sanitised and joined to scratch_root, and the result has to
+    still be under scratch_root afterwards - that check is the whole security
+    of this, since a name is the one thing the caller controls. It is
+    registered for this process only; nothing is written to the config file,
+    so a restart forgets it and the operator's list is still the operator's.
+    """
+    if not cfg.scratch_root:
+        raise ValueError(
+            "this server has no scratch_root, so new workspaces are not "
+            "available - the operator sets one in its config, or registers "
+            "projects by hand. list_projects says what exists.")
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", (name or "").strip())[:48].strip("-.")
+    if not safe:
+        raise ValueError("a workspace needs a name made of letters or digits")
+    if safe in cfg.projects:
+        return safe, cfg.projects[safe]
+
+    path = os.path.abspath(os.path.join(cfg.scratch_root, safe))
+    if os.path.commonpath([path, cfg.scratch_root]) != cfg.scratch_root:
+        raise ValueError("a workspace name cannot climb out of the scratch directory")
+
+    os.makedirs(path, exist_ok=True)
+    # A git repo, because the harness returns work by fetching what the guest
+    # committed as well as by copying files, and an empty directory with no
+    # .git quietly loses the first of those.
+    if not os.path.isdir(os.path.join(path, ".git")):
+        subprocess.run(["git", "init", "-q", path], check=False, timeout=60)
+    cfg.projects[safe] = path
+    return safe, path
 
 
 def _firecode(args, timeout=600):
@@ -862,7 +1047,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
                     "you nothing.")
         if rc != 0:
             return explain(f"Starting a VM for {args['project']}", out, rc)
-        return f"{args['project']} is up. Run commands with vm_in."
+        return f"{args['project']} is up. Run commands with vm_in." + _offline_note(cfg)
 
     if name == "vm_in":
         path = _project_path(cfg, args["project"])
@@ -924,6 +1109,14 @@ def call_tool(cfg, runs, name, args, caller_run=None):
                 f"vm_checkpoint after setting it up again, or take it on a VM "
                 f"started without --fast.")
 
+    if name == "workspace_new":
+        key, path = _workspace_new(cfg, args["name"])
+        return (f"{key} is yours, at {path} - empty, a git repo, and usable as "
+                f"a project anywhere one is asked for: vm_up, spawn, vm_in.\n"
+                f"It lasts as long as this server runs; the operator's own "
+                f"projects are untouched by anything you do in it."
+                + _offline_note(cfg))
+
     if name in ("chat_say", "chat_wait"):
         port = int(os.environ.get("FIRECODE_CHAT_PORT", "9761"))
         base = f"http://127.0.0.1:{port}"
@@ -942,13 +1135,35 @@ def call_tool(cfg, runs, name, args, caller_run=None):
                         f"Start it with: firecode chat serve")
             return f"said it as {who} (#{got.get('id')})."
 
-        # chat_wait: the mark lives here, keyed by name, so the call takes no
-        # cursor and two readers do not consume each other's messages.
+        # chat_wait: the mark lives beside the room's log, keyed by name, so
+        # the call takes no cursor and two readers do not consume each other's
+        # messages.
+        #
+        # On disk rather than in this process, because this process gets
+        # restarted - and when it did, every reader silently resumed "from
+        # now", so anything said while it was down was behind the new mark and
+        # never arrived. A caller then waits its full timeout and concludes it
+        # is being ignored, which is exactly what happened.
         limit = min(int(args.get("timeout", 300)), 900)
-        marks = getattr(call_tool, "_chat_marks", None)
-        if marks is None:
-            marks = call_tool._chat_marks = {}
-        mark = marks.get(who, None)
+        mark_dir = os.path.join(ROOT, "runs")
+        mark_file = os.path.join(
+            mark_dir, "chat-mark-mcp-" + re.sub(r"[^A-Za-z0-9._-]", "-", who))
+
+        def read_mark():
+            try:
+                return int(open(mark_file).read().strip())
+            except (OSError, ValueError):
+                return None
+
+        def write_mark(value):
+            try:
+                os.makedirs(mark_dir, exist_ok=True)
+                with open(mark_file, "w") as fh:
+                    fh.write(str(value))
+            except OSError:
+                pass
+
+        mark = read_mark()
         started = time.time()
         while True:
             left = max(1, int(limit - (time.time() - started)))
@@ -964,13 +1179,14 @@ def call_tool(cfg, runs, name, args, caller_run=None):
             if mark is None:
                 # First call: start from now rather than replaying the whole
                 # room, which is history the caller did not ask for.
-                marks[who] = got.get("last", 0)
-                mark = marks[who]
+                mark = got.get("last", 0)
+                write_mark(mark)
                 if time.time() - started >= limit:
                     return "nothing said yet (you are now listening from here on)."
                 continue
             if msgs:
-                marks[who] = got.get("last", mark)
+                mark = got.get("last", mark)
+                write_mark(mark)
             fresh = [m for m in msgs if m.get("from") != who]
             if fresh:
                 return "\n".join(
@@ -1104,7 +1320,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         gate = args.get("verify")
         return (f"started {run_id} on {args['project']}. "
                 f"It runs unattended and shuts down when done. "
-                f"Check with status({run_id}).\n"
+                f"Check with status({run_id})." + _offline_note(cfg) + "\n"
                 + (f"Its work is judged by `{gate}`, which this harness runs "
                    f"after the agent exits - so status() tells you whether the "
                    f"work passed, not whether the agent thought so."

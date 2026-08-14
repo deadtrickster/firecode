@@ -85,6 +85,27 @@ output  run_id=...        → what it said, and .firecode-verify.log has the pro
 Name the gate in `task` as well as in `verify`. An agent that knows the
 command can aim at it; one that does not finds out after it has stopped.
 
+### Two domains, and neither one substitutes for the other
+
+`task` is **prose for the agent**: what to build, what to avoid, what "done"
+should look like. It is advisory. The agent reads it, interprets it, and may
+be wrong about it.
+
+`verify` is **a command for the harness**: run after the agent has exited, in
+the project as it will be handed over, and its exit status is the run's. It is
+binding. Nothing the agent says changes it.
+
+Writing the gate into the task does not arm the gate. It reads as though it
+does - "I run ./run-tests.sh after you exit and its exit status decides this
+run" sitting in the prompt, with `verify` left empty - and the result is a run
+that reports success on a script the harness never executed and that was not
+in the delivered tree at all. That happened here, to a careful caller, on the
+same day the gate was built.
+
+The same separation runs the other way: a gate cannot tell an agent what to
+build, so a `verify` with no matching instruction in `task` produces work that
+fails a check it was never told about.
+
 ### Watch a long run without polling
 
 ```
