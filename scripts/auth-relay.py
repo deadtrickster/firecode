@@ -178,11 +178,35 @@ def _write_creds(path, key, entry):
             pass
 
 
+def zai_token():
+    """GLM's key, from the store opencode keeps it in.
+
+    An api key rather than a rotating login, so there is nothing to refresh -
+    but it is still a credential, and the reason to relay it is the same as
+    for the others: a VM that holds it can spend it, and a VM is the thing
+    most likely to be handed to somebody else's agent.
+    """
+    try:
+        with open(XAI_CREDS) as fh:          # opencode's auth.json, same file
+            entry = (json.load(fh).get("zai-coding-plan") or {})
+    except (OSError, ValueError):
+        return None, f"no opencode credentials at {XAI_CREDS}"
+    key = entry.get("key")
+    if not key:
+        return None, ("no zai-coding-plan key on the host - log in with "
+                      "opencode first (it is the store this reads)")
+    return key, None
+
+
 #: name -> (token function, default upstream). The guest is pointed at this
 #: relay instead of the upstream, and holds no credential for either.
 PROVIDERS = {
     "claude": (claude_token, "https://api.anthropic.com"),
     "xai": (xai_token, "https://api.x.ai"),
+    # z.ai speaks the Anthropic API, which is why claude can be pointed at it
+    # at all - so a guest talks to this relay exactly as it would to
+    # api.anthropic.com and never learns the difference.
+    "zai": (zai_token, "https://api.z.ai/api/anthropic"),
 }
 
 

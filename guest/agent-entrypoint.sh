@@ -76,6 +76,21 @@ if [[ -n ${ANTHROPIC_BASE_URL:-} ]]; then
 	log "model API reached through the host - no real credentials in this VM"
 fi
 
+# Model names, when this client is pointed somewhere that has never heard of
+# opus or sonnet. Sourced from the control drive rather than exported, so they
+# have to be carried into the agent's environment explicitly.
+for v in ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+	ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL; do
+	[[ -n ${!v:-} ]] && ENV+=("$v=${!v}")
+done
+# A key for an endpoint that is not anthropic. AUTH_TOKEN and not API_KEY:
+# with both set the client warns about conflicting credentials and may pick
+# the wrong one.
+if [[ -n ${ANTHROPIC_AUTH_TOKEN:-} ]]; then
+	ENV+=("ANTHROPIC_AUTH_TOKEN=$ANTHROPIC_AUTH_TOKEN")
+	log "using the key this run was given for $ANTHROPIC_BASE_URL"
+fi
+
 # An unattended agent prints nothing until it finishes, which for a job
 # measured in hours means a console showing one line and no way to tell working
 # from wedged. Asked for its events as they happen, it says what it is doing;

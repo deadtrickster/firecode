@@ -71,7 +71,16 @@ AUTH_RELAY_PID=""
 # neither.
 RELAY_PROVIDER=""
 #: providers auth-relay.py knows how to authenticate as
-RELAY_KNOWS="claude xai"
+RELAY_KNOWS="claude xai zai"
+#: Model names for an agent pointed at somewhere other than its own provider.
+#: Empty for a normal run: the client picks, and overriding it would be this
+#: harness having opinions about somebody else's model.
+GUEST_MODEL=""
+GUEST_SMALL_MODEL=""
+#: An api key for an endpoint that is not this client's own provider. Only for
+#: keys that do not rotate - a subscription login goes through the relay, or a
+#: refresh in here spends the one on the host.
+GUEST_AUTH_TOKEN=""
 API_BASE=""
 HYBRID=0
 PCORES=""
@@ -3826,6 +3835,20 @@ launch() {
 		elif ((AUTH_RELAY)); then
 			echo "ANTHROPIC_BASE_URL='http://localhost:$AUTH_RELAY_PORT'"
 		fi
+		# Which model, when the endpoint is not the client's own provider.
+		# claude asks for opus/sonnet/haiku by name and the far end has never
+		# heard of them, so each has to be mapped or every request is a 404
+		# for a model that does not exist there.
+		if [[ -n $GUEST_AUTH_TOKEN ]]; then
+			echo "ANTHROPIC_AUTH_TOKEN='$GUEST_AUTH_TOKEN'"
+		fi
+		if [[ -n $GUEST_MODEL ]]; then
+			echo "ANTHROPIC_MODEL='$GUEST_MODEL'"
+			echo "ANTHROPIC_DEFAULT_OPUS_MODEL='$GUEST_MODEL'"
+			echo "ANTHROPIC_DEFAULT_SONNET_MODEL='$GUEST_MODEL'"
+			echo "ANTHROPIC_SMALL_FAST_MODEL='${GUEST_SMALL_MODEL:-$GUEST_MODEL}'"
+			echo "ANTHROPIC_DEFAULT_HAIKU_MODEL='${GUEST_SMALL_MODEL:-$GUEST_MODEL}'"
+		fi
 		# opencode has no environment variable for a provider's endpoint - it
 		# reads that from its config file - so this is the port, and the guest
 		# writes the config around it at boot. It cannot come off the config
@@ -5130,6 +5153,35 @@ claude | opencode)
 	agent=$1
 	shift
 	launch "$agent" "$@"
+	;;
+glm)
+	# Claude Code pointed at GLM: the same shape as ~/bin/glm and ~/bin/qwen -
+	# same client, a different endpoint, and model names the far end knows.
+	#
+	# The key travels, unlike a subscription login, and that is a deliberate
+	# difference rather than an oversight: an api key does not rotate, so a
+	# copy in a VM cannot invalidate the one out here, which is the whole
+	# reason the others are relayed. --auth-relay still works if you would
+	# rather it stayed on the host.
+	shift
+	GUEST_MODEL=${FIRECODE_GLM_MODEL:-glm-4.7}
+	GUEST_SMALL_MODEL=${FIRECODE_GLM_SMALL_MODEL:-glm-4.7}
+	if ((AUTH_RELAY)); then
+		RELAY_PROVIDER=zai
+	else
+		API_BASE=${API_BASE:-https://api.z.ai/api/anthropic}
+		GUEST_AUTH_TOKEN=$(python3 -c '
+import json, os, sys
+p = os.path.expanduser("~/.local/share/opencode/auth.json")
+try:
+    print((json.load(open(p)).get("zai-coding-plan") or {}).get("key", ""))
+except Exception:
+    print("")' 2>/dev/null)
+		[[ -n $GUEST_AUTH_TOKEN ]] ||
+			die "no zai-coding-plan key on this host - log in with opencode first,
+       or run with --auth-relay if the key is somewhere else"
+	fi
+	launch claude "$@"
 	;;
 shell)
 	shift
