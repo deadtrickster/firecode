@@ -2140,6 +2140,108 @@ cmd_in() {
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
 }
 
+# Build the next guest image inside a guest.
+#
+# The docker path exists because something has to unpack packages into a
+# directory, and it costs a daemon, an export, an import, and - on a machine
+# whose resolver is a loopback DoH proxy - a container network that cannot
+# resolve anything at all. A VM already has root, a real resolver and every
+# tool involved, and it is the machine the result will run on. The output
+# image is attached as a blank disk and written directly, so when the VM stops
+# the host is already holding the finished filesystem.
+#
+# The bootstrap remains: this needs an image to build an image. `firecode
+# setup` fetches one, and the docker path stays for a machine that has neither.
+cmd_prepare_in_vm() {
+	local size=${FIRECODE_ROOTFS_SIZE:-6G} tools="" keep=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--with)
+			tools="$2"
+			shift 2
+			;;
+		--size)
+			size="$2"
+			shift 2
+			;;
+		--keep)
+			keep=1
+			shift
+			;;
+		*) die "usage: firecode prepare --in-vm [--with 'dotnet@10 uv'] [--size 6G] [--keep]" ;;
+		esac
+	done
+
+	# ROOTFS and friends are worked out here rather than assumed: this command
+	# runs before anything that would normally resolve them.
+	resolve_assets
+	[[ -f $ROOTFS ]] || die "no guest rootfs to build from yet - run: firecode prepare
+       (this path builds the next image inside the current one, so it needs
+       one to start from)"
+
+	# In images/, because a drive has to be hardlinkable into the jail and so
+	# must share a filesystem with it.
+	local out="$IMAGES/agent-firecode.next.ext4"
+	log "a blank $size image for the guest to fill: $(basename "$out")"
+	rm -f "$out"
+	truncate -s "$size" "$out"
+
+	local work
+	work=$(mktemp -d "${TMPDIR:-/tmp}/firecode-build.XXXXXX")
+	git -C "$work" init -q 2>/dev/null || true
+
+	# Only guest/ goes in, not the checkout: the repo carries images/, which
+	# is several gigabytes of the very thing being built, and packing that
+	# into a read-only drive to build a read-only drive is silly twice over.
+	log "starting the builder VM"
+	cmd_up --workdir "$work" --disk "$out:-:rw" --add-dir "$GUEST" ||
+		die "the builder VM did not start"
+
+	# The last virtio disk is the blank one: extras are attached after
+	# everything firecode owns, in the order they were given, and this run
+	# gave exactly one.
+	local dev
+	dev=$(python3 "$SCRIPTS/vsock-exec.py" "$(require_vm_socket "$work")" "$EXEC_PORT" - \
+		'ls /dev/vd* | tail -1' 2>/dev/null | tr -d '[:space:]')
+	[[ $dev == /dev/vd* ]] || die "could not find the blank disk in the builder VM"
+	log "the guest will write onto $dev"
+
+	local rc=0
+	# --add-dir mounts at the path the directory has on the host, so the
+	# builder is at the same place inside the VM as outside it.
+	cmd_in --project "$work" \
+		"sudo -n bash $GUEST/build-rootfs.sh $dev $GUEST '$tools'" || rc=$?
+
+	if ((rc == 0)); then
+		# The initramfs is built in there too, and comes back the only way
+		# anything comes back from a VM: through a file this side can read.
+		cmd_in --project "$work" 'cat /tmp/firecode-initrd.gz | base64 -w0' \
+			>"$work/.initrd.b64" 2>/dev/null || true
+	fi
+
+	cmd_down --project "$work" >/dev/null 2>&1 || true
+
+	((rc == 0)) || die "the build failed inside the VM - its console is in the run directory"
+
+	# Believe the filesystem, not the exit status: a truncated image and a
+	# finished one both come back as a file of the right size.
+	debugfs -R "stat /sbin/init" "$out" >/dev/null 2>&1 ||
+		die "the image the guest wrote has no /sbin/init - refusing to install it
+       over the working one. It is at $out if you want to look."
+
+	if [[ -s $work/.initrd.b64 ]]; then
+		base64 -d <"$work/.initrd.b64" >"$IMAGES/initrd.gz.next" &&
+			mv -f "$IMAGES/initrd.gz.next" "$INITRD"
+		log "initrd updated"
+	fi
+
+	mv -f "$ROOTFS" "$ROOTFS.previous"
+	mv -f "$out" "$ROOTFS"
+	((keep)) || rm -rf "$work"
+	log "rootfs built in a VM: $(du -h "$ROOTFS" | cut -f1)"
+	log "  the one it replaced is at $(basename "$ROOTFS").previous"
+}
+
 # The room.
 #
 # Every agent here works alone by construction - one per VM, one per session -
@@ -4897,7 +4999,8 @@ options (before the agent's own arguments):
                   image again (packages it installed are lost)
   --worktree NAME run in a git worktree of this repo, creating it if needed.
                   Its own layer, inheriting the main checkout's.
-  --add-dir DIR   extra host dir, read-only at /mnt/<name>, repeatable
+  --add-dir DIR   extra host dir, read-only at the same path it has out here,
+                  repeatable
   --host-port N   make the host's localhost:N reachable at localhost:N in the
                   guest, over vsock; repeatable. For a local llama-server or
                   any other OpenAI-compatible endpoint on loopback.
@@ -4955,7 +5058,12 @@ setup)
 	;;
 prepare)
 	shift
-	"$SCRIPTS/prepare-rootfs.sh" "$@"
+	if [[ ${1:-} == --in-vm ]]; then
+		shift
+		cmd_prepare_in_vm "$@"
+	else
+		"$SCRIPTS/prepare-rootfs.sh" "$@"
+	fi
 	;;
 doctor)
 	shift
