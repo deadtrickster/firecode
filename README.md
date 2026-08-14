@@ -13,6 +13,18 @@ host devices. It runs with permission checks off, because there is nothing in
 there worth protecting. When it finishes, the work is copied out to a sibling
 directory. Your project directory is never written to.
 
+A run is not a black box, and "done" is not the agent's opinion:
+
+```sh
+firecode claude --deliver ~/Projects/thing --verify './run-tests.sh' \
+  -- -p 'build the thing, tests and all' --dangerously-skip-permissions
+```
+
+`--verify` is run by the harness after the agent exits, in the project as it
+will be handed over. Its exit status is the run's. Meanwhile `firecode logs -f`
+shows what it is doing, `firecode say` puts another turn into it, and the agent
+inside can ask you a question and wait for the answer.
+
 ## What it protects against
 
 Wiping your system, and reading things it has no business reading - SSH keys,
@@ -27,15 +39,35 @@ credentials, because otherwise it cannot work.
 
 ## Install
 
-Needs Linux with KVM, docker (to build the guest image) and e2fsprogs.
+Needs Linux with KVM and e2fsprogs. docker is needed once, to build the first
+guest image; after that firecode builds its own.
 
 ```sh
 sudo usermod -aG kvm,docker "$USER"        # then log back in
 
 firecode setup                             # firecracker, jailer, guest kernel
-firecode prepare --with "dotnet@10 uv"     # guest image, with a toolchain
+firecode prepare --with "dotnet@10 uv"     # first guest image, via docker
 firecode doctor                            # check the host is ready
 ```
+
+Once you have an image, the next one is built **inside a VM** - no docker, no
+export, no copy-out:
+
+```sh
+firecode prepare --in-vm --with "dotnet@10 uv"
+```
+
+The blank image is attached to the builder as an unmounted disk and written
+directly, so the host holds the finished filesystem the moment the VM stops.
+It is smaller than the docker path (a package set rather than a container
+image carrying its history), it refuses to install a result whose `/sbin/init`
+is missing, and it keeps the image it replaces as `.previous`.
+
+It is also the only path that works on a host whose DNS is a loopback DoH
+proxy: docker's bridge forwards to the host's resolver address, which inside a
+container namespace is the container itself, so nothing resolves. `prepare`
+detects that and builds on the host network; `--in-vm` never meets it, because
+a guest has its own resolver.
 
 Two things need root, both one-time:
 
@@ -282,12 +314,25 @@ Three things reach the model, and only these:
   persist, that stdio MCP servers are absent, that there is no `gh` and no ssh
   key
 
+That section also carries what a delegated run keeps getting wrong, written
+down because instruction is cheaper than supervision:
+
+- **run it early** - one or two files, then compile or import or start it. The
+  worst run here wrote eight files over 24 minutes before invoking a compiler
+  once, and every error after that was entangled with the others.
+- **load what you deliver, in a new process**, from the project as it will be
+  copied out - a long session accumulates state the recipient will not have.
+- **no placeholder survives**: nobody is coming back to fill it in, because
+  the only one who was going to is the process about to stop.
+- **the room exists**, and reaching it is `firecode-chat`, not a tool.
+
 `FIRECODE=1` and `IS_SANDBOX=1` are in the environment. Commits use the git
 identity the project reports on the host, with signing forced off - there is no
 key in the guest and nothing there could answer a passphrase.
 
-opencode gets its credentials and provider config carried in, but not the
-briefing above: it reads `AGENTS.md`, not `CLAUDE.md`.
+opencode gets its credentials and provider config carried in - minus the
+provider a relay is standing in for, and minus MCP servers whose binaries live
+on the host filesystem, which it would otherwise sit trying to start.
 
 ## How it works
 
@@ -396,8 +441,53 @@ every couple of minutes and can never grant it once. Over MCP `vm_watch` goes
 further and does not poll at all: it blocks until the VM exits, until text you
 named appears, until the run has been quiet too long, or until a timeout.
 
+**The gate has to be armed.** Writing "I run ./run-tests.sh after you exit"
+into the prompt arms nothing: the prompt is prose for the agent, `--verify` is
+a command for the harness, and neither substitutes for the other. A careful
+caller did exactly that and got a green run whose gate had never executed, on
+a script that was not in the delivered tree. Say it in both places.
+
 [`prompts/`](prompts/) has starting points for both halves of this - a build
 task with a gate, and one agent supervising another.
+
+## The room
+
+Every agent here works alone by construction - one per VM, one per session -
+which is the isolation working and also its blind spot: two of them can spend
+an hour on the same wrong assumption without ever finding out.
+
+```sh
+firecode chat install       # once: a user service, survives sessions and reboots
+firecode chat 'text'        # say something
+firecode chat --read        # everything so far
+firecode chat --inbox       # block until somebody speaks, then print and exit
+```
+
+Inside a VM the same room is a command, `firecode-chat`, installed into every
+guest. An unattended run gets no MCP servers by design, so three agents in a
+row looked for a chat *tool*, found none, and concluded there was no room -
+one of them while blocked on something the others could have answered in a
+sentence.
+
+```sh
+firecode-chat 'blocked: no postgres in the image and apt cannot resolve'
+firecode-chat --ask 'install from source, or stop?'
+```
+
+`--ask` posts and waits. An unattended agent facing a decision it cannot make
+otherwise has two moves - guess, or stop and report that it needed a human -
+and both are worse than asking and waiting a few minutes. If nobody answers it
+says so and tells the agent to decide and record what it chose.
+
+Two conventions the room needs, learned by getting them wrong:
+
+- **Start listening before you start working**, and start again each time your
+  reader returns. A blocking MCP call cannot be a permanent listener - it
+  freezes the caller's turn - so the listener is a background shell running
+  `firecode chat --inbox`, which exits on each message.
+- **Acknowledge before you act.** Silence is indistinguishable from absence:
+  an agent here waited three minutes for an answer, concluded nobody was
+  coming, and went and fixed the thing itself.
 
 ## Checkpoints
 
@@ -567,16 +657,22 @@ logs stay. Layers, state and snapshots are never touched by `gc`.
 
 ## Limits and caveats
 
-- Your host credentials go into the VM. That is what makes the agent able to
-  work. The isolation is of the host filesystem, not of your API keys.
+- Your host credentials go into the VM unless you use `--auth-relay`, which
+  authenticates through this host and leaves the VM holding none. The
+  isolation is of the host filesystem; without the relay it is not of your
+  API keys.
 - The result directory looks like a full copy of the project, but the files
   that came back unchanged are hardlinks to the ones already on disk, so it
   costs what the run actually changed. Diff it, read it, delete it freely.
   Editing one of those files *in place* edits the project, since they are the
   same file - editors that save by rename (most, Emacs included) break the
   link first and are safe; `sed -i` and shell appends are not.
-- Two runs at once on one project: the second gets a throwaway copy of the state
-  drive and its session is not resumable. It says so at the time.
+- Two runs at once on one project: the second gets throwaway copies of the
+  state drive and the workspace layer, so what it installs is not kept and its
+  session is not resumable. It says so at the time. (Until recently the layer
+  was shared read-write between them, which corrupted it - the symptom was a
+  guest whose root went read-only and a run that died saying "mount point is
+  not a directory".)
 - An OAuth refresh inside a VM rotates the token and that copy is discarded, so
   the host is left holding a spent one and needs a re-auth. `--auth-relay`
   is the way out: the model is reached through this host and the VM holds no
