@@ -361,7 +361,16 @@ fi
 
 echo
 log "agent exited with status $rc"
-echo "$rc" >"$PROJECT/.firecode-exit-status" 2>/dev/null || true
+# Bookkeeping stays out of the project until the gate has run.
+#
+# These markers used to be written into the project root immediately, and the
+# verify command then ran against a tree containing them - so any gate that
+# asserts a clean tree, or that everything is committed, failed on the
+# harness's own files. A gate is supposed to judge the work; it should not be
+# tripped by the thing judging it. They are moved in at the very end, after
+# the gate has had its look.
+STATUS_TMP=/tmp/firecode-exit-status
+echo "$rc" >"$STATUS_TMP" 2>/dev/null || true
 
 # The gate.
 #
@@ -378,14 +387,16 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	echo
 	log "verifying: $FIRECODE_VERIFY"
 	vrc=0
-	vlog="$PROJECT/.firecode-verify.log"
+	# Written outside the project while the gate runs, for the same reason as
+	# the status file, and moved in afterwards.
+	vlog=/tmp/firecode-verify.log
 	started=$SECONDS
 	{
 		echo "# firecode verification"
 		echo "# command: $FIRECODE_VERIFY"
 		echo "# run after the agent exited, in $PROJECT"
 		echo
-	} >"$vlog" 2>/dev/null || vlog=/tmp/firecode-verify.log
+	} >"$vlog" 2>/dev/null || true
 	if [[ $RUN_USER == root ]]; then
 		timeout --signal=TERM --kill-after=30s "${FIRECODE_VERIFY_TIMEOUT:-1800}" \
 			env "${ENV[@]}" bash -lc "cd $(printf '%q' "$PROJECT") && $FIRECODE_VERIFY" \
@@ -401,7 +412,7 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	# The last lines on the console, because a failure nobody sees is the
 	# problem this exists to solve. The whole output stays in the log.
 	tail -n 25 "$vlog" 2>/dev/null | sed 's/^/  /'
-	echo "$vrc" >"$PROJECT/.firecode-verify-status" 2>/dev/null || true
+	echo "$vrc" >/tmp/firecode-verify-status 2>/dev/null || true
 	if ((vrc == 0)); then
 		log "verification passed in ${took}s"
 	elif ((vrc == 124)); then
@@ -413,6 +424,16 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	# whether the work can be used, not whether the agent thought so.
 	((vrc == 0)) || rc=$vrc
 fi
+
+# Now the markers go in, with the gate finished and nothing left to mislead.
+# The host reads them out of the delivered tree and deletes them there, so
+# they are a courier rather than part of anyone's project.
+[[ -f $STATUS_TMP ]] &&
+	cp -f "$STATUS_TMP" "$PROJECT/.firecode-exit-status" 2>/dev/null
+[[ -f /tmp/firecode-verify-status ]] &&
+	cp -f /tmp/firecode-verify-status "$PROJECT/.firecode-verify-status" 2>/dev/null
+[[ -f /tmp/firecode-verify.log ]] &&
+	cp -f /tmp/firecode-verify.log "$PROJECT/.firecode-verify.log" 2>/dev/null
 
 sync
 exit "$rc"
