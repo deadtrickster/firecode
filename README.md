@@ -303,6 +303,35 @@ An unattended run is stricter still: it prints logs, so nothing but text gets
 through. The console log keeps the unfiltered bytes, so the record is complete.
 `--raw` on the console turns the filter off.
 
+## What tools the agent has in there
+
+Split by **transport**, not by which server you like:
+
+| your MCP server | in a VM |
+|---|---|
+| http on the host's localhost | **relayed over vsock** - `localhost:9755` in the guest is `localhost:9755` out here, same address, no config change |
+| stdio (a local binary) | **dropped** - the binary lives at a host path that does not exist in there |
+| interactively authenticated (claude.ai connectors) | absent - the guest cannot open a browser to log in |
+
+Every run says which is which, so it is visible rather than folklore:
+
+```
+[firecode]   MCP unavailable in guest (host stdio binaries): codebase-memory-mcp, serenedash
+[firecode]   MCP relayed over vsock: oracle-ask, source-grep, oracle-lsp
+```
+
+To get a stdio server into a guest, either install its binary in the image or
+wrap it in http on the host, where it is relayed like the rest.
+
+A **spawned** run is different and deliberately so: it is started with an empty
+MCP config, so it has no tools at all. That is the flat-depth boundary - a
+child that could reach the spawn server could start VMs of its own, and the
+concurrency caps would stop meaning anything. It is a policy in the spawn
+server rather than a limitation of the harness, and it costs the child nothing
+in *voice*: `firecode-chat` is on PATH in every guest, so a spawned agent can
+still say it is blocked and ask a question. Talking and fanning out are
+different powers.
+
 ## What the agent is told
 
 Three things reach the model, and only these:
@@ -588,8 +617,18 @@ firecode claude --host-port 9770 "farm this out across the sub-projects"
 
 Projects are named keys from the config, never paths from the caller -
 otherwise an agent could ask for any directory and read it in a VM it controls.
+An agent that has nowhere of its own to work asks for `workspace_new`, which
+makes one inside a scratch directory the operator nominates - before that
+existed, every agent borrowed the one configured project and built over what
+the last one left.
+
 Children run with `--no-mcp` and an empty `--mcp-config`, so they cannot reach
-the server and spawn in turn.
+the server and spawn in turn. That is about fan-out, not about voice: a
+spawned agent still has `firecode-chat` and can say it is blocked or ask a
+question. If you ever relax the flatness, the three conditions are a depth
+budget decremented per level, a fresh workspace per child, and the parent run
+recorded on it - the second because two runs sharing one workspace layer
+corrupt it, which surfaces as a guest whose root has gone read-only.
 
 The tools come in two shapes. `spawn`, `status`, `output` and `cancel` are for
 work handed off and collected later. `vm_up`, `vm_in`, `vm_down`, `vm_list`,

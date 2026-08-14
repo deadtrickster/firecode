@@ -132,7 +132,9 @@ claim.
 
 - MCP servers that run as local commands on the host are **not** here; their
   binaries live on the host filesystem. Ones reached over http on localhost
-  are, at the same address.
+  are, at the same address. If you were started unattended by another agent
+  you have no MCP servers at all - that is deliberate, and it is about
+  starting VMs, not about talking: `firecode-chat` still works.
 - Anything else the run was told to forward is on the same `localhost:<port>`
   it uses on the host - a local model server, for instance.
 - There is no `gh` and no ssh key. That is deliberate.

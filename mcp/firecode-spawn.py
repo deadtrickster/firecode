@@ -756,7 +756,19 @@ def build_tools(cfg):
             "description": (
                 "Start a sibling microVM that runs an agent on a project, "
                 "unattended, and return its run id. The VM is isolated from "
-                "the host and from you. Poll with status, read with output."),
+                "the host and from you. Poll with status, read with output.\n\n"
+                "A spawned agent gets NO MCP servers - not an oversight, but "
+                "the flat-depth boundary: one that could reach this server "
+                "would start VMs of its own and the concurrency caps would "
+                "stop meaning anything. It can still talk: firecode-chat is on "
+                "PATH in every guest, so it can report being blocked and ask a "
+                "question while it works. Voice and fan-out are different "
+                "powers.\n\n"
+                "A run started from the command line instead (firecode claude) "
+                "does get MCP, split by transport: http servers on the host's "
+                "localhost are relayed over vsock and work unchanged; stdio "
+                "servers are dropped, because their binaries are host paths "
+                "that do not exist in a guest."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
