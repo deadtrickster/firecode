@@ -46,6 +46,7 @@ QUIET_BOOT=1
 AUTO_FLAGS=1
 TIMEOUT=0
 WORKDIR="."
+WORKDIR_EXPLICIT=0
 AGENT=""
 SYNC_BACK=1
 FAST=0
@@ -2353,7 +2354,7 @@ cmd_chat() {
 	# and a chat room that quietly answers 404 because it never started is
 	# worse than one on an odd port.
 	local port=${FIRECODE_CHAT_PORT:-9761} who=${FIRECODE_CHAT_NAME:-$(id -un)@host}
-	local mode=say since=0 wait=0
+	local mode=say since=0 wait=0 tail=${FIRECODE_CHAT_TAIL:-20}
 	while [[ ${1:-} == -* || ${1:-} == serve || ${1:-} == install ]]; do
 		case "${1:-}" in
 		serve)
@@ -2382,6 +2383,10 @@ cmd_chat() {
 			wait=${FIRECODE_CHAT_WAIT:-120}
 			shift
 			;;
+		--all)
+			tail=0
+			shift
+			;;
 		--since)
 			since="$2"
 			shift 2
@@ -2394,7 +2399,7 @@ cmd_chat() {
 			port="$2"
 			shift 2
 			;;
-		*) die "usage: firecode chat [serve|--read|--wait|--as NAME] [text...]" ;;
+		*) die "usage: firecode chat [serve|--read [--all]|--wait|--as NAME] [text...]" ;;
 		esac
 	done
 
@@ -2509,19 +2514,53 @@ if d.get("messages"):
 	fi
 
 	if [[ $mode == read ]]; then
-		curl -s -m $((wait + 30)) \
-			"http://127.0.0.1:$port/messages?since=$since&wait=$wait" |
-			python3 -c '
-import json, sys, time
+		# A tail, not a transcript.
+		#
+		# This used to print the room from its first message every time, and
+		# a room that has been up all day is 90KB of it. For an agent that is
+		# not merely noise: it is most of a context window spent re-reading
+		# conversations it already had, which is how a session comes back
+		# from a compaction and reaches for curl instead of this command.
+		#
+		# So the default is the last few messages, and --all is there for the
+		# times you genuinely want the whole thing. --since still overrides.
+		FIRECODE_CHAT_TAIL=$tail python3 -c '
+import json, os, sys, time
 d = json.load(sys.stdin)
-for m in d.get("messages", []):
+msgs = d.get("messages", [])
+tail = int(os.environ.get("FIRECODE_CHAT_TAIL") or 0)
+if tail and len(msgs) > tail:
+    print("(%d earlier message(s) not shown - firecode chat --read --all)"
+          % (len(msgs) - tail))
+    msgs = msgs[-tail:]
+for m in msgs:
     stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
     print("[%s] %s: %s" % (stamp, m["from"], m["text"]))
-print("-- last id: %d" % d.get("last", 0))'
+print("-- last id: %d" % d.get("last", 0))' \
+			< <(curl -s -m $((wait + 30)) \
+				"http://127.0.0.1:$port/messages?since=$since&wait=$wait")
 		return 0
 	fi
 
 	[[ $# -gt 0 ]] || die "usage: firecode chat 'what you want to say'"
+	# Remember who this session speaks as.
+	#
+	# Everyone in the room picks a name - orchestrator, flowy, claude-host -
+	# and nothing outside this command knows which of them is you. The Stop
+	# hook found that out the hard way: with no way to recognise its own
+	# messages it read back a question the session had just asked and refused
+	# to let it finish, which is the most annoying possible bug to ship into
+	# somebody else's session.
+	#
+	# Keyed by directory because that is the one thing a session and its
+	# hooks demonstrably agree on - the hook is handed cwd, and this runs in
+	# it. Two sessions sharing a directory is the only collision, and it just
+	# costs a self-message that was not filtered.
+	mkdir -p "$RUNS" 2>/dev/null || true
+	local self_file="$RUNS/chat-self-${PWD//[^A-Za-z0-9._-]/-}"
+	grep -qxF -- "$who" "$self_file" 2>/dev/null ||
+		printf '%s\n' "$who" >>"$self_file" 2>/dev/null || true
+
 	FIRECODE_CHAT_WHO="$who" FIRECODE_CHAT_TEXT="$*" python3 -c '
 import json, os, sys, urllib.request
 body = json.dumps({"from": os.environ["FIRECODE_CHAT_WHO"],
@@ -3291,6 +3330,7 @@ launch() {
 		case "$1" in
 		--workdir | --project)
 			WORKDIR="$2"
+			WORKDIR_EXPLICIT=1
 			shift 2
 			;;
 		--mem)
@@ -3514,6 +3554,36 @@ launch() {
 
 	resolve_assets
 	WORKDIR=$(cd "$WORKDIR" && pwd) || die "workdir does not exist"
+
+	# Never pack a huge directory nobody named.
+	#
+	# WORKDIR defaults to the current one, which is right when a person is
+	# standing in their project and dangerous when something else invokes
+	# firecode from wherever it happened to be. An orchestrator meaning to
+	# run on a small test directory got its 264G checkout packed instead,
+	# twice, and noticed by watching the disk reach 98%.
+	#
+	# The cost of being wrong is asymmetric - a refusal costs one flag, a
+	# mistaken pack costs a filled disk and a long wait - so implicit and
+	# large is refused, while --project stays a decision anybody can make.
+	if ((WORKDIR_EXPLICIT == 0)) && [[ $AGENT != shell ]]; then
+		local limit=${FIRECODE_MAX_IMPLICIT_PROJECT:-$((4 * 1024 * 1024 * 1024))}
+		local bytes
+		# Bounded on purpose: a tree too big to measure in five seconds is
+		# too big to have been chosen by accident.
+		bytes=$(timeout 5 du -sx --block-size=1 "$WORKDIR" 2>/dev/null | cut -f1)
+		if [[ ! $bytes =~ ^[0-9]+$ ]] || ((bytes > limit)); then
+			local size="too large to even measure in 5s"
+			[[ $bytes =~ ^[0-9]+$ ]] &&
+				size=$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "$bytes bytes")
+			die "refusing to pack $WORKDIR ($size) - you did not ask for this directory,
+       it is just where you were standing. Name it if you meant it:
+         firecode $AGENT --project $WORKDIR ...
+       or point somewhere smaller:
+         firecode $AGENT --project /path/to/project ...
+       (raise the limit with FIRECODE_MAX_IMPLICIT_PROJECT=<bytes>)"
+		fi
+	fi
 
 	# Run in a git worktree of this repository, making it if it is not there.
 	# Each worktree gets its own layer and inherits the main checkout's, so
