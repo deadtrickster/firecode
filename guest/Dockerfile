@@ -25,10 +25,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Everyday tooling an agent expects to find.
+#
+# fuse3 and its headers are in here rather than left to be installed per
+# project: the kernel has CONFIG_FUSE_FS built in, so a filesystem written in
+# a VM works - but only if the userspace half exists, and finding out that it
+# does not is a detour taken once per project for no reason. libfuse-dev is
+# what a C filesystem builds against; fusepy and pyfuse3 cover the two ways
+# anyone writes one in Python, and neither is packaged usefully by pip inside
+# a VM with no wheels cached.
+#
+# Nothing across the VM boundary comes from this: firecracker has no
+# virtio-fs, so a FUSE mount lives and dies inside the guest, and what travels
+# is still the project drive.
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	git git-lfs openssh-client \
 	build-essential make pkg-config \
 	python3 python3-pip python3-venv \
+	fuse3 libfuse3-dev libfuse-dev \
+	python3-fusepy python3-pyfuse3 \
 	ripgrep fd-find jq unzip tar xz-utils zstd \
 	libicu74 \
 	vim less tmux procps psmisc file bash-completion \
@@ -36,11 +50,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Node (agents and their MCP servers assume it) and bun.
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+#
+# --retry, because a build host on a VPN resolves and connects unreliably, and
+# a single curl that gives up takes the whole image with it - twenty minutes
+# of work lost to one refused name. curl's own retry covers the transient
+# case; the DNS case is handled a level up, where prepare notices "could not
+# resolve" and rebuilds on the host network.
+RUN curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 \
+	https://deb.nodesource.com/setup_22.x | bash - \
 	&& apt-get install -y --no-install-recommends nodejs \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& npm install -g pnpm yarn 2>/dev/null || true
-RUN curl -fsSL https://bun.sh/install | bash \
+RUN curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 \
+	https://bun.sh/install | bash \
 	&& ln -sf /root/.bun/bin/bun /usr/local/bin/bun
 
 # Optional heavy toolchains. Skipped by default: they roughly quadruple both
@@ -81,10 +103,17 @@ RUN curl -fsSL https://mise.run | sh \
 #
 #   firecode prepare --with "dotnet@10 java@temurin-21 uv"
 ARG FIRECODE_TOOLS=
+# Retried, and with a timeout that suits a toolchain rather than a web page.
+# Every install here pulls a few hundred megabytes from a different host -
+# dot.net, temurin, astral - and mise gives up after 30 seconds by default, so
+# one slow mirror fails a twenty-minute build at the last step. Three attempts
+# with a pause between them turns "come back and run it again" into "it took
+# a bit longer".
+ENV MISE_HTTP_TIMEOUT=300
 RUN if [ -n "$FIRECODE_TOOLS" ]; then \
 	set -eux; \
 	mise use -g $FIRECODE_TOOLS; \
-	mise install -y; \
+	mise install -y || { sleep 10; mise install -y; } || { sleep 30; mise install -y; }; \
 	mise reshim; \
 	mise ls --installed; \
 	chmod -R a+rX /opt/mise; \

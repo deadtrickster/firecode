@@ -97,12 +97,56 @@ echo "[prepare] building container image ($TOOLCHAINS toolchains)"
 [[ -n $TOOLS ]] && echo "[prepare] base toolchain: $TOOLS"
 mkdir -p "$IMAGES"
 printf '%s' "$TOOLS" >"$TOOLS_FILE"
-# shellcheck disable=SC2086  # NO_CACHE is a deliberate single optional flag
-docker build $NO_CACHE \
-	--build-arg "FIRECODE_TOOLCHAINS=$TOOLCHAINS" \
-	--build-arg "FIRECODE_TOOLS=$TOOLS" \
-	-t "$IMAGE_TAG" \
-	"$GUEST"
+# Can a container on the default bridge resolve anything at all?
+#
+# Asked once, cheaply, before committing twenty minutes to finding out. On a
+# host running a VPN the bridge's DNS is often not merely flaky but dead - it
+# times out with "no servers could be reached" every time - and the failure
+# arrives disguised as "Unable to locate package", pages into the build. One
+# probe turns that into a decision.
+bridge_resolves() {
+	timeout 45 docker run --rm --network bridge busybox:latest \
+		nslookup archive.ubuntu.com >/dev/null 2>&1
+}
+
+build_image() {
+	# shellcheck disable=SC2086  # NO_CACHE is a deliberate single optional flag
+	docker build $NO_CACHE ${1:+--network=host} \
+		--build-arg "FIRECODE_TOOLCHAINS=$TOOLCHAINS" \
+		--build-arg "FIRECODE_TOOLS=$TOOLS" \
+		-t "$IMAGE_TAG" \
+		"$GUEST" 2>&1 | tee "$IMAGES/.prepare-build.log"
+	return "${PIPESTATUS[0]}"
+}
+
+# Retry on the host network when the build cannot resolve anything.
+#
+# A build that cannot reach the archive reports itself as a pile of "Unable to
+# locate package" lines, one per package, which reads like a broken package
+# list rather than a broken network. The cause is the docker bridge - on a
+# machine that also runs VMs and their taps, its DNS is one of the first
+# things to stop working - and --network=host steps around it without changing
+# what gets built.
+NET=""
+if ! bridge_resolves; then
+	echo "[prepare] the docker bridge cannot resolve names - building on the host network"
+	NET=host
+fi
+
+if ! build_image "$NET"; then
+	# Every way this machine's bridge says "no DNS". apt says one thing, curl
+	# says another, and getaddrinfo says a third; matching only the first
+	# meant a build that failed on a curl step never got the retry. Kept as a
+	# fallback for the case the probe passed and the build still lost DNS
+	# halfway through, which a VPN reconnect will do.
+	if [[ -z $NET ]] && grep -qE "Temporary failure resolving|Could not resolve host|Name or service not known|Could not resolve proxy" \
+		"$IMAGES/.prepare-build.log" 2>/dev/null; then
+		echo "[prepare] lost DNS during the build - retrying on the host network"
+		build_image host || exit 1
+	else
+		exit 1
+	fi
+fi
 
 TAR="$IMAGES/.rootfs-export.tar"
 cleanup() { rm -f "$TAR"; }

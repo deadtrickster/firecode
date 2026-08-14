@@ -77,8 +77,19 @@ done
 
 # The layers have to come along, or the running system cannot see the
 # filesystems its own root is built from.
-/bin/busybox mkdir -p /newroot/run/firecode/base /newroot/run/firecode/upper
-/bin/busybox mount --move /upper /newroot/run/firecode/upper 2>/dev/null || true
+#
+# Not under /run: systemd mounts a tmpfs there during boot, straight over
+# whatever this put in place. The mount survives - it is still in mountinfo,
+# still holding the layer - but its path no longer resolves, so every
+# shutdown ends with
+#     Failed to remount '/run/firecode/upper' read-only: No such file or directory
+#     Failed to unmount /run/firecode/upper: No such file or directory
+#     Unable to finalize remaining file systems, ignoring.
+# which makes a clean run look broken and buries any real unmount failure
+# among the noise. /firecode is on the overlay root and nothing else claims
+# it.
+/bin/busybox mkdir -p /newroot/firecode/base /newroot/firecode/upper
+/bin/busybox mount --move /upper /newroot/firecode/upper 2>/dev/null || true
 
 /bin/busybox mount --move /dev /newroot/dev 2>/dev/null || true
 /bin/busybox umount /proc 2>/dev/null || true

@@ -251,6 +251,23 @@ overlay_home() {
 
 setup_git() {
 	local as=(runuser -u "${FIRECODE_USER:-root}" --)
+
+	# A global config git cannot parse breaks every git command in the VM.
+	#
+	# It lives in the home directory, which is in this workspace's layer, so
+	# it persists: one run writes a malformed ~/.gitconfig - a truncated
+	# heredoc, an echo that lost its quoting - and every later run in the same
+	# project starts with "fatal: bad config line 1" on everything, including
+	# this setup's own attempts to fix it. Moved aside rather than deleted,
+	# because whatever is in there was somebody's intent.
+	local home_dir="${FIRECODE_HOME:-/root}"
+	if [[ -f $home_dir/.gitconfig ]] &&
+		! "${as[@]}" git config --global --list >/dev/null 2>&1; then
+		mv -f "$home_dir/.gitconfig" "$home_dir/.gitconfig.broken" 2>/dev/null &&
+			log "WARNING: ~/.gitconfig could not be parsed by git - moved to
+       ~/.gitconfig.broken and starting a fresh one. It was left by an
+       earlier run in this workspace; the layer keeps home directories."
+	fi
 	[[ -n ${FIRECODE_GIT_NAME:-} ]] &&
 		"${as[@]}" git config --global user.name "$FIRECODE_GIT_NAME"
 	[[ -n ${FIRECODE_GIT_EMAIL:-} ]] &&
@@ -309,6 +326,18 @@ main() {
 	mount_disks
 	setup_network
 	setup_relays
+
+	# A command, not a paragraph.
+	#
+	# The room is plain HTTP on a forwarded port and the briefing says so, but
+	# an agent looking for a way to talk looks for a *tool* - and finding no
+	# chat tool, concludes there is no room and says nothing. Three of them
+	# did exactly that, each with something worth saying. On PATH it is
+	# discoverable the way agents actually discover things.
+	if [[ -f $CTL_MNT/chat-client.sh ]]; then
+		install -m 0755 "$CTL_MNT/chat-client.sh" /usr/local/bin/firecode-chat 2>/dev/null &&
+			log "firecode-chat talks to the other agents on this machine"
+	fi
 
 	# Must be mounted before the overlays: it holds their upper layers, which
 	# is what makes the agent's sessions survive the VM.
