@@ -2149,6 +2149,92 @@ cmd_in() {
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
 }
 
+# Put a finished run's work back into the workspace it came from.
+#
+# A run does not write to its project: it works on a copy and delivers to a
+# sibling directory. That is right for one run and wrong for a sequence of
+# them - phase two starts from the original tree while phase one's work sits
+# in a directory nobody read, and its gate fails on files that exist a few
+# inches away. Everyone who builds in phases writes the same three lines of
+# git to fix it, so here they are once, with the checks that make them safe.
+cmd_land() {
+	local want="" force=0
+	while [[ ${1:-} == --* ]]; do
+		case "$1" in
+		--force)
+			# Land work whose gate failed. Sometimes right - a failing test
+			# and a useful diff are not exclusive - but never the default.
+			force=1
+			shift
+			;;
+		*) die "usage: firecode land [--force] <run-id>" ;;
+		esac
+	done
+	want=${1:?usage: firecode land [--force] <run-id>}
+
+	local rd="$RUNS/$want"
+	[[ -d $rd ]] || die "no run $want here. firecode list shows what there is."
+	local result workdir
+	result=$(cat "$rd/result" 2>/dev/null || true)
+	workdir=$(cat "$rd/workdir" 2>/dev/null || true)
+	[[ -n $result && -d $result ]] ||
+		die "run $want has no result directory recorded - it may still be
+       running, or it delivered nothing. firecode status $want"
+	[[ -n $workdir && -d $workdir ]] ||
+		die "run $want does not record which workspace it came from"
+
+	# What the harness decided, not what the agent said.
+	local verdict="" exited=""
+	verdict=$(cat "$rd/verify-status" 2>/dev/null || true)
+	exited=$(cat "$rd/exit-status" 2>/dev/null || true)
+	if [[ -n $verdict && $verdict != 0 ]]; then
+		((force)) || die "that run's gate FAILED (exit $verdict), so its work is not landed.
+       Read $result/.firecode-verify.log first. --force lands it anyway."
+		log "landing work whose gate failed, because you asked"
+	elif [[ -z $verdict ]]; then
+		# Not the same as passing, and the difference has cost a day here.
+		log "note: that run had no verify command, so nothing checked it"
+		[[ $exited == 0 || -z $exited ]] ||
+			log "  and its agent exited $exited"
+	fi
+
+	[[ -d $result/.git ]] ||
+		die "there is no git history in $result, so there is nothing to land.
+       The agent produced files without committing them; copy what you want
+       by hand, and next time say in the task that committing is part of it."
+
+	# Committed only, and everything else named rather than dropped quietly.
+	local dirty
+	dirty=$(git -C "$result" status --porcelain 2>/dev/null | head -20)
+	if [[ -n $dirty ]]; then
+		log "these are in the result but were never committed, so they stay there:"
+		printf '%s\n' "$dirty" | sed 's/^/    /'
+	fi
+
+	git -C "$workdir" rev-parse --git-dir >/dev/null 2>&1 ||
+		die "$workdir is not a git repository, so there is nothing to fast-forward"
+
+	git -C "$workdir" fetch -q "$result" HEAD 2>/dev/null ||
+		die "could not read the history in $result"
+
+	local before after
+	before=$(git -C "$workdir" rev-parse HEAD 2>/dev/null || echo none)
+	if ! git -C "$workdir" merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
+		die "not a fast-forward: $workdir has moved since that run started.
+       Its head is $before, the run's is $(git -C "$workdir" rev-parse FETCH_HEAD)
+       Merge it yourself - that is a decision, not a mechanical step:
+         git -C $workdir merge FETCH_HEAD"
+	fi
+	after=$(git -C "$workdir" rev-parse HEAD)
+
+	if [[ $before == "$after" ]]; then
+		log "already landed - $workdir was up to date"
+	else
+		log "landed $(git -C "$workdir" rev-list --count "$before..$after") commit(s) into $workdir"
+		git -C "$workdir" --no-pager log --oneline "$before..$after" | sed 's/^/    /'
+	fi
+}
+
 # Build the next guest image inside a guest.
 #
 # The docker path exists because something has to unpack packages into a
@@ -4436,15 +4522,27 @@ EOF
 		local out_dir="${DELIVER:-${WORKDIR}-${id#firecode-}}"
 		log "copying the project out to $out_dir"
 		extract_image "$src_drive" "$out_dir"
+		# The run directory remembers what the delivered tree is about to
+		# forget. These markers are deleted from the result - they are
+		# harness bookkeeping, not somebody's work - and until now the verdict
+		# and the result path existed only in a log line. Anything asking
+		# later "did that run pass, and where did it land" had to grep a
+		# console; `land` cannot be built on that, and neither can an honest
+		# status.
+		printf '%s\n' "$out_dir" >"$RUN_DIR/result"
+		printf '%s\n' "$WORKDIR" >"$RUN_DIR/workdir"
+
 		local st="$out_dir/.firecode-exit-status"
 		if [[ -f $st ]]; then
 			log "agent exit status: $(cat "$st")"
+			cp -f "$st" "$RUN_DIR/exit-status"
 			rm -f "$st"
 		fi
 		# Said last, because it is the part that decides whether any of this
 		# is worth reading. The log stays in the delivered tree either way.
 		local vst="$out_dir/.firecode-verify-status"
 		if [[ -f $vst ]]; then
+			cp -f "$vst" "$RUN_DIR/verify-status"
 			if [[ $(cat "$vst") == 0 ]]; then
 				log "verification passed - see $out_dir/.firecode-verify.log"
 			else
@@ -5112,6 +5210,10 @@ watch)
 	shift
 	cmd_watch "$@"
 	;;
+land)
+	shift
+	cmd_land "$@"
+	;;
 chat)
 	shift
 	cmd_chat "$@"
@@ -5143,6 +5245,36 @@ net-setup)
 	;;
 spawn-server)
 	shift
+	# `restart` because everyone gets this wrong by hand, including me.
+	#
+	# The server loads its code and config once, so every change needs a
+	# bounce - and the obvious `pkill -f firecode-spawn.py` matches the shell
+	# that is running it, kills that instead, and leaves the old server
+	# holding the port. A guard like `pgrep || start` then sees something
+	# running and skips. Mine sat six hours behind its own source that way,
+	# while I told people the fixes were live.
+	if [[ ${1:-} == restart || ${1:-} == --restart ]]; then
+		shift
+		local_pid=$(ss -lntp 2>/dev/null |
+			sed -n 's/.*:9770 .*pid=\([0-9]*\).*/\1/p' | head -1)
+		if [[ -n $local_pid ]]; then
+			log "stopping the server on 9770 (pid $local_pid)"
+			kill "$local_pid" 2>/dev/null || true
+			waited=0
+			while ((waited < 50)) && ss -ltn 2>/dev/null | grep -q ":9770 "; do
+				sleep 0.1
+				waited=$((waited + 1))
+			done
+		fi
+		setsid python3 "$ROOT/mcp/firecode-spawn.py" "$@" \
+			>"$RUNS/spawn-server.log" 2>&1 &
+		disown 2>/dev/null || true
+		sleep 2
+		ss -ltn 2>/dev/null | grep -q ":9770 " ||
+			die "it did not come back up - see $RUNS/spawn-server.log"
+		log "spawn server restarted on the code that is on disk now"
+		exit 0
+	fi
 	exec python3 "$ROOT/mcp/firecode-spawn.py" "$@"
 	;;
 test)

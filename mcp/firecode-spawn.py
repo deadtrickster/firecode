@@ -209,7 +209,7 @@ class Runs:
         return [r for r in self.runs.values() if r["state"] == "running"]
 
     def spawn(self, project, task, timeout=None, resume=None, parent_run=None,
-              verify=None, agent=None, model=None):
+              verify=None, agent=None, model=None, land_on_pass=False):
         with self.lock:
             if project not in self.cfg.projects:
                 raise ValueError(
@@ -297,6 +297,7 @@ class Runs:
                 "exit_code": None,
                 "log": log_path,
                 "result_dir": None,
+                "land_on_pass": bool(land_on_pass),
                 "proc": proc,
                 "_log_fh": log,
             }
@@ -319,6 +320,39 @@ class Runs:
             if run["state"] == "running":
                 run["state"] = "finished" if code == 0 else "failed"
             run["result_dir"] = self._parse_result_dir(run["log"])
+            # The harness's own run id, which is not this server's - two
+            # namespaces again, and `land` speaks the harness's one.
+            run["firecode_run"] = self._parse_firecode_run(run["log"])
+
+        # Land it, if that was asked for and it earned it.
+        #
+        # Outside the lock: landing shells out to git and there is no reason
+        # to hold every other caller while it does. Only on a clean exit -
+        # the harness has already refused to report a failed gate as success,
+        # and this must not undo that by folding a failure into the workspace.
+        if run.get("land_on_pass") and code == 0 and run.get("firecode_run"):
+            rc, out = _firecode(["land", run["firecode_run"]], timeout=180)
+            run["landed"] = (rc == 0)
+            run["land_output"] = out
+            if rc != 0:
+                # Said loudly rather than swallowed: an automatic step that
+                # quietly did not happen is the same class of bug as a gate
+                # that was never armed. The usual cause is somebody editing
+                # the workspace while the phase ran.
+                print(f"[spawn] land failed for {run_id}: {out}", file=sys.stderr)
+
+    @staticmethod
+    def _parse_firecode_run(log_path):
+        """The harness's run id, from the line it prints when a run starts."""
+        try:
+            with open(log_path, errors="replace") as fh:
+                for line in fh:
+                    m = re.search(r"\brun (firecode-[0-9]+-[0-9]+)", line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+        return None
 
     @staticmethod
     def _parse_result_dir(log_path):
@@ -623,6 +657,33 @@ def build_tools(cfg):
             },
         },
         {
+            "name": "land",
+            "description": (
+                "Put a finished run's committed work back into the workspace "
+                "it came from, so the next run builds on it.\n\n"
+                "A run never writes to its project: it works on a copy and "
+                "delivers beside it. For one run that is the safety; for a "
+                "sequence it is a trap, because phase two starts from the "
+                "original tree while phase one's work sits in a directory "
+                "nobody read, and its gate fails on files that exist a few "
+                "inches away.\n\n"
+                "It refuses rather than guesses: a run whose gate failed is "
+                "not landed (pass force to override), work that was never "
+                "committed is named and left behind, and a workspace that has "
+                "moved since the run started is a merge for a person, not a "
+                "mechanical fast-forward. Landing twice is harmless."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string",
+                               "description": "The run to land - the id spawn returned."},
+                    "force": {"type": "boolean",
+                              "description": "Land even though the gate failed."},
+                },
+                "required": ["run_id"],
+            },
+        },
+        {
             "name": "workspace_new",
             "description": (
                 "Make a fresh, empty project of your own and get its name "
@@ -810,6 +871,17 @@ def build_tools(cfg):
                             "giving one matters: with no model it picks from "
                             "the provider's list and may choose something "
                             "that cannot write code at all."),
+                    },
+                    "land_on_pass": {
+                        "type": "boolean",
+                        "description": (
+                            "When the run exits cleanly, put its committed "
+                            "work back into the workspace so the next phase "
+                            "builds on it. Without this the result sits in a "
+                            "sibling directory and the next run starts from "
+                            "the tree as it was - which is the trap every "
+                            "multi-phase build falls into once. Refused, "
+                            "loudly, if the workspace has moved meanwhile."),
                     },
                     "verify": {
                         "type": "string",
@@ -1121,6 +1193,26 @@ def call_tool(cfg, runs, name, args, caller_run=None):
                 f"vm_checkpoint after setting it up again, or take it on a VM "
                 f"started without --fast.")
 
+    if name == "land":
+        run = runs.runs.get(args["run_id"])
+        if not run:
+            return (f"no run {args['run_id']!r} in this server's memory. If it "
+                    f"was started before a restart, land it from a shell: "
+                    f"firecode land <the harness run id from its log>.")
+        if run["state"] == "running":
+            return (f"{args['run_id']} is still going - nothing to land yet. "
+                    f"vm_watch or status until it is done.")
+        fc_run = run.get("firecode_run")
+        if not fc_run:
+            return (f"could not work out which harness run {args['run_id']} was "
+                    f"- its log is at {run['log']}, and `firecode land <id>` "
+                    f"takes the id from the 'run firecode-...' line in it.")
+        rc, out = _firecode(["land"] + (["--force"] if args.get("force") else [])
+                            + [fc_run], timeout=180)
+        if rc != 0:
+            return explain(f"Landing {args['run_id']}", out, rc)
+        return out or "landed."
+
     if name == "workspace_new":
         key, path = _workspace_new(cfg, args["name"])
         return (f"{key} is yours, at {path} - empty, a git repo, and usable as "
@@ -1328,7 +1420,8 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         run_id = runs.spawn(args["project"], args["task"],
                             args.get("timeout"), args.get("resume"),
                             parent_run=caller_run, verify=args.get("verify"),
-                            agent=args.get("agent"), model=args.get("model"))
+                            agent=args.get("agent"), model=args.get("model"),
+                            land_on_pass=args.get("land_on_pass"))
         gate = args.get("verify")
         return (f"started {run_id} on {args['project']}. "
                 f"It runs unattended and shuts down when done. "
