@@ -12,7 +12,9 @@ not a protocol.
 
     chat.py --port 9760 [--log runs/chat.log]
 
-    POST /say      {"from": "...", "text": "..."}     -> {"id": N}
+    POST /say      {"from": "...", "text": "...", "to": "..."} -> {"id": N}
+                   "to" is optional and names one recipient; without it the
+                   message is for the room.
     GET  /messages?since=N&wait=30                    -> {"messages": [...]}
     GET  /                                            -> the log, as text
 
@@ -82,10 +84,25 @@ SPOKE = threading.Condition(LOCK)
 LOG_PATH = None
 
 
-def say(who, text):
+def say(who, text, to=None):
+    """`to` names a recipient, or None for everybody.
+
+    Without it the room is a broadcast, and every reader has to guess which
+    messages are its business by looking for its own name in the prose. That
+    guess is wrong in both directions: it misses a reply that answers you
+    without naming you, and it matches any mention of you in a message meant
+    for somebody else. Readers that act on the guess - a hook that wakes a
+    session, say - then spend a turn each on traffic that was never theirs,
+    and every session ends up carrying the whole room in its context.
+
+    A recipient is one field and it is exact. Broadcast stays the default,
+    because a room where everything must be addressed stops being a room.
+    """
     with SPOKE:
         msg = {"id": len(MESSAGES) + 1, "at": time.time(),
                "from": who or "someone", "text": text}
+        if to:
+            msg["to"] = to
         MESSAGES.append(msg)
         SPOKE.notify_all()
     if LOG_PATH:
@@ -112,7 +129,8 @@ def as_text(msgs):
     lines = []
     for m in msgs:
         stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
-        lines.append(f"[{stamp}] {m['from']}: {m['text']}")
+        who = m["from"] + (f" -> {m['to']}" if m.get("to") else "")
+        lines.append(f"[{stamp}] {who}: {m['text']}")
     return "\n".join(lines)
 
 
@@ -141,7 +159,7 @@ class Room(BaseHTTPRequestHandler):
         text = (data.get("text") or "").strip()
         if not text:
             return self._send(400, '{"error":"nothing to say"}')
-        msg = say(data.get("from"), text)
+        msg = say(data.get("from"), text, data.get("to"))
         self._send(200, json.dumps({"id": msg["id"]}))
 
     def do_GET(self):

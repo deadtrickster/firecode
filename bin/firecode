@@ -2354,7 +2354,7 @@ cmd_chat() {
 	# and a chat room that quietly answers 404 because it never started is
 	# worse than one on an odd port.
 	local port=${FIRECODE_CHAT_PORT:-9761} who=${FIRECODE_CHAT_NAME:-$(id -un)@host}
-	local mode=say since=0 wait=0 tail=${FIRECODE_CHAT_TAIL:-20}
+	local mode=say since=0 wait=0 to="" tail=${FIRECODE_CHAT_TAIL:-20}
 	while [[ ${1:-} == -* || ${1:-} == serve || ${1:-} == install ]]; do
 		case "${1:-}" in
 		serve)
@@ -2395,11 +2395,20 @@ cmd_chat() {
 			who="$2"
 			shift 2
 			;;
+		--to)
+			# Who it is for. Without it the message is for the room, which
+			# is the right default and the wrong thing to rely on when you
+			# want an answer: a reader deciding by looking for its own name
+			# in the prose misses "thanks, that fixed it" and matches a
+			# message about it meant for somebody else.
+			to="$2"
+			shift 2
+			;;
 		--port)
 			port="$2"
 			shift 2
 			;;
-		*) die "usage: firecode chat [serve|--read [--all]|--wait|--as NAME] [text...]" ;;
+		*) die "usage: firecode chat [serve|--read [--all]|--wait|--as NAME|--to NAME] [text...]" ;;
 		esac
 	done
 
@@ -2491,7 +2500,8 @@ for m in d.get("messages", []):
     if m.get("from") == me:
         continue
     stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
-    print("[%s] %s: %s" % (stamp, m["from"], m["text"]))
+    who = m["from"] + (" -> " + m["to"] if m.get("to") else "")
+    print("[%s] %s: %s" % (stamp, who, m["text"]))
 if d.get("messages"):
     # The mark moves past everything that was read, including your own -
     # otherwise the next call reads them again and skips them again forever.
@@ -2535,7 +2545,8 @@ if tail and len(msgs) > tail:
     msgs = msgs[-tail:]
 for m in msgs:
     stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
-    print("[%s] %s: %s" % (stamp, m["from"], m["text"]))
+    who = m["from"] + (" -> " + m["to"] if m.get("to") else "")
+    print("[%s] %s: %s" % (stamp, who, m["text"]))
 print("-- last id: %d" % d.get("last", 0))' \
 			< <(curl -s -m $((wait + 30)) \
 				"http://127.0.0.1:$port/messages?since=$since&wait=$wait")
@@ -2561,10 +2572,13 @@ print("-- last id: %d" % d.get("last", 0))' \
 	grep -qxF -- "$who" "$self_file" 2>/dev/null ||
 		printf '%s\n' "$who" >>"$self_file" 2>/dev/null || true
 
-	FIRECODE_CHAT_WHO="$who" FIRECODE_CHAT_TEXT="$*" python3 -c '
+	FIRECODE_CHAT_WHO="$who" FIRECODE_CHAT_TEXT="$*" FIRECODE_CHAT_TO="$to" python3 -c '
 import json, os, sys, urllib.request
-body = json.dumps({"from": os.environ["FIRECODE_CHAT_WHO"],
-                   "text": os.environ["FIRECODE_CHAT_TEXT"]}).encode()
+body = {"from": os.environ["FIRECODE_CHAT_WHO"],
+        "text": os.environ["FIRECODE_CHAT_TEXT"]}
+if os.environ.get("FIRECODE_CHAT_TO"):
+    body["to"] = os.environ["FIRECODE_CHAT_TO"]
+body = json.dumps(body).encode()
 req = urllib.request.Request(sys.argv[1], data=body,
                              headers={"Content-Type": "application/json"})
 try:

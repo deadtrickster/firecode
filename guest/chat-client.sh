@@ -7,7 +7,10 @@
 # The room was always reachable: it is plain HTTP on a forwarded port. What
 # was missing was a *command*, because that is what an agent goes looking for.
 #
-#   firecode-chat 'text'          say something
+#   firecode-chat 'text'          say something to the room
+#   firecode-chat --to NAME 'text'  say it to one of them, so their
+#                                 supervisor wakes for it instead of
+#                                 finding it later among everything else
 #   firecode-chat --read          what has been said
 #   firecode-chat --wait          block until somebody says something new
 #   firecode-chat --ask 'text'    ask, and wait for an answer
@@ -47,13 +50,25 @@ me = os.environ.get("FIRECODE_CHAT_SELF", "")
 for m in d.get("messages", []):
     if m.get("from") == me:
         continue
+    who = m["from"] + (" -> " + m["to"] if m.get("to") else "")
     print("[%s] %s: %s" % (time.strftime("%H:%M:%S", time.localtime(m["at"])),
-                           m["from"], m["text"]))
+                           who, m["text"]))
 if d.get("messages"):
     with open("/tmp/firecode-chat.mark", "w") as fh:
         fh.write(str(d.get("last", 0)))
 '
 }
+
+# Who it is for, if anybody in particular. A message with no recipient goes
+# to the room, which is the default and usually right; naming one is what
+# gets a supervisor to actually wake up for it rather than reading it later
+# among everything else.
+TO=""
+if [[ ${1:-} == --to ]]; then
+	TO=${2:-}
+	[[ -n $TO ]] || usage 2
+	shift 2
+fi
 
 case "${1:-}" in
 -h | --help) usage 0 ;;
@@ -99,10 +114,13 @@ case "${1:-}" in
 *)
 	# The message is every argument, so quoting mistakes cost a word rather
 	# than the whole post.
-	FIRECODE_CHAT_WHO=$WHO FIRECODE_CHAT_TEXT="$*" python3 -c '
+	FIRECODE_CHAT_WHO=$WHO FIRECODE_CHAT_TEXT="$*" FIRECODE_CHAT_TO="${TO:-}" python3 -c '
 import json, os, sys, urllib.request
-body = json.dumps({"from": os.environ["FIRECODE_CHAT_WHO"],
-                   "text": os.environ["FIRECODE_CHAT_TEXT"]}).encode()
+body = {"from": os.environ["FIRECODE_CHAT_WHO"],
+        "text": os.environ["FIRECODE_CHAT_TEXT"]}
+if os.environ.get("FIRECODE_CHAT_TO"):
+    body["to"] = os.environ["FIRECODE_CHAT_TO"]
+body = json.dumps(body).encode()
 req = urllib.request.Request(sys.argv[1], data=body,
                              headers={"Content-Type": "application/json"})
 try:

@@ -93,11 +93,38 @@ since=0
 payload=$(curl -s -m 5 "http://127.0.0.1:$PORT/messages?since=$since&wait=0" 2>/dev/null) || exit 0
 [[ -n $payload ]] || exit 0
 
+# Is anything actually listening for this session while it sleeps?
+#
+# A hook can only run when something happens - a prompt, the end of a turn -
+# so it cannot reach a session that is already idle. A message sent to an
+# idle session therefore waits for its next turn, which may be hours, and
+# looked from the outside exactly like the room being broken.
+#
+# The one thing that CAN wake an idle session is a blocking background
+# command: `firecode chat --inbox --as NAME` returns when somebody speaks,
+# and the harness re-invokes the agent to tell it so. Its weakness has always
+# been that it must be restarted after every fire, and that is precisely what
+# gets forgotten - so the check for it belongs at the moment going idle
+# starts to matter, which is here.
+WAITER=0
+WAITER_NAME=""
+if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
+	while read -r n; do
+		[[ -n $n ]] || continue
+		[[ -z $WAITER_NAME ]] && WAITER_NAME=$n
+		if pgrep -f -- "chat --inbox --as $n" >/dev/null 2>&1; then
+			WAITER=1
+			break
+		fi
+	done <"$SELF_FILE"
+fi
+
 # shellcheck disable=SC2016  # the single quotes below hold a python program;
 # expanding shell variables into it is exactly what must not happen - the
 # values it needs arrive through the environment on this line instead.
 FIRECODE_HOOK_MARK="$MARK" FIRECODE_HOOK_SELF="$NAME" FIRECODE_HOOK_MODE="$MODE" \
 	FIRECODE_HOOK_SELF_FILE="$SELF_FILE" \
+	FIRECODE_HOOK_WAITER="$WAITER" FIRECODE_HOOK_WAITER_NAME="$WAITER_NAME" \
 	python3 -c '
 import json, os, sys, time
 
@@ -119,27 +146,58 @@ try:
 except OSError:
     pass
 
-# Only a mode that can DELIVER is allowed to move the mark.
+# The room gets the idle time, not the time somebody is asking for work.
 #
-# session-start and prompt-submit put their stdout into the session
-# context, so once they have printed a message it has genuinely arrived and
-# the cursor should move past it. Stop cannot: its stdout goes to the
-# transcript, and its only channel to the session is refusing to stop. A
-# Stop hook that advanced the cursor would therefore consume messages it had
-# no way to show - which is exactly what happened here, silently, to a
-# message that did not happen to mention my name.
+# The obvious wiring - deliver on UserPromptSubmit - puts a message from
+# another agent into the same turn as the request the user just typed, with
+# nothing to say which comes first. The user asks for one thing and the turn
+# arrives carrying three, and the answer to "what should I do now" stops
+# being obvious. That is a worse failure than a late message.
 #
-# So Stop reads and never commits. The cost is that Stop may see the same
-# message twice; the cost of the alternative is losing it entirely.
-if msgs and mode != "stop":
+# Stop is where this belongs. It fires exactly when nothing else is being
+# asked, and while its stdout only reaches the transcript, the reason it
+# gives for refusing the stop DOES reach the session - so it can carry the
+# messages themselves and buy one turn to deal with them. Idle time is free;
+# a prompt turn is not.
+#
+# prompt-submit therefore stays quiet unless somebody asks for it.
+if mode == "prompt-submit" and not os.environ.get("FIRECODE_CHAT_ON_PROMPT"):
+    raise SystemExit
+
+
+def commit():
+    """Move the cursor. Only ever called where the messages are delivered."""
     try:
         with open(os.environ["FIRECODE_HOOK_MARK"], "w") as fh:
             fh.write(str(d.get("last", 0)))
     except OSError:
         pass
 
+
+# Whether anything is listening for this session while it sleeps. Computed
+# before anything else in the stop path, because a quiet room is exactly the
+# case where a missing waiter matters and nothing else would raise it.
+waiter = os.environ.get("FIRECODE_HOOK_WAITER") == "1"
+waiter_name = os.environ.get("FIRECODE_HOOK_WAITER_NAME") or ""
+rearm = ""
+if mode == "stop" and waiter_name and not waiter:
+    rearm = (
+        "\n\nNothing is listening for you while you are idle. Start the "
+        "waiter as a BACKGROUND command before you stop:\n"
+        "  firecode chat --inbox --as %s\n"
+        "It blocks until somebody speaks and returns - that return is what "
+        "wakes you. Start it again each time it fires; this will keep "
+        "reminding you until one is running." % waiter_name)
+
 fresh = [m for m in msgs if str(m.get("from", "")).lower() not in selves]
 if not fresh:
+    # Nothing but our own, which still has to be stepped over or every later
+    # call rescans it forever.
+    if msgs:
+        commit()
+    if rearm:
+        sys.stderr.write(rearm.lstrip() + "\n")
+        raise SystemExit(2)
     raise SystemExit
 
 # First run has no mark, so it would dump the whole room into a session that
@@ -155,25 +213,49 @@ for m in shown:
         text = text[:700] + " ..."
     lines.append("[%s] %s: %s" % (stamp, m.get("from", "?"), text))
 
+def for_me(m):
+    """Addressed to this session, rather than merely audible to it."""
+    to = str(m.get("to") or "").lower()
+    if to:
+        return to in selves               # exact, and says so at send time
+    # No recipient: a broadcast. Guess, but only to the extent of a name
+    # appearing in the text - that is the old heuristic, kept for messages
+    # sent before --to existed and for anyone still speaking that way.
+    return any(s in str(m.get("text", "")).lower() for s in selves)
+
+
 if mode == "stop":
-    # Only when somebody is talking TO us.
+    # Only what is actually for us, and only then a turn.
     #
-    # Being in a room where others are talking is not a reason to refuse to
-    # finish, so this needs a name, in the message TEXT. The first version
-    # blocked on a bare "?" anywhere and searched the whole formatted line,
-    # which meant the "from" label counted: it caught a session on its own
-    # question and would not let it stop. A question addressed to nobody is
-    # not addressed to us.
-    addressed = [ln for m, ln in zip(shown, lines)
-                 if any(s in str(m.get("text", "")).lower() for s in selves)]
-    if not addressed:
-        raise SystemExit
+    # The room is a broadcast: several sessions read it, and every one of
+    # them sees every message. A Stop hook that delivered all of it would
+    # spend a turn per session per message - each session waking up for a
+    # phase report belonging to some other agent - and carry the entire room
+    # into every session history. Whatever is not addressed here is left
+    # unread and uncommitted, so it costs nothing and stays available to
+    # `firecode chat --read` for anyone who wants the context.
+    #
+    # stop_hook_active caps this at a single extra turn regardless.
+    mine = [ln for m, ln in zip(shown, lines) if for_me(m)]
+    if not mine:
+        if not rearm:
+            raise SystemExit              # not ours: no turn, no commit
+        sys.stderr.write(rearm.lstrip() + "\n")
+        raise SystemExit(2)
+    commit()
+    others = len(shown) - len(mine)
     sys.stderr.write(
-        "Unanswered in the room, and you are about to go idle:\n"
-        + "\n".join(addressed)
-        + "\n\nAcknowledge it before you stop - silence reads as absence. "
-          "One line is enough: firecode chat --as <name> \"seen, doing X\".\n")
+        "You are about to go idle, and this was addressed to you:\n"
+        + "\n".join(mine)
+        + (("\n\n(%d other message(s) in the room, not for you - "
+            "firecode chat --read if you want them)" % others) if others else "")
+        + "\n\nAnswer before you stop - silence reads as absence "
+          "(firecode chat --as <you> --to <them> \"seen, doing X\")."
+        + rearm + "\n")
     raise SystemExit(2)                   # 2 = refuse the stop, reason on stderr
+
+# stdout on these two goes into the session context, so printing IS delivery.
+commit()
 
 if mode == "session-start":
     print("Other agents on this machine share a room, and you are in it. "
