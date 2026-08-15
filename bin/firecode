@@ -3538,6 +3538,29 @@ launch() {
 			agent_args+=("$@")
 			break
 			;;
+		-h | --help)
+			# `firecode claude --help` used to boot a VM.
+			#
+			# Anything firecode did not recognise became an argument for the
+			# agent, so asking for usage packed the project, started a
+			# microVM and ran the agent's own --help inside it. Somebody did
+			# that by accident next to a 264G checkout.
+			usage
+			exit 0
+			;;
+		--*)
+			# An unknown long flag is a mistake, not an agent argument.
+			#
+			# Guessing here is expensive in one direction only: read as an
+			# agent argument, a typo costs a boot, a pack and a wait before
+			# anything says a word about it. Refusing costs two characters.
+			# Agent flags have a place to go and the README already puts
+			# them there, so this asks rather than assumes.
+			die "unknown firecode flag: $1
+       if it is meant for the agent, put it after -- :
+         firecode ${AGENT:-<agent>} [firecode flags] -- $1 ...
+       firecode help lists the flags firecode itself takes"
+			;;
 		*)
 			# `firecode exec` passes an empty agent so that the first thing
 			# that is not a firecode option becomes the command to run.
