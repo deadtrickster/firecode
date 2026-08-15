@@ -59,6 +59,8 @@ SESSION=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
 	<<<"$HOOK_INPUT" | head -1)
 KEY=${SESSION:-$NAME}
 MARK="$MARK_DIR/chat-hook-$(printf '%s' "$KEY" | tr -c 'A-Za-z0-9._-' '-')"
+# Replaced below by the mark belonging to this session's room identity, if it
+# has one - see the comment where SELF_FILE is read.
 
 # Which names in the room are this session.
 #
@@ -73,6 +75,43 @@ FIRECODE_ROOT=${FIRECODE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &&
 SELF_FILE=""
 if [[ -n $HOOK_CWD ]]; then
 	SELF_FILE="$FIRECODE_ROOT/runs/chat-self-$(printf '%s' "$HOOK_CWD" | tr -c 'A-Za-z0-9._-' '-')"
+fi
+
+# Is anything listening while this session sleeps, and who is it?
+#
+# A hook only runs when something happens - a prompt, the end of a turn - so
+# it cannot reach a session that is already idle. The one thing that can is a
+# blocking background command, `firecode chat --inbox --as NAME`, which
+# returns when somebody speaks and gets the agent re-invoked. Its weakness is
+# that it must be restarted after every fire, and that is what gets
+# forgotten, so it is checked where going idle begins.
+WAITER=0
+WAITER_NAME=""
+if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
+	while read -r n; do
+		[[ -n $n ]] || continue
+		[[ -z $WAITER_NAME ]] && WAITER_NAME=$n
+		if pgrep -f -- "chat --inbox --as $n" >/dev/null 2>&1; then
+			WAITER=1
+			break
+		fi
+	done <"$SELF_FILE"
+fi
+
+# One cursor per identity, shared with the waiter.
+#
+# The hook and `chat --inbox` are two ways of delivering to the same reader,
+# and each kept its own position - so a message arrived twice, once from
+# whichever fired first and again from the other. Reading back three messages
+# that were already answered is not just noise: it invites answering them a
+# second time.
+#
+# The waiter keys its mark on the name, so the hook uses that same file
+# whenever this session has a name. One that has never spoken keeps the
+# per-session file, having no identity to share yet. This must happen before
+# the mark is read or created below.
+if [[ -n $WAITER_NAME ]]; then
+	MARK="$FIRECODE_ROOT/runs/chat-mark-$(printf '%s' "$WAITER_NAME" | tr -c 'A-Za-z0-9._-' '-')"
 fi
 
 # A session that has never looked starts from now, not from the beginning of
@@ -92,32 +131,6 @@ since=0
 # One shot, no waiting: a hook that blocks is a session that hangs.
 payload=$(curl -s -m 5 "http://127.0.0.1:$PORT/messages?since=$since&wait=0" 2>/dev/null) || exit 0
 [[ -n $payload ]] || exit 0
-
-# Is anything actually listening for this session while it sleeps?
-#
-# A hook can only run when something happens - a prompt, the end of a turn -
-# so it cannot reach a session that is already idle. A message sent to an
-# idle session therefore waits for its next turn, which may be hours, and
-# looked from the outside exactly like the room being broken.
-#
-# The one thing that CAN wake an idle session is a blocking background
-# command: `firecode chat --inbox --as NAME` returns when somebody speaks,
-# and the harness re-invokes the agent to tell it so. Its weakness has always
-# been that it must be restarted after every fire, and that is precisely what
-# gets forgotten - so the check for it belongs at the moment going idle
-# starts to matter, which is here.
-WAITER=0
-WAITER_NAME=""
-if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
-	while read -r n; do
-		[[ -n $n ]] || continue
-		[[ -z $WAITER_NAME ]] && WAITER_NAME=$n
-		if pgrep -f -- "chat --inbox --as $n" >/dev/null 2>&1; then
-			WAITER=1
-			break
-		fi
-	done <"$SELF_FILE"
-fi
 
 # shellcheck disable=SC2016  # the single quotes below hold a python program;
 # expanding shell variables into it is exactly what must not happen - the

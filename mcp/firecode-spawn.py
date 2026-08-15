@@ -740,6 +740,12 @@ def build_tools(cfg):
                     "text": {"type": "string"},
                     "name": {"type": "string",
                              "description": "Who is speaking, e.g. 'glm', 'reviewer'."},
+                    "to": {"type": "string",
+                           "description":
+                               "Who it is for. Without this the message goes "
+                               "to the room, which nobody is woken for - it is "
+                               "read later, among everything else. Name a "
+                               "recipient when you want an answer."},
                 },
                 "required": ["text"],
             },
@@ -1244,7 +1250,19 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         who = args.get("name") or (f"run-{caller_run}" if caller_run else "agent")
 
         if name == "chat_say":
-            body = json.dumps({"from": who, "text": args["text"]}).encode()
+            # Said rather than raised. A missing field used to come back as
+            # KeyError: 'text' with a traceback, and this is the tool agents
+            # fall back to when the CLI is broken - the one moment it must
+            # explain itself instead of failing like an internal error.
+            text = args.get("text") or args.get("message") or ""
+            if not str(text).strip():
+                return ("nothing to say - chat_say takes text, e.g. "
+                        "{\"text\": \"gate green at abc123\", \"name\": "
+                        "\"reviewer\", \"to\": \"orchestrator\"}")
+            payload = {"from": who, "text": text}
+            if args.get("to"):
+                payload["to"] = args["to"]
+            body = json.dumps(payload).encode()
             try:
                 req = urllib.request.Request(
                     base + "/say", data=body,

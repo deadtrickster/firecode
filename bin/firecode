@@ -5381,8 +5381,33 @@ spawn-server)
 	# while I told people the fixes were live.
 	if [[ ${1:-} == restart || ${1:-} == --restart ]]; then
 		shift
+		force=0
+		[[ ${1:-} == --force ]] && {
+			force=1
+			shift
+		}
 		local_pid=$(ss -lntp 2>/dev/null |
 			sed -n 's/.*:9770 .*pid=\([0-9]*\).*/\1/p' | head -1)
+
+		# Not out from under a run that is still going.
+		#
+		# The server keeps its bookkeeping in memory, so a restart forgets
+		# every run in flight: the VM and its gate carry on, but nothing is
+		# left watching to reap them, land_on_pass never fires, and status
+		# answers "started by an earlier server process". The run does not
+		# fail - it just quietly stops being anybody's responsibility, which
+		# is worse. Each spawn is a child of the server, so children are the
+		# honest count. I restarted this under somebody's phase build to ship
+		# a fix that could have waited twenty minutes.
+		if [[ -n $local_pid ]] && ((force == 0)); then
+			busy=$(pgrep -P "$local_pid" 2>/dev/null | wc -l)
+			((busy > 0)) &&
+				die "the spawn server has $busy run(s) in flight - restarting
+       forgets them, so they would finish unwatched and never land.
+       Wait for them (firecode spawn-server ps, or status on the run),
+       or say --force if losing that bookkeeping is what you want."
+		fi
+
 		if [[ -n $local_pid ]]; then
 			log "stopping the server on 9770 (pid $local_pid)"
 			kill "$local_pid" 2>/dev/null || true
