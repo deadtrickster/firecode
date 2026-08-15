@@ -948,6 +948,14 @@ cmd_lab() {
 		shift
 		lab_slice "$@"
 		;;
+	fold)
+		shift
+		lab_fold "$@"
+		;;
+	preserve)
+		shift
+		lab_preserve "$@"
+		;;
 	slices) lab_slices ;;
 	export-pgfuse)
 		shift
@@ -1551,11 +1559,86 @@ PY
 	say "slice $slice -> worktree pgfuse-$lower"
 	lab_exec "chown dead:dead /home/dead/brief-$lower.txt
 		su - dead -c 'cd ~/pgfuse && git worktree add -q -B slice-$lower ~/pgfuse-$lower 2>&1 | tail -2
+			# Per-worktree identity, or the history lies about who wrote what.
+			# The guest has one git config and the first agent to set it won,
+			# so every slice was committing as pgfuse-b. Harmless to the code
+			# and ruinous to anyone later reconstructing who decided what.
+			git -C ~/pgfuse-$lower config user.name pgfuse-$lower
+			git -C ~/pgfuse-$lower config user.email pgfuse-$lower@lab
 			cd ~/pgfuse-$lower && . /home/dead/.agent-env &&
 			setsid claude --dangerously-skip-permissions \
 				-p \"\$(cat /home/dead/brief-$lower.txt)\" \
 				< /dev/null > /home/dead/pgfuse-$lower.log 2>&1 &' >/dev/null 2>&1
 		echo started"
+}
+
+# Fold a finished slice into the spine, and let the gate say whether it holds.
+#
+# Only ever a slice whose agent has EXITED. Merging under a running agent
+# rewrites files it is editing, destroys work, and produces a failing gate
+# that looks like a pgfuse defect and is really a scheduling mistake.
+lab_fold() {
+	local s=${1:?usage: dev.sh lab fold <a-h>}
+	say "is slice $s finished?"
+	local alive
+	alive=$(lab_exec "pgrep -u dead -fc 'pgfuse-$s' 2>/dev/null || echo 0" | tr -d '\r\n ')
+	echo "  agents matching pgfuse-$s: ${alive:-0}"
+
+	say "merging slice-$s into the spine"
+	lab_exec "su - dead -c 'cd /home/dead/pgfuse && git merge --no-edit slice-$s 2>&1 | tail -6'"
+
+	# The gate decides, not the merge exiting 0. A merge that resolves
+	# cleanly can still produce a tree that does not mount.
+	say "the gate on the merged tree"
+	lab_exec "su - dead -c 'cd /home/dead/pgfuse && export PATH=/usr/lib/postgresql/16/bin:\$PATH && \
+		./run-tests.sh 2>&1 | tail -6'"
+}
+
+# Move the lab's work somewhere it survives.
+#
+# The tree that matters lives in a disposable VM and its export sits in /tmp,
+# which clears on reboot. Nine agents' work, a full history and the room's own
+# transcript are all one `lab destroy` or one reboot from gone. This puts them
+# where the rest of this machine's work lives.
+lab_preserve() {
+	local dest=${1:-$HOME/Projects/pgfuse}
+	local notes=$dest/lab-notes
+
+	say "the code, with its history"
+	lab_exec "su - dead -c 'cd ~/pgfuse && git bundle create /home/dead/pgfuse-final.bundle --all' 2>&1 | tail -2"
+	lab_pull /home/dead/pgfuse-final.bundle "$LAB_DIR/pgfuse-final.bundle" || return 1
+	rm -rf "$dest"
+	git clone -q "$LAB_DIR/pgfuse-final.bundle" "$dest" || return 1
+	git -C "$dest" log --oneline | head -3
+	printf '  %s commits, %s files\n' \
+		"$(git -C "$dest" rev-list --count HEAD)" \
+		"$(git -C "$dest" ls-files | wc -l)"
+
+	say "how it was built, and what was found"
+	mkdir -p "$notes"
+	local f
+	for f in /tmp/firecode-scratch/pgfuse-build-spec.md \
+		/tmp/firecode-scratch/pgfuse-wave2-briefs.md \
+		/tmp/firecode-scratch/lying-peer-findings.md \
+		/tmp/firecode-scratch/lying-peer-refix.md \
+		/tmp/firecode-scratch/lying-peer-fix13.md \
+		/tmp/firecode-scratch/adversary-findings.md \
+		/tmp/firecode-scratch/flowy-lying-peer.md \
+		/tmp/firecode-scratch/flowy-integration-spec.md; do
+		[[ -f $f ]] && cp -f "$f" "$notes/" && echo "  $(basename "$f")"
+	done
+
+	# The room's transcript. It is the record of who decided what and why,
+	# and it lives in a gitignored directory - so it is in no commit and
+	# nobody would think to look for it until it was gone.
+	if [[ -f $ROOT/runs/chat.log ]]; then
+		cp -f "$ROOT/runs/chat.log" "$notes/agent-chat.log"
+		echo "  agent-chat.log ($(wc -l <"$ROOT/runs/chat.log") messages)"
+	fi
+
+	say "where it is"
+	echo "  $dest"
+	echo "  $notes"
 }
 
 # What every slice is doing.
