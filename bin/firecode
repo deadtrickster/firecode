@@ -2354,7 +2354,7 @@ cmd_chat() {
 	# and a chat room that quietly answers 404 because it never started is
 	# worse than one on an odd port.
 	local port=${FIRECODE_CHAT_PORT:-9761} who=${FIRECODE_CHAT_NAME:-$(id -un)@host}
-	local mode=say since=0 wait=0 to="" tail=${FIRECODE_CHAT_TAIL:-20}
+	local mode=say since=0 wait=0 to="" inbox_all=0 tail=${FIRECODE_CHAT_TAIL:-20}
 	while [[ ${1:-} == -* || ${1:-} == serve || ${1:-} == install ]]; do
 		case "${1:-}" in
 		serve)
@@ -2384,7 +2384,10 @@ cmd_chat() {
 			shift
 			;;
 		--all)
+			# For --read, the whole log rather than a tail. For --inbox, wake
+			# on anything said rather than only what is addressed to you.
 			tail=0
+			inbox_all=1
 			shift
 			;;
 		--since)
@@ -2489,19 +2492,35 @@ cmd_chat() {
 		while (($(date +%s) < deadline)); do
 			out=$(FIRECODE_CHAT_MARK="$mark_file" curl -s -m $((wait + 30)) \
 				"http://127.0.0.1:$port/messages?since=$since&wait=$wait" |
-				FIRECODE_CHAT_MARK="$mark_file" FIRECODE_CHAT_SELF="$who" python3 -c '
+				FIRECODE_CHAT_MARK="$mark_file" FIRECODE_CHAT_SELF="$who" \
+					FIRECODE_CHAT_INBOX_ALL="$inbox_all" python3 -c '
 import json, os, sys, time
 d = json.load(sys.stdin)
 me = os.environ.get("FIRECODE_CHAT_SELF", "")
+everything = os.environ.get("FIRECODE_CHAT_INBOX_ALL") == "1"
+skipped = 0
 for m in d.get("messages", []):
     # Not your own. Waiting on a room you also speak in means every message
     # you send wakes you up to tell you what you just said, which for an
     # agent costs a turn each time.
     if m.get("from") == me:
         continue
+    # Nor everybody elses. Returning from this waiter wakes an agent and
+    # costs it a turn, so a room where four agents post progress means four
+    # interruptions each, over work that belongs to somebody else. Addressed
+    # mail wakes you; the rest is counted and left to be read.
+    if not everything:
+        to = str(m.get("to") or "").lower()
+        mine = to in (me.lower(),) if to else me.lower() in str(m["text"]).lower()
+        if not mine:
+            skipped += 1
+            continue
     stamp = time.strftime("%H:%M:%S", time.localtime(m["at"]))
     who = m["from"] + (" -> " + m["to"] if m.get("to") else "")
     print("[%s] %s: %s" % (stamp, who, m["text"]))
+if skipped:
+    sys.stderr.write("(%d message(s) to the room, not for you - "
+                     "firecode chat --read)\n" % skipped)
 if d.get("messages"):
     # The mark moves past everything that was read, including your own -
     # otherwise the next call reads them again and skips them again forever.
