@@ -935,6 +935,36 @@ cmd_lab() {
 		;;
 	gate) lab_gate ;;
 	agent) lab_agent_setup ;;
+	flowy-up) lab_flowy_up ;;
+	flowy-rebuild)
+		shift
+		lab_flowy_rebuild "$@"
+		;;
+	confirm) lab_confirm ;;
+	node2) lab_node2 ;;
+	peer) lab_peer ;;
+	peer-tail) lab_peer_tail ;;
+	slice)
+		shift
+		lab_slice "$@"
+		;;
+	slices) lab_slices ;;
+	export-pgfuse)
+		shift
+		lab_export_pgfuse "$@"
+		;;
+	scenario) lab_scenario ;;
+	canary) lab_canary ;;
+	sql)
+		shift
+		lab_sql "$@"
+		;;
+	pull)
+		shift
+		lab_pull "$@"
+		;;
+	adversary) lab_adversary ;;
+	adversary-tail) lab_adversary_tail ;;
 	work)
 		shift
 		lab_work "$@"
@@ -1068,6 +1098,481 @@ echo written"
 	say "can an agent in the lab reach the model?"
 	lab_exec "su - dead -c '. /home/dead/.agent-env && \
 		timeout 120 claude -p \"reply with exactly: lab agent alive\" 2>&1 | tail -3'"
+}
+
+# Stand a Flowy node up in the lab, seeded, and leave it running.
+#
+# Not the gate's throwaway cluster: a node that stays up, so something can be
+# pointed at it and attacked. Postgres and the node both run as the
+# unprivileged user, because initdb refuses root and because an adversary
+# that reaches a database running as root has learned nothing interesting.
+lab_flowy_up() {
+	local port=${FLOWY_PORT:-8787}
+	say "postgres"
+	lab_exec "su - dead -c '
+		export PATH=/usr/lib/postgresql/16/bin:\$PATH
+		PGDATA=/home/dead/pgdata
+		if [ ! -d \$PGDATA ]; then
+			initdb -D \$PGDATA -A trust >/dev/null 2>&1 && echo initdb ok
+		fi
+		pg_ctl -D \$PGDATA -l /home/dead/pg.log -o \"-k /tmp -p 5433\" -w start >/dev/null 2>&1 || true
+		psql -h /tmp -p 5433 -d postgres -c \"select 1\" >/dev/null 2>&1 && echo \"postgres up on 5433\"
+		psql -h /tmp -p 5433 -d postgres -tc \"select 1 from pg_database where datname=\x27flowy\x27\" | grep -q 1 ||
+			createdb -h /tmp -p 5433 flowy
+		echo db ready'"
+
+	say "build and schema"
+	lab_exec "su - dead -c '
+		cd /home/dead/flowy
+		export PATH=/usr/lib/postgresql/16/bin:\$PATH
+		# go build with -o and ./... cannot work for more than one package,
+		# and piping it into tail hid both the error and the exit status.
+		# Build the root package and let any error be the output.
+		# (No backticks in here - this string is double-quoted, so bash
+		# would run whatever is inside them as a command substitution.)
+		go build -o /home/dead/flowy-bin . 2>&1 | tail -5
+		ls -l /home/dead/flowy-bin 2>/dev/null | cut -d\" \" -f5- || echo \"NO BINARY BUILT\"
+		psql -h /tmp -p 5433 -d flowy -f schema.sql >/dev/null 2>&1 && echo \"schema loaded\"'"
+
+	say "seed identities"
+	# smoke seed prints eval-able assignments; kept in a file the adversary
+	# will never see - it gets exactly one token, handed to it deliberately.
+	lab_exec "su - dead -c '
+		cd /home/dead/flowy
+		export DATABASE_URL=\"postgres://dead@/flowy?host=/tmp&port=5433&sslmode=disable\"
+		go run ./cmd/smoke seed > /home/dead/flowy-env.sh 2>/home/dead/flowy-seed.err
+		head -20 /home/dead/flowy-env.sh 2>/dev/null || tail -5 /home/dead/flowy-seed.err'"
+
+	# setsid, and started in its own exec.
+	#
+	# The guest agent reaps the process group when an exec finishes, so a
+	# plain `nohup ... &` inside the same call is killed the moment the call
+	# returns - the shell reports Terminated and exits 143 and it looks like
+	# the service crashed. setsid puts it in a session of its own, which the
+	# reaper does not follow, and the health check is a separate call so that
+	# what it reports is the state of a server that has outlived its starter.
+	say "serve"
+	lab_exec "su - dead -c '
+		export DATABASE_URL=\"postgres://dead@/flowy?host=/tmp&port=5433&sslmode=disable\"
+		setsid /home/dead/flowy-bin serve --addr :$port \
+			< /dev/null > /home/dead/flowy-serve.log 2>&1 &
+		echo started' >/dev/null 2>&1; echo started"
+
+	sleep 3
+	say "is it up?"
+	lab_exec "curl -s -m 5 http://127.0.0.1:$port/healthz && echo || \
+		tail -5 /home/dead/flowy-serve.log"
+}
+
+# Give the node something worth stealing.
+#
+# An adversary pointed at an empty database proves nothing - it reports that
+# it could not read project pb, and that is true because pb is empty rather
+# than because anything defended it. I nearly ran the whole blind pass that
+# way, with a brief that told the agent there were artifacts in pb when there
+# were none: a false negative dressed as a result.
+lab_scenario() {
+	chmod +x "$ROOT/scripts/lab-scenario.sh" 2>/dev/null || true
+	lab_push "$ROOT/scripts/lab-scenario.sh" /home/dead/lab-scenario.sh || return 1
+	lab_exec "chown dead:dead /home/dead/lab-scenario.sh && chmod +x /home/dead/lab-scenario.sh && \
+		su - dead -c 'bash /home/dead/lab-scenario.sh 2>&1 | tail -40'"
+}
+
+# Move the lab's Flowy to another commit and restart it, keeping the data.
+#
+# The confirmation loop needs the SAME database: a leak demonstrated on one
+# tip, the code moved forward, and the identical query refused. Re-seeding
+# would change the ids the demonstration referred to, and then "it is gone"
+# could just mean "it is somewhere else now".
+lab_flowy_rebuild() {
+	local want=${1:?usage: dev.sh lab flowy-rebuild <sha>}
+	local port=${FLOWY_PORT:-8787}
+	local src=${FLOWY_SRC:-/tmp/firecode-scratch/flowy}
+
+	say "bundling $want from the workspace"
+	git -C "$src" bundle create "$LAB_DIR/flowy.bundle" --all >/dev/null 2>&1 || return 1
+	lab_push "$LAB_DIR/flowy.bundle" /root/flowy.bundle >/dev/null 2>&1 || return 1
+
+	# As dead, not as root: the tree is theirs, and git refuses to operate on
+	# a repository owned by somebody else. The guest agent runs everything as
+	# root, so this has to be said explicitly every time.
+	say "moving the tree to $want"
+	lab_exec "cp /root/flowy.bundle /home/dead/flowy.bundle && chown dead:dead /home/dead/flowy.bundle
+		su - dead -c 'cd /home/dead/flowy &&
+			git fetch -q /home/dead/flowy.bundle \"*:refs/remotes/bundle/*\" 2>/dev/null
+			git checkout -q $want 2>&1 | tail -2
+			echo -n \"now at: \" && git rev-parse --short HEAD && git log --oneline -1'"
+
+	say "rebuild and restart, same database"
+	lab_exec "su - dead -c '
+		cd /home/dead/flowy && go build -o /home/dead/flowy-bin . 2>&1 | tail -3
+		pkill -f \"flowy-bi[n] serve\" 2>/dev/null || true
+		sleep 1
+		export DATABASE_URL=\"postgres://dead@/flowy?host=/tmp&port=5433&sslmode=disable\"
+		setsid /home/dead/flowy-bin serve --addr :$port < /dev/null \
+			> /home/dead/flowy-serve.log 2>&1 &
+		echo restarted' >/dev/null 2>&1; echo restarted"
+	sleep 3
+	lab_exec "curl -s -m 5 http://127.0.0.1:$port/healthz; echo"
+}
+
+# The same query the adversary demonstrated, run again. Fixed or not fixed.
+lab_confirm() {
+	local port=${FLOWY_PORT:-8787}
+	say "does alice still get the event naming the artifact she cannot read?"
+	lab_exec "su - dead -c '. /home/dead/flowy-env.sh
+		curl -s -H \"Authorization: Bearer \$TOKEN_A\" http://127.0.0.1:$port/api/events |
+		python3 -c \"
+import json,sys
+d = json.load(sys.stdin)
+hits = [e for e in (d.get(\\\"events\\\") or []) if \\\"CANARY-EVENT\\\" in (e.get(\\\"body\\\") or \\\"\\\")]
+print(\\\"  events visible to alice:\\\", len(d.get(\\\"events\\\") or []))
+if hits:
+    print(\\\"  STILL LEAKS:\\\", hits[0].get(\\\"artifact\\\"), hits[0].get(\\\"body\\\")[:60])
+else:
+    print(\\\"  the canary event is no longer visible to her\\\")
+\"'"
+	say "and can she still not read the artifact itself?"
+	lab_exec "su - dead -c '. /home/dead/flowy-env.sh
+		curl -s -H \"Authorization: Bearer \$TOKEN_A\" \
+			http://127.0.0.1:$port/api/artifact/01M02MPXMB72GPHQH38CSSS3QM | head -c 120; echo'"
+}
+
+# Hand the spine tree to a host path, for review outside the lab.
+lab_export_pgfuse() {
+	local dest=${1:-/tmp/firecode-scratch/pgfuse-spine}
+	lab_exec "su - dead -c 'cd ~/pgfuse && git bundle create /home/dead/pgfuse.bundle --all' 2>&1 | tail -2"
+	lab_pull /home/dead/pgfuse.bundle "$LAB_DIR/pgfuse.bundle" || return 1
+	rm -rf "$dest"
+	git clone -q "$LAB_DIR/pgfuse.bundle" "$dest" 2>&1 | tail -2
+	echo "$dest"
+	git -C "$dest" log --oneline | head -5
+}
+
+# Hand node2 to a hostile operator who cannot read the source.
+#
+# A real peer operator would have the software - it is the same program on
+# both sides - so withholding the source is not realism, it is what keeps the
+# discovery independent. The point of the run is whether an attacker REACHES
+# the attribution hole, and an agent that can read the pull path will find it
+# by reading rather than by trying. It gets the binary, its own database and
+# its own key: everything a hostile operator has, minus the answer.
+lab_peer() {
+	local brief=${FIRECODE_AGENT_BRIEF:-runs/agent-brief.txt}
+	[[ -s $brief ]] || {
+		echo "no brief at $brief"
+		return 2
+	}
+
+	say "an operator who owns node2 and cannot read the code"
+	lab_exec "id peer >/dev/null 2>&1 || useradd -m -s /bin/bash peer
+		install -o peer -g peer -m 700 -d /home/peer/work
+		# The binary, not the tree: it runs the software, it does not read it.
+		install -m 755 /home/dead/flowy-bin /usr/local/bin/flowy
+		install -o peer -g peer -m 600 /home/dead/node2-env.sh /home/peer/node2-env.sh
+		# A postgres role of its own on node2's cluster. Trust auth still
+		# needs the role to exist, and without it the operator cannot reach
+		# its own database - it would have concluded the machine was not
+		# really its to control, which is the one premise the scenario rests
+		# on. Superuser on THAT cluster only; node1's is untouched.
+		su - dead -c 'psql -h /tmp -p 5434 -d postgres -tc \"select 1 from pg_roles where rolname='\''peer'\''\" | grep -q 1 ||
+			psql -h /tmp -p 5434 -d postgres -c \"create role peer superuser login\"' >/dev/null 2>&1
+		cp /home/dead/.agent-env /home/peer/.agent-env && chown peer:peer /home/peer/.agent-env
+		su - peer -c 'cat /home/dead/flowy/sync.go >/dev/null 2>&1 && echo \"CAN READ SOURCE - not isolated\" || echo \"cannot read the flowy source\"'
+		su - peer -c 'psql -h /tmp -p 5434 -d flowy2 -tc \"select count(*) from events\" >/dev/null 2>&1 && echo \"owns node2 database\" || echo \"NO DATABASE ACCESS - it cannot be an operator\"'"
+
+	lab_push "$brief" /home/peer/work/brief.txt >/dev/null 2>&1 || return 1
+
+	say "letting it loose"
+	lab_exec "chown peer:peer /home/peer/work/brief.txt
+		pkill -u peer -f 'claud[e]' 2>/dev/null
+		su - peer -c 'cd /home/peer/work && . /home/peer/.agent-env && \
+			setsid claude --dangerously-skip-permissions \
+			-p \"\$(cat /home/peer/work/brief.txt)\" \
+			< /dev/null > /home/peer/work/peer.log 2>&1 &' >/dev/null 2>&1
+		echo started"
+	echo "  follow with: dev.sh lab peer-tail"
+}
+
+lab_peer_tail() {
+	lab_exec "tail -15 /home/peer/work/peer.log 2>/dev/null || echo '(no log yet)'
+		echo '--- findings ---'
+		tail -40 /home/peer/work/findings.md 2>/dev/null || echo '(none yet)'"
+}
+
+# A second, hostile-capable Flowy node for the lying-peer scenario.
+lab_node2() {
+	chmod +x "$ROOT/scripts/lab-node2.sh" 2>/dev/null || true
+	lab_push "$ROOT/scripts/lab-node2.sh" /home/dead/lab-node2.sh >/dev/null 2>&1 || return 1
+	lab_exec "chown dead:dead /home/dead/lab-node2.sh && \
+		su - dead -c 'bash /home/dead/lab-node2.sh 2>&1 | tail -25'"
+}
+
+# Run a query against the lab's Flowy database.
+#
+# Through a file rather than an argument: the query has to survive dev.sh,
+# lab_exec, su -c and psql, and every layer wants different quoting. A file
+# crosses all of them untouched.
+lab_sql() {
+	local q=${1:?usage: dev.sh lab sql \"SELECT ...\"}
+	printf '%s\n' "$q" >"$LAB_DIR/query.sql"
+	lab_push "$LAB_DIR/query.sql" /home/dead/query.sql >/dev/null 2>&1 || return 1
+	lab_exec "chown dead:dead /home/dead/query.sql; su - dead -c \
+		'psql -h /tmp -p 5433 -d flowy -f /home/dead/query.sql' 2>&1 | head -40"
+}
+
+# Bring a file out of the lab.
+#
+# lab_push only goes one way, and the interesting artefacts - an adversary's
+# findings, a gate log - are written inside. base64 through the guest agent
+# rather than another listening port: it is the channel that already exists
+# and it does not weaken the isolation to use it.
+lab_pull() {
+	local src=${1:?usage: dev.sh lab pull <guest-path> <host-path>}
+	local dst=${2:?usage: dev.sh lab pull <guest-path> <host-path>}
+	lab_exec "base64 -w0 '$src'" >"$dst.b64" 2>/dev/null || return 1
+	if base64 -d "$dst.b64" >"$dst" 2>/dev/null; then
+		rm -f "$dst.b64"
+		echo "$dst  ($(wc -c <"$dst") bytes)"
+	else
+		rm -f "$dst.b64" "$dst"
+		echo "could not decode - is $src there?"
+		return 1
+	fi
+}
+
+# The unambiguous canary: an event that names an artifact alice cannot read.
+lab_canary() {
+	chmod +x "$ROOT/scripts/lab-canary-event.sh" 2>/dev/null || true
+	lab_push "$ROOT/scripts/lab-canary-event.sh" /home/dead/lab-canary-event.sh || return 1
+	lab_exec "chown dead:dead /home/dead/lab-canary-event.sh && \
+		su - dead -c 'bash /home/dead/lab-canary-event.sh 2>&1 | tail -20'"
+}
+
+# Turn an adversary loose on the running node, in a microVM with no source.
+#
+# The isolation is the point rather than a precaution. An adversary that can
+# read the code is testing its own reading; one that can only reach the API
+# is testing the thing that is actually deployed. So it runs one level down -
+# its own microVM, its own filesystem, no Flowy tree, no seed file, no
+# catalogue of known attacks - and gets exactly what a real attacker would
+# have: a URL and one token that is genuinely theirs.
+#
+# It reaches the node through the guest gateway, which is the only route out
+# of that microVM.
+lab_adversary() {
+	local brief=${FIRECODE_AGENT_BRIEF:-runs/agent-brief.txt}
+	local port=${FLOWY_PORT:-8787}
+	[[ -s $brief ]] || {
+		echo "no brief at $brief"
+		return 2
+	}
+
+	say "the token it will be given"
+	local token
+	token=$(lab_exec "grep '^TOKEN_A=' /home/dead/flowy-env.sh | cut -d= -f2" |
+		tr -d '\r\n ')
+	[[ -n $token ]] || {
+		echo "no TOKEN_A - is the node seeded? dev.sh lab flowy-up"
+		return 1
+	}
+	echo "  ${token:0:12}... (alice, project pa)"
+
+	# A separate unix user, not a nested microVM.
+	#
+	# The property that matters is that the adversary cannot read the source
+	# - it must test what is deployed, not its own reading of the code. A
+	# microVM would give that AND a blast-radius boundary, but the relay is
+	# only wired one level down, so an agent two levels down cannot reach a
+	# model at all. /home/dead is 0750, so a second unprivileged user cannot
+	# read the tree, the seed file with everyone's tokens, or the gate that
+	# names every known attack. Blast radius is still the lab VM.
+	#
+	# Being honest about the difference: this is source isolation, not
+	# containment. It is the right trade while nested auth is unfinished, and
+	# it is not what I would ship for an adversary I did not write myself.
+	# Any previous run first: two adversaries against one node makes it
+	# impossible to say which of them saw what. The bracket keeps pkill from
+	# matching this very command line - a self-match killed a shell here
+	# earlier today and reported it as the service dying.
+	lab_exec "pkill -u adv -f 'claud[e]' 2>/dev/null; echo 'previous run cleared'" >/dev/null 2>&1
+
+	say "an unprivileged user with no access to the source"
+	lab_exec "id adv >/dev/null 2>&1 || useradd -m -s /bin/bash adv
+		install -o adv -g adv -m 700 -d /home/adv/work
+		su - adv -c 'cat /home/dead/flowy/serve.go >/dev/null 2>&1 && echo \"CAN READ SOURCE - not isolated\" || echo \"cannot read the flowy tree\"'
+		su - adv -c 'cat /home/dead/flowy-env.sh >/dev/null 2>&1 && echo \"CAN READ SEED\" || echo \"cannot read the seed file\"'"
+
+	say "briefing"
+	mkdir -p "$LAB_DIR/adversary"
+	sed -e "s|TOKEN_A_PLACEHOLDER|$token|" \
+		-e "s|FLOWY_URL|127.0.0.1:$port|g" \
+		-e "s|ROOM_URL|10.0.2.2:9761|g" \
+		-e "s|/root/findings.md|/home/adv/work/findings.md|g" \
+		"$brief" >"$LAB_DIR/adversary/brief.txt"
+	lab_push "$LAB_DIR/adversary/brief.txt" /home/adv/work/brief.txt || return 1
+
+	say "letting it loose"
+	lab_exec "chown adv:adv /home/adv/work/brief.txt
+		cp /home/dead/.agent-env /home/adv/.agent-env
+		chown adv:adv /home/adv/.agent-env
+		su - adv -c 'cd /home/adv/work && . /home/adv/.agent-env && \
+			setsid claude --dangerously-skip-permissions \
+			-p \"\$(cat /home/adv/work/brief.txt)\" \
+			< /dev/null > /home/adv/work/adversary.log 2>&1 &' >/dev/null 2>&1
+		echo started"
+	echo "  follow with: dev.sh lab adversary-tail"
+}
+
+lab_adversary_tail() {
+	lab_exec "tail -20 /home/adv/work/adversary.log 2>/dev/null || echo '(no log yet)'
+		echo '--- findings so far ---'
+		tail -40 /home/adv/work/findings.md 2>/dev/null || echo '(none written yet)'"
+}
+
+# Fan a Wave 2 slice out onto its own worktree.
+#
+#   dev.sh lab slice A
+#
+# One agent, one worktree, one branch, its own copy of the tree. They share
+# the spine's history so each starts from green, and they cannot tread on
+# each other's files while they work - which is the whole reason the spine
+# was serial and this is not.
+#
+# The brief is assembled here rather than by hand: the gate-is-law paragraph
+# goes at the TOP of every one, because the spine swept an addendum into a
+# commit with git add -A before reading it and a one-shot agent cannot be
+# corrected once it starts.
+lab_slice() {
+	local slice=${1:?usage: dev.sh lab slice <A-H>}
+	local briefs=${PGFUSE_BRIEFS:-/tmp/firecode-scratch/pgfuse-wave2-briefs.md}
+	[[ -r $briefs ]] || {
+		echo "no briefs at $briefs"
+		return 2
+	}
+
+	local lower
+	lower=$(printf '%s' "$slice" | tr '[:upper:]' '[:lower:]')
+	mkdir -p "$LAB_DIR/slices"
+	local out="$LAB_DIR/slices/brief-$lower.txt"
+
+	PGFUSE_SLICE="$slice" python3 - "$briefs" >"$out" <<'PY'
+import os, re, sys
+
+text = open(sys.argv[1]).read()
+slice_id = os.environ["PGFUSE_SLICE"].upper()
+
+# The contract paragraph, quoted in the file with a leading ">".
+law = ""
+m = re.search(r"gate is law\)\n> (.+?)\n\n", text, re.S)
+if m:
+    law = re.sub(r"\n> ?", " ", m.group(1)).strip()
+
+# The slice itself, up to the next heading.
+m = re.search(r"^## Slice %s\b.*?\n(.*?)(?=^## |\Z)" % slice_id, text, re.S | re.M)
+if not m:
+    sys.exit("no slice %s in the briefs" % slice_id)
+body = m.group(1).strip()
+
+# What every slice needs to know and none of them should have to ask.
+print(law)
+print()
+print("You are pgfuse Wave 2, slice %s. The spine is built, green and yours to" % slice_id)
+print("build on: it already has name=BYTEA, a blocks table with a fixed block")
+print("size, inodes/dir_entries/xattrs, mount/remount/persistence, crash-debris")
+print("with --collect-orphans, and a refusal for a remount at the wrong block")
+print("size. Keep every one of its properties passing.")
+print()
+print("YOUR SLICE:")
+print()
+print(body)
+print()
+print("HOW TO WORK")
+print()
+print("You have your own git worktree and your own branch. Nobody else is")
+print("editing your files; several other slices are working on theirs at the")
+print("same time, so do not reach outside your worktree.")
+print()
+print("Add your properties to ./run-tests.sh. Prove each new behaviour fails")
+print("before your change and passes after - a test that never failed is a")
+print("test nobody knows works.")
+print()
+print("Commit only when the WHOLE gate is green: the spine's properties and")
+print("yours. Read the verify log for the verdict rather than an exit code.")
+print()
+print("SCRATCH SPACE")
+print()
+print("Namespace everything you put outside your worktree by your slice:")
+print("/tmp/pgfuse-slice-%s-... for temporary clusters, mounts and dirs." % slice_id.lower())
+print("Your worktree is yours alone; /tmp is not, and several agents are")
+print("working on this machine right now. One slice has already destroyed")
+print("another's scratch database by using a shared path.")
+print()
+print("If you need a schema change, take SCHEMA_VERSION %d - it is reserved" % (10 + ord(slice_id.lower()) - ord("a")))
+print("for you - and write the migration so it runs from any earlier")
+print("version. Version 2 is taken by slice b (symlink_target BYTEA).")
+print()
+print("STAYING CORRECTABLE")
+print()
+print("At natural boundaries - after a property lands, before each commit -")
+print("check your own inbox:")
+print()
+print("  FIRECODE_CHAT_WAIT=0 FIRECODE_CHAT_DEADLINE=1 \\")
+print("      firecode chat --inbox --as pgfuse-%s" % slice_id.lower())
+print()
+print("It returns ONLY messages addressed to you. The room's general")
+print("conversation is invisible to you, deliberately - you are working, not")
+print("following along. How to weigh what you find:")
+print()
+print("  a directed correction from claude-host or orchestrator FOLDS INTO")
+print("    your current work - it does not restart it")
+print("  a hazard warning ADJUSTS what you are doing")
+print("  \"stop\" means commit what is green and exit cleanly, not abandon")
+print("  anything not addressed to you does not exist")
+print()
+print("Read, do not reply. Coordination is not your job.")
+print()
+print("STAYING IN TOUCH")
+print()
+print("Other agents and two humans share a room. You are \"pgfuse-%s\" in it." % slice_id.lower())
+print("  curl -s -X POST http://10.0.2.2:9761/say -H 'content-type: application/json' \\")
+print("       -d '{\"from\":\"pgfuse-%s\",\"to\":\"claude-host\",\"text\":\"...\"}'" % slice_id.lower())
+print()
+print("Say something when your gate first goes green, when you are stuck, or")
+print("when you decide part of this brief is wrong. Not otherwise.")
+print()
+print("Report at the end: the real numbers from the gate, what you did not")
+print("finish, anything you skipped and why, and anything the next agent needs")
+print("that is not obvious from the code.")
+PY
+	[[ -s $out ]] || return 1
+
+	lab_push "$out" "/home/dead/brief-$lower.txt" >/dev/null 2>&1 || return 1
+	say "slice $slice -> worktree pgfuse-$lower"
+	lab_exec "chown dead:dead /home/dead/brief-$lower.txt
+		su - dead -c 'cd ~/pgfuse && git worktree add -q -B slice-$lower ~/pgfuse-$lower 2>&1 | tail -2
+			cd ~/pgfuse-$lower && . /home/dead/.agent-env &&
+			setsid claude --dangerously-skip-permissions \
+				-p \"\$(cat /home/dead/brief-$lower.txt)\" \
+				< /dev/null > /home/dead/pgfuse-$lower.log 2>&1 &' >/dev/null 2>&1
+		echo started"
+}
+
+# What every slice is doing.
+# shellcheck disable=SC2016  # these expand in the guest, not here - that is
+# the point of passing the loop through as a string.
+lab_slices() {
+	lab_exec 'for d in /home/dead/pgfuse-*/; do
+		[ -d "$d" ] || continue
+		n=$(basename "$d")
+		printf "%-14s " "$n"
+		cd "$d" 2>/dev/null || continue
+		printf "commits:%-3s " "$(sudo -u dead git rev-list --count HEAD 2>/dev/null || echo ?)"
+		printf "log:%-8s " "$(wc -c < /home/dead/$n.log 2>/dev/null || echo 0)"
+		pgrep -f "pgfuse-${n#pgfuse-}" >/dev/null 2>&1 && echo "(agent alive)" || echo ""
+	done
+	echo "--- claude processes: $(pgrep -u dead -c claude 2>/dev/null || echo 0)"
+	echo "--- load: $(cut -d" " -f1-3 /proc/loadavg)"'
 }
 
 # Set an agent to work in the lab, on a brief, unattended.

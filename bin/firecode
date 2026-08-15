@@ -1198,7 +1198,7 @@ PY
 		sleep 1
 	done
 	log "the domain stopped"
-	return $rc
+	return "$rc"
 }
 
 # Is that domain running, asked of libvirt rather than of the guest.
@@ -4723,6 +4723,11 @@ EOF
 				# a shell script, the spawn server, an orchestrator deciding
 				# whether to land the work. A gate nobody can act on is
 				# decoration, and this one was built after two runs lied.
+				#
+				# Anything unreadable in that file counts as a failure: the
+				# gate said something went wrong, and a status we cannot
+				# parse is not a reason to call it a pass.
+				[[ $vrc =~ ^[0-9]+$ ]] && ((vrc > 0)) || vrc=1
 				rc=$vrc
 			fi
 			rm -f "$vst"
@@ -4738,7 +4743,7 @@ EOF
 			echo
 			[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
 			echo
-			return $rc
+			return "$rc"
 		fi
 		local saved
 		saved=$(link_unchanged "$WORKDIR" "$out_dir")
@@ -4756,7 +4761,7 @@ EOF
 		echo
 	fi
 
-	return $rc
+	return "$rc"
 }
 
 # Read an ext4 image without mounting it, so no root is needed. Files the
