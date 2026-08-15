@@ -182,12 +182,39 @@ class Config:
                 "note": spec.get("note") or "",
             }
 
-        self.max_concurrent = int(raw.get("max_concurrent", 2))
+        # A default the machine chooses, not a number picked once.
+        #
+        # Two was the old default everywhere, so a fleet of eight arrived,
+        # hit the cap and quietly serialised into a pipeline - the caller got
+        # its work done and never learned that the parallelism it asked for
+        # had been declined. On a host with 24 threads and 60G that is a
+        # cost, and on a laptop with 4 threads a higher fixed number would
+        # have been a different kind of wrong.
+        #
+        # Each VM takes a few cores and its own memory, so size it by
+        # whichever runs out first and leave the host something to run on.
+        self.mem_per_run_mb = int(raw.get("mem_per_run_mb", 4096))
+        self.max_concurrent = int(raw.get("max_concurrent", 0)) or self._fits()
         self.max_total = int(raw.get("max_total", 20))
         self.default_timeout = int(raw.get("default_timeout", 3600))
         self.host_ports = [int(p) for p in (raw.get("host_ports") or [])]
         self.agent = raw.get("agent", "claude")
         self.extra_args = list(raw.get("extra_args") or [])
+
+        self.concurrency_reason = getattr(self, "concurrency_reason", "configured")
+
+        # Tools a spawned agent may keep. Never this server: a child that can
+        # reach it can spawn, and depth stops being flat. Checked rather than
+        # trusted, because the config is edited by hand and the failure is
+        # silent recursion.
+        self.child_mcp = dict(raw.get("child_mcp") or {})
+        for name in list(self.child_mcp):
+            spec = json.dumps(self.child_mcp[name])
+            if "firecode-spawn" in spec or f":{raw.get('port', 9770)}" in spec:
+                print(f"[spawn] refusing to give children {name}: it reaches "
+                      "this server, and a child that can spawn is not flat",
+                      file=sys.stderr)
+                del self.child_mcp[name]
 
         missing = [n for n, p in self.projects.items() if not os.path.isdir(p)]
         for name in missing:
@@ -198,6 +225,32 @@ class Config:
 
 class Runs:
     """Everything this server has started, and what became of it."""
+
+    def _fits(self):
+        """How many VMs this machine can carry at once.
+
+        Whichever runs out first - cores or memory - decides, and the host
+        keeps a share of both so the machine stays usable while a fleet is
+        running. Reported at startup and in the refusal, because a cap the
+        caller cannot see is a cap it will quietly serialise around.
+        """
+        try:
+            cores = os.cpu_count() or 2
+            with open("/proc/meminfo") as fh:
+                avail_mb = next(
+                    int(line.split()[1]) // 1024 for line in fh
+                    if line.startswith("MemAvailable:"))
+        except Exception:
+            self.concurrency_reason = "could not read the machine, assuming small"
+            return 2
+
+        by_cpu = max(1, (cores - 2) // 2)
+        by_mem = max(1, int(avail_mb * 0.7) // max(1, self.mem_per_run_mb))
+        fits = max(1, min(by_cpu, by_mem, 12))
+        self.concurrency_reason = (
+            f"{cores} cores and {avail_mb // 1024}G free allow {by_cpu} by cpu "
+            f"and {by_mem} by memory at {self.mem_per_run_mb}M a run")
+        return fits
 
     def __init__(self, config):
         self.cfg = config
@@ -234,8 +287,15 @@ class Runs:
             # the subscription model, to grok, or to something local, and
             # comparing them is the point of being able to say.
             which = (agent or self.cfg.agent).strip()
-            if which not in ("claude", "opencode"):
-                raise ValueError(f"unknown agent {which!r} - claude or opencode")
+            if which not in ("claude", "opencode", "glm"):
+                raise ValueError(
+                    f"unknown agent {which!r} - claude, opencode or glm")
+            # glm is claude the client against z.ai, so it takes claude's
+            # argument shape. It was missing here while the CLI had it,
+            # which left one wrong way to ask for it - agent=opencode with
+            # a zai model - and that combination gets no credentials at all,
+            # because the relay picks its provider from the AGENT name and
+            # opencode means xai. Somebody nearly committed four runs to it.
 
             cmd = [FIRECODE, which,
                    "--workdir", workdir,
@@ -274,10 +334,19 @@ class Runs:
                     cmd += ["-m", model]
                 cmd += [task]
             else:
+                # The child must not reach THIS server - depth stays flat -
+                # but an empty config took every other tool with it. Eight
+                # researchers were sent to study codebases with no search,
+                # no fetch and no reader, and had to work bare-handed; they
+                # did the work and nobody was told the tools had been
+                # removed. Give the child exactly what the operator listed
+                # under child_mcp, and nothing else: --strict-mcp-config
+                # still means the child cannot pick anything up on its own,
+                # and this server is not in that list.
                 cmd += ["--", "-p", task, "--dangerously-skip-permissions",
-                        # No MCP of any kind in the child, so it cannot reach
-                        # this server and start VMs of its own.
-                        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+                        "--strict-mcp-config",
+                        "--mcp-config", json.dumps(
+                            {"mcpServers": self.cfg.child_mcp})]
                 if model:
                     cmd += ["--model", model]
                 if resume:
@@ -878,13 +947,21 @@ def build_tools(cfg):
                     },
                     "agent": {
                         "type": "string",
-                        "enum": ["claude", "opencode"],
+                        "enum": ["claude", "opencode", "glm"],
                         "description": (
                             "Which agent runs the task. Defaults to this "
-                            "server's configured one. opencode is the way to "
-                            "reach another provider - grok, a local model - "
-                            "so use it when the point is to compare, or when "
-                            "the task suits a different model."),
+                            "server's configured one.\n\n"
+                            "glm is the way to run a GLM model: it is the "
+                            "claude client pointed at z.ai, so it takes "
+                            "claude's shape and needs no model argument "
+                            "(glm-4.7 by default, FIRECODE_GLM_MODEL to "
+                            "change it). Do NOT ask for a GLM model by "
+                            "passing agent=opencode with a zai model name - "
+                            "that combination gets no credentials, because "
+                            "the relay picks its provider from the AGENT and "
+                            "opencode means xai.\n\n"
+                            "opencode is the way to reach grok or a local "
+                            "model, and it needs an explicit model."),
                     },
                     "model": {
                         "type": "string",
@@ -1742,6 +1819,7 @@ def main(argv):
     print(f"[spawn] projects: {', '.join(sorted(cfg.projects)) or '(none)'}")
     print(f"[spawn] at most {cfg.max_concurrent} at once, "
           f"{cfg.max_total} in total")
+    print(f"[spawn]   {cfg.concurrency_reason}")
     print("[spawn] reach it from a guest with: "
           f"firecode claude --host-port {port} ...")
     try:

@@ -337,6 +337,64 @@ cmd_libvirtvm() {
 	echo "  log: $ROOT/runs/libvirt-probe.log"
 }
 
+# Point a scratch workspace at the durable repository it was copied to.
+#
+#   dev.sh repoint flowy ~/Projects/flowy
+#
+# Spawns resolve a project by its scratch path, so a symlink is the whole
+# change: work packs FROM the durable repo and folds back INTO it, and /tmp
+# stops being in the loop. The scratch tree is renamed rather than removed -
+# it held a whole project through fourteen fix rounds this afternoon and
+# nothing about a tidy-up is worth risking that.
+cmd_repoint() {
+	local name=${1:?usage: dev.sh repoint <name> <durable-path>}
+	local dest=${2:?usage: dev.sh repoint <name> <durable-path>}
+	local scratch=${FIRECODE_SCRATCH:-/tmp/firecode-scratch}/$name
+
+	[[ -d $dest ]] || {
+		echo "no durable repo at $dest"
+		return 2
+	}
+	if [[ -L $scratch ]]; then
+		echo "$scratch is already a link -> $(readlink "$scratch")"
+		return 0
+	fi
+
+	# Refuse if the scratch tree holds anything the durable copy does not.
+	if [[ -d $scratch/.git ]]; then
+		local s d n
+		s=$(git -C "$scratch" rev-parse HEAD 2>/dev/null)
+		d=$(git -C "$dest" rev-parse HEAD 2>/dev/null)
+		n=$(git -C "$scratch" rev-list --count --all 2>/dev/null || echo 0)
+		say "$name"
+		echo "  scratch  $s ($n commits)"
+		echo "  durable  $d"
+		# An empty repository holds nothing to lose, and comparing its
+		# unborn HEAD against a real commit refuses a move that is safe.
+		if [[ $n == 0 ]] && [[ -z $(ls -A "$scratch" | grep -v '^\.git$') ]]; then
+			echo "  scratch is an empty placeholder - nothing to preserve"
+			s=$d
+		fi
+		if [[ $s != "$d" ]]; then
+			echo "  REFUSING: the two are not at the same commit. Sync first -"
+			echo "  the scratch tree may hold work the durable copy has never seen."
+			return 1
+		fi
+		if ! git -C "$scratch" diff --quiet 2>/dev/null ||
+			! git -C "$scratch" diff --cached --quiet 2>/dev/null; then
+			echo "  REFUSING: the scratch tree has uncommitted changes."
+			return 1
+		fi
+	fi
+
+	local aside
+	aside="$scratch.replaced-$(date +%Y%m%d-%H%M%S)"
+	mv "$scratch" "$aside" || return 1
+	ln -s "$dest" "$scratch" || return 1
+	echo "  $scratch -> $dest"
+	echo "  previous tree kept at $aside"
+}
+
 cmd_status() {
 	say "branch"
 	git rev-parse --abbrev-ref HEAD
@@ -1753,7 +1811,16 @@ lab_tail() {
 # Arm the room waiter. Run it in the BACKGROUND - it blocks until somebody
 # addresses you, and that return is the wake-up.
 cmd_listen() {
-	exec firecode chat --inbox --as "${FIRECODE_CHAT_NAME:-claude-host}"
+	# A long window on purpose.
+	#
+	# The default deadline is half an hour, so every quiet stretch ends with
+	# the waiter exiting "nobody said anything" and the session deaf until
+	# somebody notices - which is the same lapse as forgetting to re-arm it,
+	# arriving on a timer instead of by inattention. The exit is what wakes
+	# the harness, so a long block costs nothing and a short one costs the
+	# whole channel.
+	FIRECODE_CHAT_DEADLINE=${FIRECODE_CHAT_DEADLINE:-28800} \
+		exec firecode chat --inbox --as "${FIRECODE_CHAT_NAME:-claude-host}"
 }
 
 case "${1:-all}" in
@@ -1762,6 +1829,10 @@ packcheck) cmd_packcheck ;;
 libvirtvm)
 	shift
 	cmd_libvirtvm "$@"
+	;;
+repoint)
+	shift
+	cmd_repoint "$@"
 	;;
 fusecheck) cmd_fusecheck ;;
 gatecheck) cmd_gatecheck ;;

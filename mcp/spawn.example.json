@@ -23,8 +23,22 @@
     "project and builds over whatever is already in it."
   ],
   "scratch_root": "/tmp/firecode-scratch",
-  "max_concurrent": 2,
+  "_max_concurrent_note": [
+    "Leave at 0 and the machine decides: cores and free memory, whichever",
+    "runs out first, with a share left for the host. A fixed 2 was the old",
+    "default and a fleet of eight quietly serialised against it - the work",
+    "got done and nobody was told the parallelism had been declined."
+  ],
+  "max_concurrent": 0,
   "max_total": 20,
+  "_child_mcp_note": [
+    "MCP servers a SPAWNED agent keeps. Empty means it has no tools at all,",
+    "which is what shipped: agents sent to study codebases had no search, no",
+    "fetch and no reader, and worked bare-handed without being told. List",
+    "the read-only ones an unattended agent should have. This server is",
+    "refused here whatever you write - a child that can spawn is not flat."
+  ],
+  "child_mcp": {},
   "default_timeout": 3600,
   "host_ports": [
     18080
