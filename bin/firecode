@@ -27,6 +27,18 @@ declare -a FIRECODE_ARGV=("$@")
 FC="$VENDOR/firecracker"
 JAILER="$VENDOR/jailer"
 
+# A missing HOME is a wrong answer, not a crash.
+#
+# Under `set -u` a bare $HOME kills the script outright, and HOME is absent in
+# every context that is not a login shell: systemd units, cron, a container
+# entrypoint, and the qemu guest agent - which is how this was found, one
+# level down, where `firecode doctor` died on line 32 before printing a word.
+# The passwd entry is the answer the shell would have given anyway.
+if [[ -z ${HOME:-} ]]; then
+	HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+	export HOME="${HOME:-/root}"
+fi
+
 # Where the host agents keep their configuration. Overridable mostly so the
 # harness can be exercised against a throwaway copy.
 CLAUDE_HOME="${FIRECODE_CLAUDE_HOME:-$HOME/.claude}"
@@ -300,17 +312,45 @@ stage_project() {
 	mkdir -p "$stage"
 
 	local -a rs=(-a --link-dest="$workdir")
-	if ((USE_GITIGNORE)) && [[ -d $workdir/.git ]]; then
-		# Per-directory .gitignore rules, the same set git itself would skip.
-		# .git is not covered by those, so the history still comes along.
-		rs+=(--filter=':- .gitignore')
-	fi
 	local p
 	for p in ${EXCLUDES+"${EXCLUDES[@]}"}; do
 		rs+=(--exclude="$p")
 	done
 
-	rsync "${rs[@]}" "$workdir"/ "$stage"/ 2>/dev/null || true
+	# Ask git which files it would keep, rather than teaching rsync to read
+	# .gitignore.
+	#
+	# `--filter=':- .gitignore'` looks like it means "the files git would
+	# keep" and does not: rsync reads that file with its own rules, and the
+	# two disagree about negation. Git treats `!pattern` as re-including
+	# something an earlier rule excluded - which is how every project keeps
+	# one file inside an otherwise-ignored build directory - while rsync's
+	# merge takes every line in a `-` file as another exclusion and drops the
+	# re-include on the floor.
+	#
+	# The result is a delivered tree that differs from the committed one in a
+	# way nothing reports: Flowy embeds web/dist into its binary and keeps
+	# web/dist/.gitkeep for exactly this reason, and an agent handed the
+	# packed tree got a project that would not compile while a clone of the
+	# same commit built fine. It cost a review round to find, and it was
+	# blamed on zero-byte files, which pack correctly.
+	#
+	# git ls-files answers exactly, including untracked-but-not-ignored work,
+	# which is most of what an agent is given a project for.
+	local listed=0
+	if ((USE_GITIGNORE)) && [[ -e $workdir/.git ]] &&
+		git -C "$workdir" rev-parse --git-dir >/dev/null 2>&1; then
+		if git -C "$workdir" ls-files -z --cached --others --exclude-standard 2>/dev/null |
+			rsync "${rs[@]}" --files-from=- --from0 "$workdir"/ "$stage"/ 2>/dev/null; then
+			listed=1
+			# .git is not in ls-files, and an agent with no history cannot
+			# read a blame or make a commit.
+			rsync -a --link-dest="$workdir" "$workdir/.git" "$stage"/ 2>/dev/null || true
+		fi
+	fi
+
+	# No repository, or git could not answer: copy what is there.
+	((listed)) || rsync "${rs[@]}" "$workdir"/ "$stage"/ 2>/dev/null || true
 
 	# A git worktree's .git is a file pointing into the main checkout, which is
 	# not in the VM - so git in there would find no repository at all, and the
@@ -4668,12 +4708,22 @@ EOF
 		# is worth reading. The log stays in the delivered tree either way.
 		local vst="$out_dir/.firecode-verify-status"
 		if [[ -f $vst ]]; then
+			local vrc
+			vrc=$(cat "$vst")
 			cp -f "$vst" "$RUN_DIR/verify-status"
-			if [[ $(cat "$vst") == 0 ]]; then
+			if [[ $vrc == 0 ]]; then
 				log "verification passed - see $out_dir/.firecode-verify.log"
 			else
-				log "VERIFICATION FAILED (exit $(cat "$vst")) - $out_dir/.firecode-verify.log"
+				log "VERIFICATION FAILED (exit $vrc) - $out_dir/.firecode-verify.log"
 				log "  whatever the agent said about this run, the check did not pass"
+				# The gate's status becomes the run's, which is the entire
+				# point of having one. It was being logged and then dropped:
+				# the run exited 0 because the AGENT exited 0, so a failed
+				# gate was invisible to everything that reads an exit code -
+				# a shell script, the spawn server, an orchestrator deciding
+				# whether to land the work. A gate nobody can act on is
+				# decoration, and this one was built after two runs lied.
+				rc=$vrc
 			fi
 			rm -f "$vst"
 		fi
@@ -5023,7 +5073,15 @@ doc_check() {
 		DOC_BAD=$((DOC_BAD + 1))
 	fi
 	[[ -n $fix ]] && DOC_FIXES+=("$label|$fix")
-	return 1
+	# Always 0, deliberately.
+	#
+	# This runs under `set -e`, and every call is a bare command, so returning
+	# non-zero on a failed check aborted doctor at the first thing that was
+	# missing - on a machine with nothing set up, the report stopped after two
+	# lines. A tool whose whole job is telling you what is absent must survive
+	# finding something absent. The counts and DOC_FIXES carry the verdict;
+	# the exit status of an individual check carries nothing anyone reads.
+	return 0
 }
 
 doc_info() { printf '  --    %-38s %s\n' "$1" "$2"; }
