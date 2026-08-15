@@ -330,7 +330,19 @@ class Runs:
         # to hold every other caller while it does. Only on a clean exit -
         # the harness has already refused to report a failed gate as success,
         # and this must not undo that by folding a failure into the workspace.
-        if run.get("land_on_pass") and code == 0 and run.get("firecode_run"):
+        if run.get("land_on_pass") and code == 0 and not run.get("firecode_run"):
+            # Asked to land, earned the landing, and no id to land with.
+            # Recorded rather than skipped: the caller asked for a fold and
+            # is entitled to find out it did not get one from the same place
+            # it reads everything else about the run.
+            run["landed"] = False
+            run["land_output"] = (
+                "no harness run id could be read from the log, so nothing was "
+                "landed. Fold by hand with `firecode land <run>` - `firecode "
+                "list` shows the ids.")
+            print(f"[spawn] land skipped for {run_id}: no run id in log",
+                  file=sys.stderr)
+        elif run.get("land_on_pass") and code == 0 and run.get("firecode_run"):
             rc, out = _firecode(["land", run["firecode_run"]], timeout=180)
             run["landed"] = (rc == 0)
             run["land_output"] = out
@@ -347,7 +359,12 @@ class Runs:
         try:
             with open(log_path, errors="replace") as fh:
                 for line in fh:
-                    m = re.search(r"\brun (firecode-[0-9]+-[0-9]+)", line)
+                    # date-time-pid, all three. Matching only two of them
+                    # still matches - the pattern is not anchored - and
+                    # returns a truncated id that every later command
+                    # rejects as "no run ... here". land_on_pass silently
+                    # did nothing for its first real user because of it.
+                    m = re.search(r"\brun (firecode-[0-9]+-[0-9]+-[0-9]+)", line)
                     if m:
                         return m.group(1)
         except OSError:
