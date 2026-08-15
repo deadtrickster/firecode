@@ -307,6 +307,28 @@ cmd_gatecheck() {
 	return $rc
 }
 
+# A libvirt-backed VM, left up long enough for something to watch it.
+#
+# For verifying the OTHER vmm path end to end - firecode's live_runs finds a
+# libvirt run by its domain file rather than by a firecracker socket, and a
+# dashboard that only ever saw firecracker runs would show an empty table and
+# look correct.
+cmd_libvirtvm() {
+	local secs=${1:-600}
+	local proj=/tmp/firecode-scratch/libvirt-probe
+	mkdir -p "$proj"
+	echo "a workspace for a libvirt-backed run" >"$proj/README"
+	say "booting a libvirt VM for ${secs}s"
+	setsid firecode exec --vmm libvirt --project "$proj" \
+		-- bash -c "sleep $secs" >"$ROOT/runs/libvirt-probe.log" 2>&1 &
+	disown 2>/dev/null || true
+	sleep 25
+	say "what firecode sees"
+	firecode ps 2>&1 | head -12
+	echo
+	echo "  log: $ROOT/runs/libvirt-probe.log"
+}
+
 cmd_status() {
 	say "branch"
 	git rev-parse --abbrev-ref HEAD
@@ -1614,31 +1636,55 @@ lab_preserve() {
 		"$(git -C "$dest" rev-list --count HEAD)" \
 		"$(git -C "$dest" ls-files | wc -l)"
 
-	say "how it was built, and what was found"
+	# Sorted by what they are ABOUT, not by which lab produced them.
+	#
+	# The first pass put Flowy's security findings and its integration spec
+	# beside a FUSE filesystem, because both came out of the same lab on the
+	# same day. That is filing by accident of production: somebody reading
+	# pgfuse in six months has no use for a federation threat model, and
+	# somebody auditing Flowy would never think to look in a filesystem
+	# repository for the adversarial reports about it.
+	say "how pgfuse was built"
 	mkdir -p "$notes"
 	local f
 	for f in /tmp/firecode-scratch/pgfuse-build-spec.md \
-		/tmp/firecode-scratch/pgfuse-wave2-briefs.md \
-		/tmp/firecode-scratch/lying-peer-findings.md \
+		/tmp/firecode-scratch/pgfuse-wave2-briefs.md; do
+		[[ -f $f ]] && cp -f "$f" "$notes/" && echo "  $(basename "$f")"
+	done
+	# Flowy's own artifacts, kept apart.
+	local flowy=${FLOWY_NOTES:-$HOME/Projects/flowy-lab-notes}
+	say "what the lab found out about flowy"
+	mkdir -p "$flowy"
+	for f in /tmp/firecode-scratch/lying-peer-findings.md \
 		/tmp/firecode-scratch/lying-peer-refix.md \
 		/tmp/firecode-scratch/lying-peer-fix13.md \
 		/tmp/firecode-scratch/adversary-findings.md \
 		/tmp/firecode-scratch/flowy-lying-peer.md \
+		/tmp/firecode-scratch/flowy-covered.md \
 		/tmp/firecode-scratch/flowy-integration-spec.md; do
-		[[ -f $f ]] && cp -f "$f" "$notes/" && echo "  $(basename "$f")"
+		[[ -f $f ]] && cp -f "$f" "$flowy/" && echo "  $(basename "$f")"
 	done
+	rm -f "$notes"/lying-peer-*.md "$notes"/adversary-findings.md \
+		"$notes"/flowy-*.md 2>/dev/null || true
 
 	# The room's transcript. It is the record of who decided what and why,
 	# and it lives in a gitignored directory - so it is in no commit and
 	# nobody would think to look for it until it was gone.
+	# The transcript covers both projects and belongs to neither, so it goes
+	# to both rather than being split - a conversation cut in half by topic
+	# loses the thing that makes it worth keeping, which is the order the
+	# decisions were made in.
 	if [[ -f $ROOT/runs/chat.log ]]; then
 		cp -f "$ROOT/runs/chat.log" "$notes/agent-chat.log"
-		echo "  agent-chat.log ($(wc -l <"$ROOT/runs/chat.log") messages)"
+		cp -f "$ROOT/runs/chat.log" "$flowy/agent-chat.log"
+		echo
+		echo "  agent-chat.log ($(wc -l <"$ROOT/runs/chat.log") messages) to both"
 	fi
 
 	say "where it is"
 	echo "  $dest"
-	echo "  $notes"
+	echo "  $notes        (pgfuse: how it was built)"
+	echo "  $flowy   (flowy: what the lab found)"
 }
 
 # What every slice is doing.
@@ -1705,6 +1751,10 @@ cmd_listen() {
 case "${1:-all}" in
 lint) cmd_lint ;;
 packcheck) cmd_packcheck ;;
+libvirtvm)
+	shift
+	cmd_libvirtvm "$@"
+	;;
 fusecheck) cmd_fusecheck ;;
 gatecheck) cmd_gatecheck ;;
 status) cmd_status ;;
