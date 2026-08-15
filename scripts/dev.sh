@@ -318,8 +318,16 @@ cmd_libvirtvm() {
 	local proj=/tmp/firecode-scratch/libvirt-probe
 	mkdir -p "$proj"
 	echo "a workspace for a libvirt-backed run" >"$proj/README"
-	say "booting a libvirt VM for ${secs}s"
-	setsid firecode exec --vmm libvirt --project "$proj" \
+	# Session, not system.
+	#
+	# firecode defaults to qemu:///system, where qemu runs as libvirt-qemu
+	# and cannot traverse a 0750 home - so the domain dies on Permission
+	# denied before it exists. The session daemon runs qemu as this user,
+	# reads this user's files, and needs no root. Overridable, because the
+	# default is right on a host configured for it.
+	say "booting a libvirt VM for ${secs}s (${LIBVIRT_DEFAULT_URI:-qemu:///session})"
+	LIBVIRT_DEFAULT_URI=${LIBVIRT_DEFAULT_URI:-qemu:///session} \
+		setsid firecode exec --vmm libvirt --project "$proj" \
 		-- bash -c "sleep $secs" >"$ROOT/runs/libvirt-probe.log" 2>&1 &
 	disown 2>/dev/null || true
 	sleep 25

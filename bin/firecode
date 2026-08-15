@@ -2394,6 +2394,16 @@ cmd_chat() {
 	# and a chat room that quietly answers 404 because it never started is
 	# worse than one on an odd port.
 	local port=${FIRECODE_CHAT_PORT:-9761} who=${FIRECODE_CHAT_NAME:-$(id -un)@host}
+	# The room is not always on this machine.
+	#
+	# Hardcoding 127.0.0.1 meant an agent inside a VM could POST to the room
+	# - the briefs gave it the gateway address by curl - and could never
+	# READ, because `chat --inbox` looked for a server on its own loopback
+	# where nothing listens. So the inbox check that was supposed to make a
+	# running agent interruptible silently returned nothing, every time, and
+	# I reported it as working. One address, two directions, and only one of
+	# them was ever right.
+	local host=${FIRECODE_CHAT_HOST:-127.0.0.1}
 	local mode=say since=0 wait=0 to="" inbox_all=0 tail=${FIRECODE_CHAT_TAIL:-20}
 	while [[ ${1:-} == -* || ${1:-} == serve || ${1:-} == install ]]; do
 		case "${1:-}" in
@@ -2531,7 +2541,7 @@ cmd_chat() {
 		local deadline=$(($(date +%s) + ${FIRECODE_CHAT_DEADLINE:-1800})) out=""
 		while (($(date +%s) < deadline)); do
 			out=$(FIRECODE_CHAT_MARK="$mark_file" curl -s -m $((wait + 30)) \
-				"http://127.0.0.1:$port/messages?since=$since&wait=$wait" |
+				"http://$host:$port/messages?since=$since&wait=$wait" |
 				FIRECODE_CHAT_MARK="$mark_file" FIRECODE_CHAT_SELF="$who" \
 					FIRECODE_CHAT_INBOX_ALL="$inbox_all" python3 -c '
 import json, os, sys, time
@@ -2608,7 +2618,7 @@ for m in msgs:
     print("[%s] %s: %s" % (stamp, who, m["text"]))
 print("-- last id: %d" % d.get("last", 0))' \
 			< <(curl -s -m $((wait + 30)) \
-				"http://127.0.0.1:$port/messages?since=$since&wait=$wait")
+				"http://$host:$port/messages?since=$since&wait=$wait")
 		return 0
 	fi
 
@@ -2645,7 +2655,7 @@ try:
         print("said (#%d)" % json.load(r)["id"])
 except Exception as exc:
     sys.exit("chat is not answering on %s: %s" % (sys.argv[1], exc))
-' "http://127.0.0.1:$port/say"
+' "http://$host:$port/say"
 }
 
 # Wait, then say what a run has been doing.
@@ -4885,6 +4895,17 @@ p=$(ss -ltn 2>/dev/null | tail -n +2 | awk "{print \$4}" | grep -v "^127\." | so
 true' 2>/dev/null) || snap=""
 		if [[ -n $snap ]]; then
 			printf '%s\n' "$snap"
+		elif [[ $backend == libvirt ]]; then
+			# Not the same statement as silence from a firecracker VM.
+			#
+			# The exec channel is a vsock the firecracker path sets up and
+			# the libvirt path does not, so a perfectly healthy libvirt run
+			# never answers - and saying "not answering - busy, or shutting
+			# down" about it is a lie that reads as a dying VM. A dashboard
+			# was about to infer this from the backend name, which is a
+			# guess it should not have to make: firecode knows which runs it
+			# never probed, so it should say so.
+			echo "  (no exec channel on this backend - not probed)"
 		else
 			echo "  (not answering - busy, or shutting down)"
 		fi
@@ -5115,6 +5136,31 @@ cmd_doctor() {
 		"firecode prepare        # needs docker, but no root"
 	doc_check warn "docker (only for prepare)" "docker info" "" \
 		"install docker and add yourself to the docker group - only 'prepare' needs it"
+
+	# Only meaningful if libvirt is the backend, and silent otherwise - but
+	# when it bites there is nothing to see. The system daemon runs qemu as
+	# libvirt-qemu, so a home directory that uid cannot traverse makes every
+	# libvirt run die on "Permission denied" reading its own layer image,
+	# before the domain exists. The message names qemu and a file, so it
+	# reads like a disk problem rather than a permissions one. Found because
+	# somebody asked why a dashboard never showed a libvirt row: no libvirt
+	# domain had ever started on this machine.
+	if command -v virsh >/dev/null 2>&1; then
+		# The other-execute bit decides it: without it nobody outside your
+		# user and group can traverse $HOME, and libvirt-qemu is outside
+		# both. Octal rather than the rwx string, because matching dashes in
+		# "drwxr-x---" is fiddly and wrong in a way that silently passes -
+		# which it did on the first attempt here.
+		doc_check warn "libvirt can read your home" \
+			"[[ \$(stat -c '%a' '$HOME' 2>/dev/null) =~ [1357]\$ ]]" \
+			"" "your home is $(stat -c '%a %A' "$HOME" 2>/dev/null) so qemu:///system (running as
+       libvirt-qemu) cannot reach a layer image under it, and every
+       'firecode --vmm libvirt' run will fail before the domain exists.
+       Use the session daemon instead:
+         LIBVIRT_DEFAULT_URI=qemu:///session firecode --vmm libvirt ...
+       It runs qemu as you, reads your files, and needs no root - at the
+       cost of usermode networking rather than a bridge."
+	fi
 
 	echo
 	echo " host tools"
