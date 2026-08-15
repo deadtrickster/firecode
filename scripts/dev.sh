@@ -14,6 +14,10 @@
 #   dev.sh lint      shellcheck + shfmt + parse every script, compile python
 #   dev.sh status    branch, last commits, what is uncommitted
 #   dev.sh push      push the current branch
+#   dev.sh await-commit
+#                    block until the magit buffer is finished or abandoned,
+#                    so run it in the background after ecommit and the
+#                    notification is the answer
 #   dev.sh room      chat server, cursors, identities, who is listening
 #   dev.sh server    spawn server pid, runs in flight, recent log
 #   dev.sh all       every read-only check above
@@ -99,6 +103,44 @@ cmd_push() {
 	git push
 }
 
+# Block until the commit sitting in the editor is finished, or abandoned.
+#
+# `ecommit` opens a magit buffer and returns straight away, so nothing tells
+# an agent when C-c C-c actually lands - it finds out by polling git log,
+# which means either asking repeatedly or noticing minutes later. Run this in
+# the background instead: it exits when HEAD moves, and a background command
+# that exits is a notification.
+#
+# Exits 0 with the new commit, 1 if nothing happened before the timeout, and
+# 2 if the commit was abandoned - the staged changes still sitting there with
+# HEAD where it was is what C-c C-k leaves behind.
+cmd_await_commit() {
+	local start now waited=0 limit=${FIRECODE_AWAIT_COMMIT:-1800}
+	start=$(git rev-parse HEAD 2>/dev/null) || return 1
+	while ((waited < limit)); do
+		sleep 2
+		waited=$((waited + 2))
+		now=$(git rev-parse HEAD 2>/dev/null)
+		if [[ $now != "$start" ]]; then
+			say "committed"
+			git log --oneline -1
+			say "still uncommitted"
+			git status --short
+			return 0
+		fi
+		# Nothing staged any more, HEAD unmoved: the buffer was abandoned
+		# and somebody unstaged, or another session committed the index.
+		if git diff --cached --quiet 2>/dev/null; then
+			say "nothing staged and HEAD did not move"
+			echo "the commit was abandoned, or its changes were unstaged"
+			return 2
+		fi
+	done
+	say "timeout"
+	echo "no commit after ${limit}s - the buffer is probably still open"
+	return 1
+}
+
 cmd_room() {
 	say "chat server"
 	if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
@@ -151,6 +193,7 @@ case "${1:-all}" in
 lint) cmd_lint ;;
 status) cmd_status ;;
 push) cmd_push ;;
+await-commit) cmd_await_commit ;;
 room) cmd_room ;;
 server) cmd_server ;;
 all)
