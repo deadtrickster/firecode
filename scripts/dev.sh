@@ -14,10 +14,12 @@
 #   dev.sh lint      shellcheck + shfmt + parse every script, compile python
 #   dev.sh status    branch, last commits, what is uncommitted
 #   dev.sh push      push the current branch
-#   dev.sh await-commit
-#                    block until the magit buffer is finished or abandoned,
-#                    so run it in the background after ecommit and the
+#   dev.sh commit    stage first, put the message in runs/commit-msg.txt,
+#                    then run this in the BACKGROUND: it opens the magit
+#                    buffer and blocks until C-c C-c or C-c C-k, so the
 #                    notification is the answer
+#   dev.sh await-commit
+#                    the waiting half alone, for a buffer already open
 #   dev.sh room      chat server, cursors, identities, who is listening
 #   dev.sh server    spawn server pid, runs in flight, recent log
 #   dev.sh all       every read-only check above
@@ -115,8 +117,36 @@ cmd_push() {
 # 2 if the commit was abandoned - the staged changes still sitting there with
 # HEAD where it was is what C-c C-k leaves behind.
 cmd_await_commit() {
-	local start now waited=0 limit=${FIRECODE_AWAIT_COMMIT:-1800}
+	local start
 	start=$(git rev-parse HEAD 2>/dev/null) || return 1
+	wait_for_commit "$start"
+}
+
+# Stage first, write the message to runs/commit-msg.txt, then run this in the
+# background. It captures HEAD before opening the editor, which `await-commit`
+# on its own cannot do: called as a separate command it can be started after
+# C-c C-c has already landed, and then "HEAD is where I found it and nothing
+# is staged" describes a finished commit and an abandoned one identically. It
+# reported a successful commit as abandoned exactly once before this existed.
+cmd_commit() {
+	local msg=${FIRECODE_COMMIT_MSG:-runs/commit-msg.txt} start
+	if [[ ! -s $msg ]]; then
+		echo "no commit message at $msg - write it there first"
+		return 2
+	fi
+	if git diff --cached --quiet 2>/dev/null; then
+		echo "nothing staged - git add what you mean to commit first"
+		return 2
+	fi
+	start=$(git rev-parse HEAD 2>/dev/null) || return 1
+	say "opening the commit buffer"
+	git diff --cached --stat | tail -1
+	ecommit -F "$msg" || true
+	wait_for_commit "$start"
+}
+
+wait_for_commit() {
+	local start=$1 now waited=0 limit=${FIRECODE_AWAIT_COMMIT:-1800}
 	while ((waited < limit)); do
 		sleep 2
 		waited=$((waited + 2))
@@ -194,6 +224,7 @@ lint) cmd_lint ;;
 status) cmd_status ;;
 push) cmd_push ;;
 await-commit) cmd_await_commit ;;
+commit) cmd_commit ;;
 room) cmd_room ;;
 server) cmd_server ;;
 all)
