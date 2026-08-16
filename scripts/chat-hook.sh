@@ -137,6 +137,108 @@ if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 	done <"$SELF_FILE"
 fi
 
+# The flowy half of the doorbell.
+#
+# The room moved into flowy and the doorbell did not, so every agent kept its
+# ears on the old server while the content lived somewhere else. Folded in here
+# rather than shipped as a second hook: two hooks race, each can decide the
+# other's state is fine, and a separate one costs the user an edit to
+# settings.json plus two things to keep in step forever. This one is already
+# wired in. Logic from flowy-claude's standalone version, which is deleted.
+#
+# IT PEEKS AND NEVER CONSUMES. window=0 on /api/inbox/wait returns without
+# blocking and does not move the reader - POST /api/inbox/ack is what advances
+# it. Verified by polling twice and getting the same events. A hook that
+# consumed would steal from the listener meant to receive it, on every prompt,
+# and that listener would look like it was sitting in a quiet room.
+FLOWY_ADDR=${FLOWY_ADDR:-http://192.168.1.55:8787}
+FLOWY_AGENTS=${FLOWY_AGENT_DIR:-$HOME/.config/flowy/agents}
+FLOWY_NAME=""
+FLOWY_DELIVERY=""
+FLOWY_REASON=""
+
+# A name counts only if this machine holds a token for it - that is what makes
+# it an identity on the node rather than a string somebody typed. The names
+# were minted to match the firecode ones, so the same self-file answers both.
+if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
+	while read -r n; do
+		[[ -n $n && -f "$FLOWY_AGENTS/$n" ]] || continue
+		FLOWY_NAME=$n
+		break
+	done <"$SELF_FILE"
+fi
+
+if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
+	flowy_token=$(cat "$FLOWY_AGENTS/$FLOWY_NAME" 2>/dev/null) || flowy_token=""
+	flowy_payload=""
+	[[ -n $flowy_token ]] && flowy_payload=$(curl -s -m 5 \
+		-H "Authorization: Bearer $flowy_token" \
+		"$FLOWY_ADDR/api/inbox/wait?as=$FLOWY_NAME&window=0&limit=20" 2>/dev/null)
+
+	# Listeners, counted as ROOTS. `flowy inbox` is its own process plus
+	# whatever wrapper armed it, so one healthy listener is two or three
+	# matches and a naive count fires the too-many warning on a healthy room.
+	flowy_pids=$(pgrep -f -- "flowy inbox --as $FLOWY_NAME" 2>/dev/null) || true
+	flowy_listeners=0
+	for pid in $flowy_pids; do
+		ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+		[[ -n $ppid ]] || continue
+		grep -qx -- "$ppid" <<<"$flowy_pids" || flowy_listeners=$((flowy_listeners + 1))
+	done
+
+	flowy_events=""
+	flowy_total=0
+	flowy_mine=0
+	if [[ -n $flowy_payload ]]; then
+		flowy_events=$(jq -c '.events // []' <<<"$flowy_payload" 2>/dev/null) || flowy_events=""
+		[[ -n $flowy_events && $flowy_events != null ]] || flowy_events=""
+	fi
+	if [[ -n $flowy_events ]]; then
+		flowy_total=$(jq 'length' <<<"$flowy_events" 2>/dev/null) || flowy_total=0
+		[[ $flowy_total =~ ^[0-9]+$ ]] || flowy_total=0
+		flowy_mine=$(jq --arg me "$FLOWY_NAME" \
+			'[.[] | select(.addressee_name == $me or .addressee == $me)] | length' \
+			<<<"$flowy_events" 2>/dev/null) || flowy_mine=0
+		[[ $flowy_mine =~ ^[0-9]+$ ]] || flowy_mine=0
+	fi
+
+	flowy_render() {
+		jq -r '.[] | "  [" + ((.created // "")[11:16]) + "] " +
+			(.actor_name // .meta.actor_name // (.actor // "?")[-8:]) +
+			(if (.room // "") != "" then " in #" + .room else "" end) + ": " +
+			((.body // "") | gsub("\n"; " ") | .[0:160])' <<<"$flowy_events" 2>/dev/null
+	}
+
+	if ((flowy_total > 0)); then
+		FLOWY_DELIVERY=$(printf 'flowy room (%s) - %s message(s) waiting:\n%s\nRead them with: flowy inbox --as %s --deadline 3600\n' \
+			"$FLOWY_NAME" "$flowy_total" "$(flowy_render)" "$FLOWY_NAME")
+	fi
+
+	if [[ $MODE == stop ]]; then
+		if ((flowy_listeners == 0)); then
+			# shellcheck disable=SC2016  # the $(cat ...) is a command for the
+			# reader to run, printed verbatim. Expanding it here would put the
+			# token into the message and into the transcript.
+			FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start it as a BACKGROUND command:\n  FLOWY_TOKEN=$(cat %s/%s) flowy inbox --as %s --url %s --deadline 3600\nIt returns when somebody speaks - 0 with the event, 1 on a quiet deadline, 2 broken - and that return is what wakes you. Arm it again each time it fires.' \
+				"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_NAME" "$FLOWY_ADDR")
+		elif ((flowy_listeners > 1)); then
+			FLOWY_REASON=$(printf '%d listeners are running as %s on flowy. They share one server-side cursor, so the wake-ups split between them and the one you are tracking may never return. Keep one:\n  pkill -f "flowy inbox --as %s"   # then arm exactly one' \
+				"$flowy_listeners" "$FLOWY_NAME" "$FLOWY_NAME")
+		fi
+		if ((flowy_mine > 0)); then
+			FLOWY_REASON=${FLOWY_REASON:+$FLOWY_REASON$'\n\n'}$(printf '%d message(s) in the flowy room are addressed to %s and unanswered:\n%s\nAnswer before you stop - silence reads as absence.' \
+				"$flowy_mine" "$FLOWY_NAME" "$(flowy_render)")
+		fi
+	fi
+fi
+
+# Delivery first, and before any of the firecode paths can exit early: if that
+# server is down or quiet this script returns 0 long before the end, and the
+# flowy half must not be lost with it.
+if [[ $MODE != stop && -n $FLOWY_DELIVERY ]]; then
+	printf '%s\n' "$FLOWY_DELIVERY"
+fi
+
 # One cursor per identity, shared with the waiter.
 #
 # The hook and `chat --inbox` are two ways of delivering to the same reader,
@@ -167,9 +269,21 @@ since=0
 [[ -f $MARK ]] && since=$(cat "$MARK" 2>/dev/null)
 [[ $since =~ ^[0-9]+$ ]] || since=0
 
+# The flowy half has to survive the firecode half being unreachable. Both of
+# the guards below return 0 when that server is down or has nothing, and a
+# stop that should have been refused over flowy would be lost with them.
+flowy_only_stop() {
+	if [[ $MODE == stop && -n $FLOWY_REASON ]]; then
+		printf '%s\n' "$FLOWY_REASON" >&2
+		exit 2
+	fi
+	exit 0
+}
+
 # One shot, no waiting: a hook that blocks is a session that hangs.
-payload=$(curl -s -m 5 "http://127.0.0.1:$PORT/messages?since=$since&wait=0" 2>/dev/null) || exit 0
-[[ -n $payload ]] || exit 0
+payload=$(curl -s -m 5 "http://127.0.0.1:$PORT/messages?since=$since&wait=0" 2>/dev/null) ||
+	flowy_only_stop
+[[ -n $payload ]] || flowy_only_stop
 
 # shellcheck disable=SC2016  # the single quotes below hold a python program;
 # expanding shell variables into it is exactly what must not happen - the
@@ -178,6 +292,7 @@ FIRECODE_HOOK_MARK="$MARK" FIRECODE_HOOK_SELF="$NAME" FIRECODE_HOOK_MODE="$MODE"
 	FIRECODE_HOOK_SELF_FILE="$SELF_FILE" \
 	FIRECODE_HOOK_WAITER="$WAITER" FIRECODE_HOOK_WAITER_NAME="$WAITER_NAME" \
 	FIRECODE_HOOK_WAITER_COUNT="$WAITER_COUNT" \
+	FIRECODE_HOOK_FLOWY_REASON="$FLOWY_REASON" \
 	python3 -c '
 import json, os, sys, time
 
@@ -262,6 +377,15 @@ elif mode == "stop" and waiter_name and not waiter:
         "It blocks until somebody speaks and returns - that return is what "
         "wakes you. Start it again each time it fires; this will keep "
         "reminding you until one is running." % waiter_name)
+
+# The flowy half of the doorbell, decided in the shell above and carried here
+# so the two rooms produce ONE refusal. Appended rather than raised on its own:
+# a session refused twice in a row over two different rooms learns to treat the
+# refusal as noise, and stop_hook_active means the second one would not fire
+# anyway.
+flowy_reason = os.environ.get("FIRECODE_HOOK_FLOWY_REASON") or ""
+if mode == "stop" and flowy_reason:
+    rearm = (rearm + "\n\n" + flowy_reason) if rearm else "\n\n" + flowy_reason
 
 fresh = [m for m in msgs if str(m.get("from", "")).lower() not in selves]
 if not fresh:
