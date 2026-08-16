@@ -290,6 +290,26 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	fi
 fi
 
+# WHAT A WAITER ALREADY TOOK, which is the half that was being lost.
+#
+# A waiter exits 0 having printed the messages to a background task's output
+# and having moved the mark past them. If the agent never reads that output -
+# and across the fleet tonight, agents did not - the messages are delivered to
+# nobody and gone from the inbox. So the waiter also spools what it read, and
+# this is where the spool reaches the session: printed, then cleared, so the
+# same message is not delivered twice.
+SPOOL=""
+if [[ -n $WAITER_NAME ]]; then
+	spool_file="$FIRECODE_ROOT/runs/chat-spool-$(printf '%s' "$WAITER_NAME" | tr -c 'A-Za-z0-9._-' '-').txt"
+	if [[ -s $spool_file ]]; then
+		SPOOL=$(cat "$spool_file" 2>/dev/null || true)
+		: >"$spool_file"
+	fi
+fi
+if [[ $MODE != stop && -n $SPOOL ]]; then
+	printf 'Said in the room while you were away (already taken off the inbox):\n%s\n' "$SPOOL"
+fi
+
 # Delivery first, and before any of the firecode paths can exit early: if that
 # server is down or quiet this script returns 0 long before the end, and the
 # flowy half must not be lost with it.

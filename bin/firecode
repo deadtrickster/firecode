@@ -2610,6 +2610,42 @@ if d.get("messages"):
     with open(os.environ["FIRECODE_CHAT_MARK"], "w") as fh:
         fh.write(str(d.get("last", 0)))' 2>/dev/null)
 			[[ -n $out ]] && {
+				# RE-ARM BEFORE RETURNING, not after.
+				#
+				# The gap that actually loses messages is not two waiters, it
+				# is ZERO: this one delivers, exits, and the room is unheard
+				# until the agent gets round to starting another. That
+				# depends on the agent noticing a background task finished,
+				# and tonight it repeatedly did not - the user posted "who is
+				# here listening" into a room where nobody was.
+				#
+				# So the waiter hands over before it goes. The replacement is
+				# detached with setsid, so it survives this process and the
+				# shell that started it; the pid file is released first so
+				# the successor is not refused as a duplicate, and it writes
+				# its own. This process still exits, which is what wakes the
+				# harness - the fork covers the room, the exit covers the
+				# agent, and neither waits for the other.
+				rm -f "$pid_file"
+				trap - EXIT INT TERM
+				setsid "$0" chat --inbox --as "$who" \
+					>>"$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.log" 2>&1 </dev/null &
+				disown 2>/dev/null || true
+
+				# SPOOL IT, because exit 0 is not delivery.
+				#
+				# The waiter printing to stdout means the messages went to a
+				# background task's output - and if the agent never reads
+				# that output, the mark has still moved past them and they
+				# are gone from the inbox. Observed across the fleet tonight:
+				# listeners exiting 0 while nobody picked anything up.
+				#
+				# So what was read is appended here as well, and the hook
+				# delivers and clears it on the next prompt or stop. Two
+				# routes to the agent, and the durable one does not depend on
+				# anybody remembering to look at a log.
+				printf '%s\n' "$out" >>"$RUNS/chat-spool-${who//[^A-Za-z0-9._-]/-}.txt"
+
 				printf '%s\n' "$out"
 				# Said with the messages rather than in a document nobody
 				# rereads: an unanswered message is indistinguishable from an
@@ -2617,11 +2653,9 @@ if d.get("messages"):
 				echo
 				echo "-- ack anything addressed to you before you work on it:"
 				echo "--   firecode chat --as $who \"seen, doing X\""
-				echo "-- then start this waiter again, or you leave the room:"
-				echo "--   firecode chat --inbox --as $who"
-				echo "-- IN THE BACKGROUND - it blocks until somebody speaks."
-				echo "--   claude code: Bash with run_in_background: true"
-				echo "--   a plain shell: append &"
+				echo "-- A SUCCESSOR IS ALREADY LISTENING - it was forked before"
+				echo "-- this returned, so the room is covered while you read."
+				echo "-- You do NOT need to re-arm; arming another is refused."
 				return 0
 			}
 		done
