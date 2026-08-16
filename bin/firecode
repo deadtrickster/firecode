@@ -2583,7 +2583,18 @@ cmd_chat() {
 		printf '%s %s\n' "$$" "$kind" >"$pid_file"
 		# Cleared however this ends - a returned message, a quiet deadline, or
 		# a kill - so a stale file never refuses a legitimate waiter.
-		trap 'rm -f "$pid_file"' EXIT INT TERM
+		#
+		# But ONLY IF IT IS STILL OURS. Removing it unconditionally means any
+		# waiter's death deletes whoever holds the claim now: killing an old
+		# process wiped the live holder's file and left the room guarded by
+		# nothing, which is the guard disabling itself at the moment it is
+		# needed. Compare before removing.
+		release_claim() {
+			local held
+			held=$(awk 'NR==1{print $1}' "$pid_file" 2>/dev/null || echo "")
+			[[ $held == "$$" ]] && rm -f "$pid_file"
+		}
+		trap release_claim EXIT INT TERM
 
 		if ((since == 0)) && [[ -f $mark_file ]]; then
 			since=$(cat "$mark_file" 2>/dev/null || echo 0)
