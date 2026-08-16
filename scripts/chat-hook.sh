@@ -153,6 +153,12 @@ fi
 # and that listener would look like it was sitting in a quiet room.
 FLOWY_ADDR=${FLOWY_ADDR:-http://192.168.1.55:8787}
 FLOWY_AGENTS=${FLOWY_AGENT_DIR:-$HOME/.config/flowy/agents}
+# The binary is not on PATH, so the command this hook prints has to name it in
+# full. Printing a bare `flowy` gives the reader "command not found" - a fix
+# instruction that does not work is worse than none, because it reads as the
+# room being broken rather than the advice being wrong.
+FLOWY_BIN=${FLOWY_BIN:-$(command -v flowy 2>/dev/null)}
+[[ -n $FLOWY_BIN ]] || FLOWY_BIN=$HOME/Projects/flowy-dogfood/flowy
 FLOWY_NAME=""
 FLOWY_DELIVERY=""
 FLOWY_REASON=""
@@ -210,8 +216,8 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	}
 
 	if ((flowy_total > 0)); then
-		FLOWY_DELIVERY=$(printf 'flowy room (%s) - %s message(s) waiting:\n%s\nRead them with: flowy inbox --as %s --deadline 3600\n' \
-			"$FLOWY_NAME" "$flowy_total" "$(flowy_render)" "$FLOWY_NAME")
+		FLOWY_DELIVERY=$(printf 'flowy room (%s) - %s message(s) waiting:\n%s\nRead them with: %s inbox --as %s --deadline 3600\n' \
+			"$FLOWY_NAME" "$flowy_total" "$(flowy_render)" "$FLOWY_BIN" "$FLOWY_NAME")
 	fi
 
 	if [[ $MODE == stop ]]; then
@@ -219,8 +225,8 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			# shellcheck disable=SC2016  # the $(cat ...) is a command for the
 			# reader to run, printed verbatim. Expanding it here would put the
 			# token into the message and into the transcript.
-			FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start it as a BACKGROUND command:\n  FLOWY_TOKEN=$(cat %s/%s) flowy inbox --as %s --url %s --deadline 3600\nIt returns when somebody speaks - 0 with the event, 1 on a quiet deadline, 2 broken - and that return is what wakes you. Arm it again each time it fires.' \
-				"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_NAME" "$FLOWY_ADDR")
+			FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start it as a BACKGROUND command:\n  FLOWY_TOKEN=$(cat %s/%s) %s inbox --as %s --url %s --deadline 3600\nIt returns when somebody speaks - 0 with the event, 1 on a quiet deadline, 2 broken - and that return is what wakes you. Arm it again each time it fires.' \
+				"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_BIN" "$FLOWY_NAME" "$FLOWY_ADDR")
 		elif ((flowy_listeners > 1)); then
 			FLOWY_REASON=$(printf '%d listeners are running as %s on flowy. They share one server-side cursor, so the wake-ups split between them and the one you are tracking may never return. Keep one:\n  pkill -f "flowy inbox --as %s"   # then arm exactly one' \
 				"$flowy_listeners" "$FLOWY_NAME" "$FLOWY_NAME")

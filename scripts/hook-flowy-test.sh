@@ -102,10 +102,21 @@ sleep 1
 err=$(FIRECODE_CHAT_PORT=9 bash "$HOOK" stop <<<"$input" 2>&1 >/dev/null)
 got=$?
 check "exit 2 with no listener" 2 "$got"
-if grep -q "flowy inbox --as $NAME" <<<"$err"; then
+if grep -q "inbox --as $NAME" <<<"$err"; then
 	echo "ok    names the command to run"
 else
 	echo "FAIL  refusal did not name the flowy command"
+	rc=1
+fi
+
+# The discriminating case for that one: it passed while the hook printed a bare
+# `flowy`, which is not on PATH here, so the reader got "command not found" and
+# read it as the room being broken. Check the binary it names EXISTS.
+bin=$(grep -oE '[^ ]*flowy[^ ]* inbox --as' <<<"$err" | head -1 | sed 's/ inbox --as//')
+if [[ -n $bin ]] && command -v "$bin" >/dev/null 2>&1; then
+	echo "ok    the command it names is runnable: $bin"
+else
+	echo "FAIL  the refusal names something that will not run: [$bin]"
 	rc=1
 fi
 
