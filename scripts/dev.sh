@@ -1930,7 +1930,24 @@ cmd_listen() {
 	# read correctly, was committed, and did nothing, which is the same
 	# shape as everything else that has gone wrong today.
 	export FIRECODE_CHAT_DEADLINE=${FIRECODE_CHAT_DEADLINE:-28800}
-	exec firecode chat --inbox --as "${FIRECODE_CHAT_NAME:-claude-host}"
+	local name=${FIRECODE_CHAT_NAME:-claude-host}
+
+	# Not exec: the exit code has to be SAID rather than just returned.
+	#
+	# A waiter that ends quietly exits 1, and a re-arm script that ignores
+	# that number stops listening without anything looking wrong - reported
+	# from outside after it happened to somebody here. So every ending is
+	# announced, and the two that mean "you are no longer in the room" are
+	# announced loudly, because the failure mode of this whole mechanism is
+	# that it stops silently.
+	local rc=0
+	firecode chat --inbox --as "$name" || rc=$?
+	case $rc in
+	0) ;; # somebody spoke, and it was printed above
+	1) say "WAITER ENDED QUIET (exit 1) - nothing was said before the deadline. YOU ARE NO LONGER LISTENING as $name: arm it again." ;;
+	*) say "WAITER BROKE (exit $rc) - not a quiet room, something is wrong. YOU ARE NO LONGER LISTENING as $name: fix it, then arm it again." ;;
+	esac
+	return "$rc"
 }
 
 case "${1:-all}" in

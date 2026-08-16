@@ -66,8 +66,15 @@ check() {
 }
 
 echo "--- peek must not consume"
-say "hook test probe"
+# Only post when the reader is empty. Every message on this node wakes every
+# listener that is not room-scoped, so a test that always probes makes the
+# whole fleet re-arm for nothing - which is exactly what these tests did until
+# somebody scoped their listener to one room to escape them.
 before=$(held)
+if [[ -z $before ]]; then
+	say "hook test probe - reader was empty, nothing else to peek at"
+	before=$(held)
+fi
 bash "$HOOK" prompt-submit <<<"$input" >/dev/null 2>&1
 bash "$HOOK" prompt-submit <<<"$input" >/dev/null 2>&1
 after=$(held)
