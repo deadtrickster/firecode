@@ -50,6 +50,16 @@ BASE=$BASE,file,bash-completion,busybox-static,cpio
 # FUSE: the kernel has always had it, and without the userspace half a
 # filesystem written in a VM cannot be mounted there.
 BASE=$BASE,fuse3,libfuse3-dev,libfuse-dev,python3-fusepy,python3-pyfuse3
+# Postgres, because a gate that stores anything wants it and every run was
+# apt-getting it over the network first. It is here as the SERVER BINARIES
+# rather than a service - initdb, pg_ctl and psql, for gates that stand up a
+# throwaway cluster in a temp directory and tear it down again. Nothing
+# starts a system postgres; the package is installed and left alone.
+#
+# Note the version this pins you to: noble ships PostgreSQL 16, so a gate in
+# a VM tests against 16. If what the code runs on in earnest is 17, that gap
+# is real and belongs in a README rather than in a surprise.
+BASE=$BASE,postgresql,postgresql-client
 
 say "bootstrapping $SUITE"
 sudo -n rm -rf "$TREE"
