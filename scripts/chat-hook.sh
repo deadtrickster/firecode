@@ -106,6 +106,26 @@ fi
 # and refuses to start a second one for the same name. So: liveness is kill -0
 # on a number, and a name is this session's when its pid file holds a live
 # pid. No pattern, nothing to self-match, no parent and child to tell apart.
+# AN OFF SWITCH, because a nag with no way to be told "I meant that" is a nag
+# that argues with the person it works for.
+#
+# The user killed both listeners twice in a minute - deliberately, to get the
+# background shell count down - and this hook immediately demanded they be
+# armed again. It cannot tell a listener that died from one that was stopped
+# on purpose, and without a way to say so it would refuse every stop from now
+# on. Silence is a legitimate choice; this is how it is expressed.
+#
+#   touch runs/chat-quiet       - no nagging, in either room
+#   rm    runs/chat-quiet       - back to normal
+#
+# Delivery is unaffected: what is waiting is still shown at session start and
+# on every prompt. What stops is the demand to arm something.
+if [[ -f "$FIRECODE_ROOT/runs/chat-quiet" ]]; then
+	CHAT_QUIET=1
+else
+	CHAT_QUIET=0
+fi
+
 waiter_pid_for() {
 	local f
 	f="$FIRECODE_ROOT/runs/chat-waiter-$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-').pid"
@@ -290,7 +310,7 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			"$FLOWY_NAME" "$flowy_total" "$(flowy_render)" "$FLOWY_BIN" "$FLOWY_NAME")
 	fi
 
-	if [[ $MODE == stop ]]; then
+	if [[ $MODE == stop && $CHAT_QUIET == 0 ]]; then
 		if ((flowy_listeners == 0)); then
 			# shellcheck disable=SC2016  # the $(cat ...) is a command for the
 			# reader to run, printed verbatim. Expanding it here would put the
@@ -389,6 +409,7 @@ FIRECODE_HOOK_MARK="$MARK" FIRECODE_HOOK_SELF="$NAME" FIRECODE_HOOK_MODE="$MODE"
 	FIRECODE_HOOK_WAITER="$WAITER" FIRECODE_HOOK_WAITER_NAME="$WAITER_NAME" \
 	FIRECODE_HOOK_WAITER_COUNT="$WAITER_COUNT" \
 	FIRECODE_HOOK_FLOWY_REASON="$FLOWY_REASON" \
+	FIRECODE_HOOK_QUIET="$CHAT_QUIET" \
 	python3 -c '
 import json, os, sys, time
 
@@ -486,7 +507,13 @@ elif mode == "stop" and waiter_name and not waiter:
 # refusal as noise, and stop_hook_active means the second one would not fire
 # anyway.
 flowy_reason = os.environ.get("FIRECODE_HOOK_FLOWY_REASON") or ""
-if mode == "stop" and flowy_reason:
+# Silenced on purpose - see the chat-quiet comment in the shell above. The
+# room is still DELIVERED; what stops is telling somebody to arm something
+# they have just deliberately stopped.
+quiet = os.environ.get("FIRECODE_HOOK_QUIET") == "1"
+if quiet:
+    rearm = ""
+if mode == "stop" and flowy_reason and not quiet:
     rearm = (rearm + "\n\n" + flowy_reason) if rearm else "\n\n" + flowy_reason
 
 fresh = [m for m in msgs if str(m.get("from", "")).lower() not in selves]
