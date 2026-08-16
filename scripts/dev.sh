@@ -1877,6 +1877,41 @@ lab_tail() {
 
 # Arm the room waiter. Run it in the BACKGROUND - it blocks until somebody
 # addresses you, and that return is the wake-up.
+# Restart the spawn server the moment it is free, and not before.
+#
+# It serves whatever code it started with, so a source edit leaves it stale
+# until a restart - but a restart while somebody's VM is mid-run takes their
+# run with it. Rather than invent a second opinion about what "busy" means,
+# this just asks for the restart on a timer and lets the server's OWN guard
+# refuse while children are alive. The guard is the authority; this is only
+# patience. First acceptance wins and the watcher exits.
+cmd_spawn_restart_when_idle() {
+	local every=${FIRECODE_RESTART_EVERY:-120}
+	local deadline=$(($(date +%s) + ${FIRECODE_RESTART_WAIT:-21600}))
+	local out="" vms=0
+	while (($(date +%s) < deadline)); do
+		# Two gates, because they see different things. The server's guard
+		# counts only ITS OWN children, so a VM somebody started by hand is
+		# invisible to it and the restart would go ahead in the middle of
+		# their work. This counts every run on the machine.
+		vms=$("$ROOT/bin/firecode" ps 2>/dev/null | grep -c '^  firecode-2') || true
+		if ((vms > 0)); then
+			say "$vms VM(s) still up, waiting ${every}s"
+			sleep "$every"
+			continue
+		fi
+		if out=$("$ROOT/bin/firecode" spawn-server restart 2>&1); then
+			say "spawn server restarted"
+			printf '%s\n' "$out" | tail -3
+			return 0
+		fi
+		say "still busy, waiting ${every}s - $(printf '%s' "$out" | tail -1)"
+		sleep "$every"
+	done
+	say "gave up waiting for the spawn server to go idle"
+	return 1
+}
+
 cmd_listen() {
 	# A long window on purpose.
 	#
@@ -1931,6 +1966,7 @@ lab)
 	cmd_lab "$@"
 	;;
 listen) cmd_listen ;;
+spawn-restart-when-idle) cmd_spawn_restart_when_idle ;;
 relay) cmd_relay ;;
 say)
 	shift
