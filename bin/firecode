@@ -2547,18 +2547,40 @@ cmd_chat() {
 		# a pid file, `kill -0` to see whether that pid is alive, and a
 		# refusal to start a second one. No pattern matching anywhere.
 		local pid_file="$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.pid"
+
+		# A TRACKED WAITER ALWAYS BEATS A FORKED ONE, and this is the whole
+		# difference between covering the room and reaching the agent.
+		#
+		# The successor forked at delivery is detached: it keeps the room
+		# heard, but it is NOT a harness background task, so when it catches
+		# a message it has nothing to wake. It hears everything and tells
+		# nobody - and while it holds this lock, the agent's own re-arm is
+		# refused as a duplicate, which is how a session ends up with a live
+		# listener, zero shells, and silence. Observed exactly that way.
+		#
+		# So the file records WHICH KIND is holding it. A forked holder is
+		# stood down the moment a tracked one arrives; only a tracked holder
+		# refuses another, because two of those really would split a cursor.
+		local kind=${FIRECODE_CHAT_WAITER_KIND:-tracked}
 		if [[ -f $pid_file ]]; then
-			local held
-			held=$(cat "$pid_file" 2>/dev/null || echo "")
+			local held held_kind
+			held=$(awk 'NR==1{print $1}' "$pid_file" 2>/dev/null || echo "")
+			held_kind=$(awk 'NR==1{print ($2 == "" ? "tracked" : $2)}' "$pid_file" 2>/dev/null || echo tracked)
 			if [[ $held =~ ^[0-9]+$ ]] && kill -0 "$held" 2>/dev/null; then
-				die "a waiter for '$who' is already running (pid $held).
+				if [[ $held_kind == forked && $kind == tracked ]]; then
+					log "standing down the forked waiter (pid $held) - a tracked one can wake you, it cannot"
+					kill "$held" 2>/dev/null || true
+					sleep 1
+				else
+					die "a waiter for '$who' is already running (pid $held, $held_kind).
        Two of them share one cursor, so the second would take messages the
        first should have delivered. Keep that one, or stop it with
        'kill $held' if it is not the one your harness is watching."
+				fi
 			fi
 			rm -f "$pid_file"
 		fi
-		printf '%s\n' "$$" >"$pid_file"
+		printf '%s %s\n' "$$" "$kind" >"$pid_file"
 		# Cleared however this ends - a returned message, a quiet deadline, or
 		# a kill - so a stale file never refuses a legitimate waiter.
 		trap 'rm -f "$pid_file"' EXIT INT TERM
@@ -2628,8 +2650,16 @@ if d.get("messages"):
 				# agent, and neither waits for the other.
 				rm -f "$pid_file"
 				trap - EXIT INT TERM
-				setsid "$0" chat --inbox --as "$who" \
-					>>"$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.log" 2>&1 </dev/null &
+				# export in a subshell, not an assignment prefix: firecode
+				# re-execs itself, and a prefixed assignment does not survive
+				# that - the successor came up marked `tracked`, which would
+				# make it refuse the very takeover this distinction exists
+				# for. Same class as `VAR=x exec cmd` earlier today.
+				(
+					export FIRECODE_CHAT_WAITER_KIND=forked
+					setsid "$0" chat --inbox --as "$who" \
+						>>"$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.log" 2>&1 </dev/null &
+				)
 				disown 2>/dev/null || true
 
 				# SPOOL IT, because exit 0 is not delivery.
