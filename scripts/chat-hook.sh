@@ -92,46 +92,66 @@ fi
 # angle while messages are handed to a process nobody is reading. Arming one
 # per stop-hook nag across a long session is all it takes - reported by
 # flowy-claude with five of them, and this session had two.
+# STOP ASKING THE PROCESS TABLE - IT ANSWERED WRONG EVERY WAY IT COULD.
+#
+# Every identity and liveness bug in this file came from matching patterns
+# against ps: a pgrep matches the shell running it, so a check said one waiter
+# when there were none; a healthy waiter is two processes, so counting matches
+# nagged a healthy room; killing a parent orphaned its child into a third
+# root, so the fix advice made the count worse; and another agent's waiter
+# under a shared name looked exactly like this session's, so the hook handed
+# flowy-glm somebody else's name AND TOKEN.
+#
+# The waiter now writes a pid file when it starts, removes it when it ends,
+# and refuses to start a second one for the same name. So: liveness is kill -0
+# on a number, and a name is this session's when its pid file holds a live
+# pid. No pattern, nothing to self-match, no parent and child to tell apart.
+waiter_pid_for() {
+	local f
+	f="$FIRECODE_ROOT/runs/chat-waiter-$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-').pid"
+	[[ -f $f ]] || return 1
+	local pid
+	pid=$(cat "$f" 2>/dev/null || echo "")
+	[[ $pid =~ ^[0-9]+$ ]] || return 1
+	kill -0 "$pid" 2>/dev/null || return 1
+	printf '%s' "$pid"
+}
+
+# WHAT THIS SESSION IS CALLED, REMEMBERED - because a process cannot answer it
+# when the process is gone, and that is exactly when the nag is needed.
+#
+# Resolving identity from a live listener made this hook go SILENT whenever the
+# listener had died in a directory with more than one name: no process, no
+# name, no nag, in the one case the nag exists for. Reported as "the watchers
+# stopped working", and it was this.
+#
+# So the name is learned while it can be PROVED - a listener whose ancestry is
+# this session's - and written down per session id. When the listener is later
+# gone, the remembered name is used. Proof when available, memory when not, and
+# never a guess from somebody else's process.
+NAME_MEMO="$MARK_DIR/session-name-$(printf '%s' "${SESSION:-none}" | tr -c 'A-Za-z0-9._-' '-')"
+remember_name() { [[ -n ${SESSION:-} && -n $1 ]] && printf '%s\n' "$1" >"$NAME_MEMO" 2>/dev/null || true; }
+remembered_name() { [[ -f $NAME_MEMO ]] && head -1 "$NAME_MEMO" 2>/dev/null || true; }
+MEMO_NAME=$(remembered_name)
+
 WAITER=0
 WAITER_COUNT=0
 WAITER_NAME=""
 if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 	while read -r n; do
 		[[ -n $n ]] || continue
-		# First name in the file, kept only as the fallback for the rearm
-		# line when nothing is listening under any of them.
-		[[ -z $WAITER_NAME ]] && WAITER_NAME=$n
-		# `|| true`: pgrep exits 1 when it matches nothing, which under
-		# set -e plus pipefail would kill the hook on the quiet case.
-		pids=$(pgrep -f -- "chat --inbox --as $n" 2>/dev/null) || true
-		# Count WAITERS, not processes, and they are not the same number.
-		# One healthy waiter shows up as two or three matches: `firecode` is
-		# a bash script that re-execs itself, so there is a parent and a
-		# child with identical command lines, and arming it through a
-		# harness leaves a `bash -c` wrapper whose command line also carries
-		# the pattern. Counting lines therefore reports three waiters where
-		# there is one, and the too-many warning below fires on a healthy
-		# room every single time.
-		#
-		# So count only the matches whose parent is NOT itself a match -
-		# the root of each little tree. Two independent roots is two
-		# waiters; a parent and its child is one.
-		count=0
-		for pid in $pids; do
-			ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
-			[[ -n $ppid ]] || continue
-			grep -qx -- "$ppid" <<<"$pids" || count=$((count + 1))
-		done
-		if ((count > 0)); then
-			WAITER_COUNT=$count
-			# The name that matters is the one whose process is actually up,
-			# because that is the name whose cursor the waiter is moving.
-			# Leaving the first name here instead lets the hook confirm one
-			# identity's waiter while keying the mark to another's - two
-			# readers, two positions, and a message delivered twice, which
-			# is the bug the cursor comment below says was already fixed.
+		# The remembered name wins over file order: the first line of a
+		# shared directory's self-file is whoever spoke there first, which
+		# is not this session.
+		[[ -z $WAITER_NAME ]] && WAITER_NAME=${MEMO_NAME:-$n}
+		# One number, one kill -0. The waiter refuses to start a second
+		# under the same name, so a live pid file IS one healthy waiter -
+		# there is nothing left to count and nothing to disambiguate.
+		if waiter_pid_for "$n" >/dev/null; then
+			WAITER_COUNT=1
 			WAITER_NAME=$n
 			WAITER=1
+			remember_name "$n"
 			break
 		fi
 	done <"$SELF_FILE"
@@ -186,14 +206,19 @@ elif [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 		flowy_candidates+=("$n")
 	done <"$SELF_FILE"
 fi
-for n in ${flowy_candidates[@]+"${flowy_candidates[@]}"}; do
-	if pgrep -f -- "flowy inbox --as $n" >/dev/null 2>&1; then
-		FLOWY_NAME=$n
-		break
-	fi
-done
+# The remembered name first, then the only candidate. No process lookup at
+# all on this side: `flowy inbox` is not ours to make write a pid file, and
+# the node itself answers the liveness question far better - /api/presence
+# reports whether a reader is polling right now, which is a fact the server
+# observes rather than one inferred from a command line.
+if [[ -n $MEMO_NAME ]]; then
+	for n in ${flowy_candidates[@]+"${flowy_candidates[@]}"}; do
+		[[ $n == "$MEMO_NAME" ]] && FLOWY_NAME=$n && break
+	done
+fi
 if [[ -z $FLOWY_NAME && ${#flowy_candidates[@]} -eq 1 ]]; then
 	FLOWY_NAME=${flowy_candidates[0]}
+	remember_name "$FLOWY_NAME"
 fi
 
 if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
@@ -203,16 +228,21 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 		-H "Authorization: Bearer $flowy_token" \
 		"$FLOWY_ADDR/api/inbox/wait?as=$FLOWY_NAME&window=0&limit=20" 2>/dev/null)
 
-	# Listeners, counted as ROOTS. `flowy inbox` is its own process plus
-	# whatever wrapper armed it, so one healthy listener is two or three
-	# matches and a naive count fires the too-many warning on a healthy room.
-	flowy_pids=$(pgrep -f -- "flowy inbox --as $FLOWY_NAME" 2>/dev/null) || true
+	# ASK THE NODE, NOT THE PROCESS TABLE. /api/presence reports whether this
+	# reader is polling right now - a fact the server observes, on the machine
+	# that would actually deliver the message. Counting local processes could
+	# only ever guess at it, and every way of guessing was wrong: the checking
+	# shell matched its own pattern, one listener looked like three, and
+	# another agent's listener looked like this one.
 	flowy_listeners=0
-	for pid in $flowy_pids; do
-		ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
-		[[ -n $ppid ]] || continue
-		grep -qx -- "$ppid" <<<"$flowy_pids" || flowy_listeners=$((flowy_listeners + 1))
-	done
+	flowy_presence=$(curl -s -m 5 -H "Authorization: Bearer $flowy_token" \
+		"$FLOWY_ADDR/api/presence" 2>/dev/null) || flowy_presence=""
+	if [[ -n $flowy_presence ]]; then
+		flowy_listeners=$(jq --arg me "$FLOWY_NAME" \
+			'[(.listeners // [])[] | select(.reader == $me and .attached)] | length' \
+			<<<"$flowy_presence" 2>/dev/null) || flowy_listeners=0
+		[[ $flowy_listeners =~ ^[0-9]+$ ]] || flowy_listeners=0
+	fi
 
 	flowy_events=""
 	flowy_total=0

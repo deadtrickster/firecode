@@ -2530,6 +2530,39 @@ cmd_chat() {
 		# the argument list. One name, one mark, so two watchers reading the
 		# room do not consume each other's messages.
 		local mark_file="$RUNS/chat-mark-${who//[^A-Za-z0-9._-]/-}"
+
+		# ONE WAITER PER NAME, ENFORCED HERE RATHER THAN COUNTED LATER.
+		#
+		# Two waiters under one name share this mark file: whichever polls
+		# first advances it and the rest block on a position that moved, so
+		# messages arrive at a process nobody is reading while every check
+		# says the room is healthy. That was found by counting processes, and
+		# counting processes is what produced a week of wrong answers in one
+		# evening - a pgrep matches the shell running it, a healthy waiter is
+		# two processes, killing a parent orphans its child into a third, and
+		# another agent's waiter under a shared name looks exactly like this
+		# session's.
+		#
+		# So the waiter writes down that it exists, and nothing has to guess:
+		# a pid file, `kill -0` to see whether that pid is alive, and a
+		# refusal to start a second one. No pattern matching anywhere.
+		local pid_file="$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.pid"
+		if [[ -f $pid_file ]]; then
+			local held
+			held=$(cat "$pid_file" 2>/dev/null || echo "")
+			if [[ $held =~ ^[0-9]+$ ]] && kill -0 "$held" 2>/dev/null; then
+				die "a waiter for '$who' is already running (pid $held).
+       Two of them share one cursor, so the second would take messages the
+       first should have delivered. Keep that one, or stop it with
+       'kill $held' if it is not the one your harness is watching."
+			fi
+			rm -f "$pid_file"
+		fi
+		printf '%s\n' "$$" >"$pid_file"
+		# Cleared however this ends - a returned message, a quiet deadline, or
+		# a kill - so a stale file never refuses a legitimate waiter.
+		trap 'rm -f "$pid_file"' EXIT INT TERM
+
 		if ((since == 0)) && [[ -f $mark_file ]]; then
 			since=$(cat "$mark_file" 2>/dev/null || echo 0)
 			[[ $since =~ ^[0-9]+$ ]] || since=0
