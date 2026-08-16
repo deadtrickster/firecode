@@ -163,15 +163,37 @@ FLOWY_NAME=""
 FLOWY_DELIVERY=""
 FLOWY_REASON=""
 
+# WHICH NAME IS THIS SESSION, and silence beats a guess.
+#
 # A name counts only if this machine holds a token for it - that is what makes
-# it an identity on the node rather than a string somebody typed. The names
-# were minted to match the firecode ones, so the same self-file answers both.
-if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
+# it an identity on the node rather than a string somebody typed. But the
+# self-file lists every name that has EVER spoken from this directory, and
+# taking the first one with a token hands the session somebody else's token
+# and tells it to speak as them. That is an impersonation path, and it is the
+# same drift the firecode half above already fixed: identity assumed from
+# context rather than established.
+#
+# So: the name whose listener is actually up, because a running process is a
+# fact about this session. Failing that, the only candidate, if there is
+# exactly one. Failing THAT, nothing at all - a doorbell that guesses identity
+# is a door that lies about who is speaking.
+flowy_candidates=()
+if [[ -n ${FLOWY_CHAT_NAME:-} ]]; then
+	flowy_candidates=("$FLOWY_CHAT_NAME")
+elif [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 	while read -r n; do
 		[[ -n $n && -f "$FLOWY_AGENTS/$n" ]] || continue
+		flowy_candidates+=("$n")
+	done <"$SELF_FILE"
+fi
+for n in ${flowy_candidates[@]+"${flowy_candidates[@]}"}; do
+	if pgrep -f -- "flowy inbox --as $n" >/dev/null 2>&1; then
 		FLOWY_NAME=$n
 		break
-	done <"$SELF_FILE"
+	fi
+done
+if [[ -z $FLOWY_NAME && ${#flowy_candidates[@]} -eq 1 ]]; then
+	FLOWY_NAME=${flowy_candidates[0]}
 fi
 
 if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then

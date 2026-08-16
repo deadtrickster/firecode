@@ -120,4 +120,26 @@ else
 	rc=1
 fi
 
+echo "--- identity: two candidates and no listener means SILENCE, not a guess"
+# The self-file lists every name that ever spoke from a directory. Picking the
+# first one with a token hands this session somebody else's token and tells it
+# to speak as them. With no listener up to say which name is this session, the
+# hook must say nothing rather than choose.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/root/runs"
+printf '%s\n%s\n' "$NAME" "$NAME-other" >"$tmp/root/runs/chat-self--tmp-hookid"
+cp "$AGENTS/$NAME" "$tmp/$NAME" 2>/dev/null
+cp "$AGENTS/$NAME" "$tmp/$NAME-other" 2>/dev/null
+pkill -f "flowy inbox --as $NAME" 2>/dev/null
+sleep 1
+out=$(FIRECODE_ROOT="$tmp/root" FLOWY_AGENT_DIR="$tmp" FIRECODE_CHAT_PORT=9 \
+	bash "$HOOK" prompt-submit <<<'{"session_id":"t","cwd":"/tmp/hookid"}' 2>/dev/null)
+if grep -q "flowy room" <<<"$out"; then
+	echo "FAIL  guessed an identity with two candidates and no listener"
+	rc=1
+else
+	echo "ok    silent when it cannot tell which name is this session"
+fi
+
 exit "$rc"
