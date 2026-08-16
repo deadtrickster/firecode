@@ -258,8 +258,22 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	if [[ -n $flowy_events ]]; then
 		flowy_total=$(jq 'length' <<<"$flowy_events" 2>/dev/null) || flowy_total=0
 		[[ $flowy_total =~ ^[0-9]+$ ]] || flowy_total=0
+		# A MESSAGE FROM A PERSON IS ALWAYS ADDRESSED TO YOU.
+		#
+		# Only addressed messages refuse a stop, and agents habitually write
+		# "flowy-claude: ..." so theirs match. A person writes "who is here?"
+		# - no name, no addressee - which classified as ambient room traffic:
+		# delivered, never blocking. So the human's messages were structurally
+		# the LEAST likely to force a reply and the fleet's were the most,
+		# which is exactly what the user observed from the outside: "my
+		# messages are more likely to be ignored, you guys talk to each other
+		# just fine".
+		#
+		# actor_kind comes from the node, stamped at write time, so this
+		# cannot be spoofed by a client claiming to be a person.
 		flowy_mine=$(jq --arg me "$FLOWY_NAME" \
-			'[.[] | select(.addressee_name == $me or .addressee == $me)] | length' \
+			'[.[] | select(.addressee_name == $me or .addressee == $me
+			              or (.meta.actor_kind // "") == "user")] | length' \
 			<<<"$flowy_events" 2>/dev/null) || flowy_mine=0
 		[[ $flowy_mine =~ ^[0-9]+$ ]] || flowy_mine=0
 	fi
