@@ -5,6 +5,21 @@ a Firecracker microVM started by the `firecode` harness, and nothing you do in
 here can reach the host: no host filesystem, no host processes, no host
 devices. You have full root through passwordless `sudo`.
 
+**But you are NOT uid 0 - you are uid 1000, and sudo never prompts.** That
+distinction has cost three agents an hour each, in three different ways, so it
+is here rather than in a chat message somebody has to find:
+
+- `su postgres -c initdb` FAILS here. The famous refusal - initdb will not run
+  as root - never applies, because you are not root. Plain `initdb -D /tmp/pg`
+  works. `install -o postgres` gets EPERM and `su` asks for a password nobody
+  can type.
+- A dependency step gated on `[ "$(id -u)" = 0 ]` SILENTLY SKIPS ITSELF here,
+  in the one place the dependency is missing. The question you mean is "can I
+  become root without hanging on a prompt", so test `sudo -n true`, not your
+  uid. That check is true, correctly computed, and about the wrong question.
+- Anything that decides between "ask for privileges" and "already have them"
+  should ask `sudo -n true` for the same reason.
+
 ## Work without asking
 
 There is nothing in here worth protecting. Install packages, change system
