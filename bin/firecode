@@ -2546,7 +2546,13 @@ cmd_chat() {
 		# So the waiter writes down that it exists, and nothing has to guess:
 		# a pid file, `kill -0` to see whether that pid is alive, and a
 		# refusal to start a second one. No pattern matching anywhere.
-		local pid_file="$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.pid"
+		# NOT local: the EXIT trap below runs after this function's scope is
+		# gone, so a local here is UNBOUND by the time the trap reads it -
+		# which under set -u printed "pid_file: unbound variable" on every
+		# quiet deadline. Reported by orchestrator within minutes of the
+		# change. A trap outlives the frame that set it.
+		CHAT_PID_FILE="$RUNS/chat-waiter-${who//[^A-Za-z0-9._-]/-}.pid"
+		local pid_file="$CHAT_PID_FILE"
 
 		# A TRACKED WAITER ALWAYS BEATS A FORKED ONE, and this is the whole
 		# difference between covering the room and reaching the agent.
@@ -2590,9 +2596,11 @@ cmd_chat() {
 		# nothing, which is the guard disabling itself at the moment it is
 		# needed. Compare before removing.
 		release_claim() {
-			local held
-			held=$(awk 'NR==1{print $1}' "$pid_file" 2>/dev/null || echo "")
-			[[ $held == "$$" ]] && rm -f "$pid_file"
+			local f=${CHAT_PID_FILE:-} held
+			[[ -n $f ]] || return 0
+			held=$(awk 'NR==1{print $1}' "$f" 2>/dev/null || echo "")
+			[[ $held == "$$" ]] && rm -f "$f"
+			return 0
 		}
 		trap release_claim EXIT INT TERM
 
