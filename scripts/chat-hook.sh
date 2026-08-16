@@ -85,7 +85,15 @@ fi
 # returns when somebody speaks and gets the agent re-invoked. Its weakness is
 # that it must be restarted after every fire, and that is what gets
 # forgotten, so it is checked where going idle begins.
+# COUNTED, not tested, and the difference is a real bug: N waiters under one
+# name all share runs/chat-mark-NAME, so whichever polls first advances the
+# cursor and the rest block on a position that moved. A plain pgrep test is
+# satisfied by one waiter or by ten, so the room looks healthy from every
+# angle while messages are handed to a process nobody is reading. Arming one
+# per stop-hook nag across a long session is all it takes - reported by
+# flowy-claude with five of them, and this session had two.
 WAITER=0
+WAITER_COUNT=0
 WAITER_NAME=""
 if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 	while read -r n; do
@@ -93,7 +101,29 @@ if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 		# First name in the file, kept only as the fallback for the rearm
 		# line when nothing is listening under any of them.
 		[[ -z $WAITER_NAME ]] && WAITER_NAME=$n
-		if pgrep -f -- "chat --inbox --as $n" >/dev/null 2>&1; then
+		# `|| true`: pgrep exits 1 when it matches nothing, which under
+		# set -e plus pipefail would kill the hook on the quiet case.
+		pids=$(pgrep -f -- "chat --inbox --as $n" 2>/dev/null) || true
+		# Count WAITERS, not processes, and they are not the same number.
+		# One healthy waiter shows up as two or three matches: `firecode` is
+		# a bash script that re-execs itself, so there is a parent and a
+		# child with identical command lines, and arming it through a
+		# harness leaves a `bash -c` wrapper whose command line also carries
+		# the pattern. Counting lines therefore reports three waiters where
+		# there is one, and the too-many warning below fires on a healthy
+		# room every single time.
+		#
+		# So count only the matches whose parent is NOT itself a match -
+		# the root of each little tree. Two independent roots is two
+		# waiters; a parent and its child is one.
+		count=0
+		for pid in $pids; do
+			ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+			[[ -n $ppid ]] || continue
+			grep -qx -- "$ppid" <<<"$pids" || count=$((count + 1))
+		done
+		if ((count > 0)); then
+			WAITER_COUNT=$count
 			# The name that matters is the one whose process is actually up,
 			# because that is the name whose cursor the waiter is moving.
 			# Leaving the first name here instead lets the hook confirm one
@@ -147,6 +177,7 @@ payload=$(curl -s -m 5 "http://127.0.0.1:$PORT/messages?since=$since&wait=0" 2>/
 FIRECODE_HOOK_MARK="$MARK" FIRECODE_HOOK_SELF="$NAME" FIRECODE_HOOK_MODE="$MODE" \
 	FIRECODE_HOOK_SELF_FILE="$SELF_FILE" \
 	FIRECODE_HOOK_WAITER="$WAITER" FIRECODE_HOOK_WAITER_NAME="$WAITER_NAME" \
+	FIRECODE_HOOK_WAITER_COUNT="$WAITER_COUNT" \
 	python3 -c '
 import json, os, sys, time
 
@@ -201,8 +232,26 @@ def commit():
 # case where a missing waiter matters and nothing else would raise it.
 waiter = os.environ.get("FIRECODE_HOOK_WAITER") == "1"
 waiter_name = os.environ.get("FIRECODE_HOOK_WAITER_NAME") or ""
+try:
+    waiter_count = int(os.environ.get("FIRECODE_HOOK_WAITER_COUNT") or 0)
+except ValueError:
+    waiter_count = 0
 rearm = ""
-if mode == "stop" and waiter_name and not waiter:
+if mode == "stop" and waiter_name and waiter_count > 1:
+    # Too many is its own failure and it looks exactly like healthy. They all
+    # share one mark file, so whichever polls first advances it and the others
+    # block on a position that moved - messages go to a process nobody reads.
+    rearm = (
+        "\n\n%d waiters are running under %s. They SHARE ONE CURSOR, so "
+        "whichever fires first advances it and the rest block on a position "
+        "that moved - messages arrive at a process nobody is reading, and "
+        "every check still says the room is healthy.\n"
+        "Keep one, and do NOT arm another:\n"
+        "  pkill -of \"chat --inbox --as %s\"   # repeat until one remains\n"
+        "Arming one per reminder across a long session is how it happens: a "
+        "waiter armed during a quiet spell is still blocking, not exited."
+        % (waiter_count, waiter_name, waiter_name))
+elif mode == "stop" and waiter_name and not waiter:
     rearm = (
         "\n\nNothing is listening for you while you are idle. Start the "
         "waiter before you stop:\n"
