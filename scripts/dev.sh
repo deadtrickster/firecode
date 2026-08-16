@@ -1885,8 +1885,16 @@ cmd_listen() {
 	# arriving on a timer instead of by inattention. The exit is what wakes
 	# the harness, so a long block costs nothing and a short one costs the
 	# whole channel.
-	FIRECODE_CHAT_DEADLINE=${FIRECODE_CHAT_DEADLINE:-28800} \
-		exec firecode chat --inbox --as "${FIRECODE_CHAT_NAME:-claude-host}"
+	# export, not an assignment prefix.
+	#
+	# `VAR=x exec cmd` does not put VAR in cmd's environment: exec is a
+	# special builtin, so the assignment persists in the SHELL and is never
+	# exported. The waiter therefore kept its half-hour default while this
+	# line claimed to give it eight, and went deaf on schedule - a fix that
+	# read correctly, was committed, and did nothing, which is the same
+	# shape as everything else that has gone wrong today.
+	export FIRECODE_CHAT_DEADLINE=${FIRECODE_CHAT_DEADLINE:-28800}
+	exec firecode chat --inbox --as "${FIRECODE_CHAT_NAME:-claude-host}"
 }
 
 case "${1:-all}" in

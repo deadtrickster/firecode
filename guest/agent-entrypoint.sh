@@ -413,6 +413,15 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	# problem this exists to solve. The whole output stays in the log.
 	tail -n 25 "$vlog" 2>/dev/null | sed 's/^/  /'
 	echo "$vrc" >/tmp/firecode-verify-status 2>/dev/null || true
+	# How long the gate took, written down rather than only said.
+	#
+	# This number already existed - it is in the console line below - but
+	# only as prose, so anything that wanted it had to guess from file
+	# mtimes, and mtimes lie here because the whole tree is copied out at
+	# once and lands with one timestamp. A gate that took 0.2s on a run that
+	# took forty minutes is a gate that is not testing anything, and that is
+	# invisible unless the duration is a fact somebody can read.
+	echo "$took" >/tmp/firecode-verify-seconds 2>/dev/null || true
 	if ((vrc == 0)); then
 		log "verification passed in ${took}s"
 	elif ((vrc == 124)); then
@@ -432,6 +441,8 @@ fi
 	cp -f "$STATUS_TMP" "$PROJECT/.firecode-exit-status" 2>/dev/null
 [[ -f /tmp/firecode-verify-status ]] &&
 	cp -f /tmp/firecode-verify-status "$PROJECT/.firecode-verify-status" 2>/dev/null
+[[ -f /tmp/firecode-verify-seconds ]] &&
+	cp -f /tmp/firecode-verify-seconds "$PROJECT/.firecode-verify-seconds" 2>/dev/null
 [[ -f /tmp/firecode-verify.log ]] &&
 	cp -f /tmp/firecode-verify.log "$PROJECT/.firecode-verify.log" 2>/dev/null
 

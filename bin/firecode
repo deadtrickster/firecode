@@ -4735,6 +4735,15 @@ EOF
 		fi
 		# Said last, because it is the part that decides whether any of this
 		# is worth reading. The log stays in the delivered tree either way.
+		# The gate's duration, beside its verdict. A dashboard cannot get
+		# this from mtimes - the whole tree is copied out at once and lands
+		# with a single timestamp - and it is the number that says whether
+		# a gate is doing anything at all.
+		local vsec="$out_dir/.firecode-verify-seconds"
+		if [[ -f $vsec ]]; then
+			cp -f "$vsec" "$RUN_DIR/verify-seconds"
+			rm -f "$vsec"
+		fi
 		local vst="$out_dir/.firecode-verify-status"
 		if [[ -f $vst ]]; then
 			local vrc
