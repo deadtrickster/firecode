@@ -90,9 +90,13 @@ say "postgresql $PGVERSION, from PGDG rather than from the suite"
 # The binaries land in /usr/lib/postgresql/<v>/bin, which is on nobody's PATH,
 # so they are linked into /usr/local/bin - ahead of the Debian wrappers, so
 # `initdb` in a gate is this version rather than whatever a wrapper picks.
-# One trap that survives all of this: initdb REFUSES TO RUN AS ROOT, and a
-# firecode guest is root. Gates want `su postgres -c 'initdb -D /tmp/pg'`;
-# the postgres user exists in the image because postgresql-common makes it.
+# A GATE RUNS AS uid 1000 HERE, not as root, with passwordless sudo. So plain
+# `initdb -D /tmp/pgdata` is what a gate wants, and the famous workaround for
+# initdb refusing root - `su postgres -c initdb` - FAILS in a firecode VM:
+# `install -o postgres` gets EPERM and su prompts for a password nobody can
+# type. This comment said the opposite for one commit and an agent copied it
+# into a brief before it was caught, which is the whole reason it is spelled
+# out. initdb refusing root is true; its precondition is false here.
 sudo -n chroot "$TREE" /bin/bash -s "$PGVERSION" <<-'PGDG'
 	set -euo pipefail
 	pgver=$1
