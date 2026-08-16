@@ -90,8 +90,17 @@ WAITER_NAME=""
 if [[ -n $SELF_FILE && -f $SELF_FILE ]]; then
 	while read -r n; do
 		[[ -n $n ]] || continue
+		# First name in the file, kept only as the fallback for the rearm
+		# line when nothing is listening under any of them.
 		[[ -z $WAITER_NAME ]] && WAITER_NAME=$n
 		if pgrep -f -- "chat --inbox --as $n" >/dev/null 2>&1; then
+			# The name that matters is the one whose process is actually up,
+			# because that is the name whose cursor the waiter is moving.
+			# Leaving the first name here instead lets the hook confirm one
+			# identity's waiter while keying the mark to another's - two
+			# readers, two positions, and a message delivered twice, which
+			# is the bug the cursor comment below says was already fixed.
+			WAITER_NAME=$n
 			WAITER=1
 			break
 		fi
