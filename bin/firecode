@@ -5490,13 +5490,30 @@ spawn-server)
 	# while I told people the fixes were live.
 	if [[ ${1:-} == restart || ${1:-} == --restart ]]; then
 		shift
+		# An `if`, not `[[ ... ]] && { ... }`.
+		#
+		# The compound form returns 1 when the test is false, this script
+		# runs under set -e, and so `restart` without --force exited 1
+		# silently having done nothing at all - no restart, no message, no
+		# clue. It is the same shape as doctor stopping at its first failing
+		# check, which was fixed this morning, reintroduced here this
+		# evening by me.
 		force=0
-		[[ ${1:-} == --force ]] && {
+		if [[ ${1:-} == --force ]]; then
 			force=1
 			shift
-		}
+		fi
+		# `|| true`, because this pipeline can fail while working perfectly.
+		#
+		# head -1 leaves as soon as it has its line, sed then writes into a
+		# closed pipe and dies of SIGPIPE, and under `set -o pipefail` that
+		# is the status of the whole assignment - so `set -e` killed the
+		# script here, silently, before a single line was printed. The
+		# symptom was `spawn-server restart` exiting 1 having done nothing
+		# at all, which reads as a command that does not exist rather than
+		# one that died finding the pid it was about to use.
 		local_pid=$(ss -lntp 2>/dev/null |
-			sed -n 's/.*:9770 .*pid=\([0-9]*\).*/\1/p' | head -1)
+			sed -n 's/.*:9770 .*pid=\([0-9]*\).*/\1/p' | head -1) || true
 
 		# Not out from under a run that is still going.
 		#
@@ -5509,12 +5526,28 @@ spawn-server)
 		# honest count. I restarted this under somebody's phase build to ship
 		# a fix that could have waited twenty minutes.
 		if [[ -n $local_pid ]] && ((force == 0)); then
-			busy=$(pgrep -P "$local_pid" 2>/dev/null | wc -l)
-			((busy > 0)) &&
+			# `|| true` on the ASSIGNMENT, which is where it actually dies.
+			#
+			# pgrep exits 1 when it finds nothing, pipefail makes that the
+			# status of the whole pipeline, and set -e kills the script on
+			# the assignment - so the no-runs-in-flight case, the one where
+			# the restart should go ahead, was the one that stopped it. I
+			# "fixed" the comparison below this line twice before tracing it
+			# and finding the failure was here. Reading the code and
+			# guessing produced three wrong fixes; bash -x produced the
+			# answer in one run.
+			busy=$(pgrep -P "$local_pid" 2>/dev/null | wc -l) || true
+			# `if`, for the same reason as above: `(( ))` returns non-zero
+			# when the expression is FALSE, so the no-runs-in-flight case -
+			# the case where the restart should proceed - was the one that
+			# killed the script under set -e. Twice in six lines, in the
+			# guard I added this afternoon to stop restarts eating runs.
+			if ((busy > 0)); then
 				die "the spawn server has $busy run(s) in flight - restarting
        forgets them, so they would finish unwatched and never land.
        Wait for them (firecode spawn-server ps, or status on the run),
        or say --force if losing that bookkeeping is what you want."
+			fi
 		fi
 
 		if [[ -n $local_pid ]]; then

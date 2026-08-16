@@ -395,6 +395,63 @@ cmd_repoint() {
 	echo "  previous tree kept at $aside"
 }
 
+# Run firecode under a shell trace and show where it stopped.
+#
+#   dev.sh trace spawn-server restart
+#
+# For the case that has cost the most time today: a command that exits
+# non-zero having printed nothing, because `set -e` killed it at a line that
+# looked harmless. Reading the code and guessing which line produced three
+# wrong fixes in a row; the trace says which line it actually was.
+cmd_trace() {
+	say "tracing: firecode $*"
+	bash -x "$ROOT/bin/firecode" "$@" 2>&1 | tail -25
+	echo "--- exit ${PIPESTATUS[0]} ---"
+}
+
+# Start a GLM research run from the CLI.
+#
+#   dev.sh spawn-glm <slug> <brief-file> [project]
+#
+# For the case where the MCP client holds a stale tool schema and cannot ask
+# for an agent the server now accepts - the caller's calls silently collapse
+# to the old default, which is worse than an error. The CLI has no schema to
+# go stale.
+cmd_spawn_glm() {
+	local slug=${1:?usage: dev.sh spawn-glm <slug> <brief-file> [project]}
+	local brief=${2:?usage: dev.sh spawn-glm <slug> <brief-file> [project]}
+	local proj=${3:-/tmp/firecode-scratch/flowy}
+
+	[[ -f $proj/$brief ]] || {
+		echo "no brief at $proj/$brief"
+		return 2
+	}
+
+	local task
+	task="You are ${slug}. Read ${brief} in this repository and find the section for your slug, ${slug}. Do exactly what that section asks, and nothing outside harness-research/.
+
+Write your deliverable to harness-research/${slug}.md and commit it:
+  git add harness-research/ && git commit -m 'research: ${slug}'
+
+Cite file:line or a URL for every claim - no unsourced best practices. If you cannot find a source, say which searches you tried rather than asserting.
+
+Scratch goes under /tmp/${slug}-... and nowhere else: other agents are working on this machine right now and a shared scratch path has already destroyed one agent's database today.
+
+When you are done or blocked, say so once:
+  firecode chat --as ${slug} --to flowy-glm 'done - one line' (or 'blocked - why')
+then exit."
+
+	say "$slug"
+	setsid firecode glm --project "$proj" --timeout 3600 --mem 4096 \
+		--host-port 9761 --no-mcp \
+		--verify "test -f harness-research/${slug}.md" \
+		-- -p "$task" --dangerously-skip-permissions \
+		</dev/null >"$ROOT/runs/$slug.log" 2>&1 &
+	disown 2>/dev/null || true
+	sleep 2
+	echo "  started, log: runs/$slug.log"
+}
+
 cmd_status() {
 	say "branch"
 	git rev-parse --abbrev-ref HEAD
@@ -1833,6 +1890,14 @@ libvirtvm)
 repoint)
 	shift
 	cmd_repoint "$@"
+	;;
+trace)
+	shift
+	cmd_trace "$@"
+	;;
+spawn-glm)
+	shift
+	cmd_spawn_glm "$@"
 	;;
 fusecheck) cmd_fusecheck ;;
 gatecheck) cmd_gatecheck ;;

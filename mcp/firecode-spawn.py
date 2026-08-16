@@ -127,6 +127,48 @@ FIRECODE = os.path.join(ROOT, "bin", "firecode")
 
 
 class Config:
+    def _fits(self):
+        """How many VMs this machine can carry at once.
+
+        Whichever runs out first - cores or memory - decides, and the host
+        keeps a share of both so the machine stays usable while a fleet is
+        running. Reported at startup and in the refusal, because a cap the
+        caller cannot see is a cap it will quietly serialise around.
+        """
+        try:
+            cores = os.cpu_count() or 2
+            with open("/proc/meminfo") as fh:
+                avail_mb = next(
+                    int(line.split()[1]) // 1024 for line in fh
+                    if line.startswith("MemAvailable:"))
+        except Exception:
+            self.concurrency_reason = "could not read the machine, assuming small"
+            return 2
+
+        # Taps are the constraint that actually binds, and the one I missed.
+        #
+        # A run without a tap does not queue - it tries to make one, needs
+        # sudo, finds no terminal to ask at, and dies. Pre-created taps are
+        # therefore a hard ceiling on concurrency, and sizing by cores and
+        # memory alone let this cap rise to eleven on a machine with four.
+        # The fifth run of the evening found that by dying.
+        try:
+            taps = len([n for n in os.listdir("/sys/class/net")
+                        if n.startswith("fccode")])
+        except OSError:
+            taps = 0
+
+        by_cpu = max(1, (cores - 2) // 2)
+        by_mem = max(1, int(avail_mb * 0.7) // max(1, self.mem_per_run_mb))
+        fits = max(1, min(by_cpu, by_mem, taps or 1, 12))
+        self.concurrency_reason = (
+            f"{taps} taps, {cores} cores, {avail_mb // 1024}G free: "
+            f"{by_cpu} by cpu, {by_mem} by memory at {self.mem_per_run_mb}M, "
+            f"{taps} by tap - the smallest wins"
+            + ("" if taps else " (no taps found; make them with "
+                               "sudo firecode net-setup --count N)"))
+        return fits
+
     def __init__(self, path):
         self.path = path
         with open(path) as fh:
@@ -225,32 +267,6 @@ class Config:
 
 class Runs:
     """Everything this server has started, and what became of it."""
-
-    def _fits(self):
-        """How many VMs this machine can carry at once.
-
-        Whichever runs out first - cores or memory - decides, and the host
-        keeps a share of both so the machine stays usable while a fleet is
-        running. Reported at startup and in the refusal, because a cap the
-        caller cannot see is a cap it will quietly serialise around.
-        """
-        try:
-            cores = os.cpu_count() or 2
-            with open("/proc/meminfo") as fh:
-                avail_mb = next(
-                    int(line.split()[1]) // 1024 for line in fh
-                    if line.startswith("MemAvailable:"))
-        except Exception:
-            self.concurrency_reason = "could not read the machine, assuming small"
-            return 2
-
-        by_cpu = max(1, (cores - 2) // 2)
-        by_mem = max(1, int(avail_mb * 0.7) // max(1, self.mem_per_run_mb))
-        fits = max(1, min(by_cpu, by_mem, 12))
-        self.concurrency_reason = (
-            f"{cores} cores and {avail_mb // 1024}G free allow {by_cpu} by cpu "
-            f"and {by_mem} by memory at {self.mem_per_run_mb}M a run")
-        return fits
 
     def __init__(self, config):
         self.cfg = config
