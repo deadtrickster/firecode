@@ -110,8 +110,12 @@ waiter_pid_for() {
 	local f
 	f="$FIRECODE_ROOT/runs/chat-waiter-$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-').pid"
 	[[ -f $f ]] || return 1
+	# First field only: the file is "<pid> <kind>" since the forked/tracked
+	# distinction went in, and reading the whole line made this test fail on
+	# a perfectly healthy waiter - the hook then reported an empty room while
+	# one was listening. A writer changed its format and its reader did not.
 	local pid
-	pid=$(cat "$f" 2>/dev/null || echo "")
+	pid=$(awk 'NR==1{print $1}' "$f" 2>/dev/null || echo "")
 	[[ $pid =~ ^[0-9]+$ ]] || return 1
 	kill -0 "$pid" 2>/dev/null || return 1
 	printf '%s' "$pid"
