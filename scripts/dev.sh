@@ -441,8 +441,17 @@ When you are done or blocked, say so once:
   firecode chat --as ${slug} --to flowy-glm 'done - one line' (or 'blocked - why')
 then exit."
 
+	# 6G, not 4.
+	#
+	# A research agent that clones a repo and then strings-dumps a shipped
+	# binary looking for evidence reaches 3.5G of anonymous memory on its
+	# own, and a 4G guest kills it - the VM reboots to an empty tree and the
+	# gate correctly reports nothing, which reads as an agent that did no
+	# work rather than one that was killed for doing it. Eight of these at
+	# 6G is 48G, which this machine has.
+	local mem=${FIRECODE_RUN_MEM:-6144}
 	say "$slug"
-	setsid firecode glm --project "$proj" --timeout 3600 --mem 4096 \
+	setsid firecode glm --project "$proj" --timeout 3600 --mem "$mem" \
 		--host-port 9761 --no-mcp \
 		--verify "test -f harness-research/${slug}.md" \
 		-- -p "$task" --dangerously-skip-permissions \

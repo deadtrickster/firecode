@@ -235,7 +235,15 @@ class Config:
         #
         # Each VM takes a few cores and its own memory, so size it by
         # whichever runs out first and leave the host something to run on.
-        self.mem_per_run_mb = int(raw.get("mem_per_run_mb", 4096))
+        # What a run actually takes, not what the flag says.
+        #
+        # This is the number the cap divides free memory by, so it has to be
+        # the real footprint. A research agent that clones a repository and
+        # then strings-dumps a binary reaches 3.5G by itself; at 4G the guest
+        # kernel kills it, the VM reboots to an empty tree, and the gate
+        # reports an agent that produced nothing - which looks like a lazy
+        # agent rather than a starved one.
+        self.mem_per_run_mb = int(raw.get("mem_per_run_mb", 6144))
         self.max_concurrent = int(raw.get("max_concurrent", 0)) or self._fits()
         self.max_total = int(raw.get("max_total", 20))
         self.default_timeout = int(raw.get("default_timeout", 3600))

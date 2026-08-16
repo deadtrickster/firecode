@@ -4289,9 +4289,11 @@ launch() {
 	# same ext4 read-write, which produced multiply-claimed blocks, a root
 	# that remounted read-only mid-boot, and a run that died twelve seconds in
 	# saying "mount point is not a directory". Nothing pointed at the cause.
+	local private_copy=0
 	if ((STATE_PERSISTENT == 0)); then
 		local shared=$workspace_layer
 		workspace_layer="$RUN_DIR/layer.ext4"
+		private_copy=1
 		log "another run holds this workspace's layer - using a private copy"
 		log "  (what this VM installs will not be kept)"
 		cp --sparse=always "$shared" "$workspace_layer"
@@ -4299,6 +4301,23 @@ launch() {
 
 	local fsck_rc=0
 	sbin e2fsck -p "$workspace_layer" >"$RUN_DIR/layer-fsck.log" 2>&1 || fsck_rc=$?
+	# A copy of a MOUNTED filesystem is torn by construction.
+	#
+	# The other run has it mounted read-write, so cp reads a moving target
+	# and the copy arrives with a journal the superblock knows nothing about
+	# - "needs_recovery flag is clear, but journal has data", which e2fsck -p
+	# refuses to touch unattended and rightly so on a shared image. But this
+	# one is PRIVATE and thrown away at the end of the run, so there is
+	# nothing to lose by repairing it and everything to lose by refusing:
+	# eight concurrent runs on one project all take this path, and every one
+	# of them died here with a message about a damaged workspace.
+	if ((private_copy)) && ((fsck_rc >= 4)); then
+		log "the private copy came from a live filesystem - repairing it"
+		fsck_rc=0
+		sbin e2fsck -y "$workspace_layer" >>"$RUN_DIR/layer-fsck.log" 2>&1 ||
+			fsck_rc=$?
+		((fsck_rc < 4)) && fsck_rc=0
+	fi
 	if ((fsck_rc == 1)); then
 		log "repaired the workspace layer (it was left dirty by an earlier run)"
 	elif ((fsck_rc >= 4)); then
