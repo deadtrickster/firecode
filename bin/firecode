@@ -2582,9 +2582,13 @@ if d.get("messages"):
 				# rereads: an unanswered message is indistinguishable from an
 				# unread one, and the sender acts on that.
 				echo
-				echo "-- ack anything addressed to you before you work on it"
-				echo "-- ('firecode chat --as <you> \"seen, doing X\"'), then"
-				echo "-- start this waiter again so you stay in the room"
+				echo "-- ack anything addressed to you before you work on it:"
+				echo "--   firecode chat --as $who \"seen, doing X\""
+				echo "-- then start this waiter again, or you leave the room:"
+				echo "--   firecode chat --inbox --as $who"
+				echo "-- IN THE BACKGROUND - it blocks until somebody speaks."
+				echo "--   claude code: Bash with run_in_background: true"
+				echo "--   a plain shell: append &"
 				return 0
 			}
 		done

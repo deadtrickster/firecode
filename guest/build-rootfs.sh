@@ -50,21 +50,96 @@ BASE=$BASE,file,bash-completion,busybox-static,cpio
 # FUSE: the kernel has always had it, and without the userspace half a
 # filesystem written in a VM cannot be mounted there.
 BASE=$BASE,fuse3,libfuse3-dev,libfuse-dev,python3-fusepy,python3-pyfuse3
-# Postgres, because a gate that stores anything wants it and every run was
-# apt-getting it over the network first. It is here as the SERVER BINARIES
-# rather than a service - initdb, pg_ctl and psql, for gates that stand up a
-# throwaway cluster in a temp directory and tear it down again. Nothing
-# starts a system postgres; the package is installed and left alone.
-#
-# Note the version this pins you to: noble ships PostgreSQL 16, so a gate in
-# a VM tests against 16. If what the code runs on in earnest is 17, that gap
-# is real and belongs in a README rather than in a surprise.
-BASE=$BASE,postgresql,postgresql-client
+# Postgres is NOT in this list on purpose - see the PGDG step below. Noble
+# ships PostgreSQL 16, and a gate that tests against a version nobody runs is
+# testing a hypothetical.
+PGVERSION=${PGVERSION:-18}
 
 say "bootstrapping $SUITE"
 sudo -n rm -rf "$TREE"
 sudo -n mmdebstrap --variant=important --include="$BASE" \
 	--components=main,universe "$SUITE" "$TREE" "$MIRROR"
+
+# mmdebstrap leaves no working resolver in the tree, so anything that reaches
+# the network from INSIDE the chroot - PGDG below, mise further down - fails
+# with "Could not resolve host" while the VM around it has perfectly good DNS.
+# The builder's resolver is copied in for those steps and removed again before
+# the filesystem is written, so nothing about this machine ships in the image.
+# It would be harmless anyway: firecode-setup.sh rewrites resolv.conf at every
+# boot. Removing it keeps that the only place the guest's resolver comes from.
+# The rm is not redundant: what mmdebstrap leaves there is a symlink into
+# systemd-resolved's runtime directory, which nothing has created inside the
+# tree, and cp refuses to write through a dangling symlink.
+sudo -n rm -f "$TREE/etc/resolv.conf"
+sudo -n cp /etc/resolv.conf "$TREE/etc/resolv.conf"
+
+say "postgresql $PGVERSION, from PGDG rather than from the suite"
+# A gate that stores anything wants postgres, and every run was apt-getting it
+# over the network first - the orchestrator's did it all day. So it is baked.
+#
+# It is baked as SERVER BINARIES and not as a service: nothing here starts a
+# system postgres, and the postinst is stopped from building a cluster inside
+# the image (create_main_cluster, plus a policy-rc.d that makes invoke-rc.d a
+# no-op in the chroot). A gate makes its own throwaway cluster with initdb in
+# a temp directory and tears it down again.
+#
+# From PGDG and pinned by name because noble ships 16 and the instance this is
+# tested against runs 18. A gate passing on a version nobody runs is testing a
+# hypothetical - which was the first question asked about it, twice.
+#
+# The binaries land in /usr/lib/postgresql/<v>/bin, which is on nobody's PATH,
+# so they are linked into /usr/local/bin - ahead of the Debian wrappers, so
+# `initdb` in a gate is this version rather than whatever a wrapper picks.
+# One trap that survives all of this: initdb REFUSES TO RUN AS ROOT, and a
+# firecode guest is root. Gates want `su postgres -c 'initdb -D /tmp/pg'`;
+# the postgres user exists in the image because postgresql-common makes it.
+sudo -n chroot "$TREE" /bin/bash -s "$PGVERSION" <<-'PGDG'
+	set -euo pipefail
+	pgver=$1
+	export DEBIAN_FRONTEND=noninteractive
+	printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+	chmod 0755 /usr/sbin/policy-rc.d
+	install -d /etc/postgresql-common
+	echo 'create_main_cluster = false' >/etc/postgresql-common/createcluster.conf
+	curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused \
+		https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+		-o /usr/share/keyrings/pgdg.asc
+	. /etc/os-release
+	echo "deb [signed-by=/usr/share/keyrings/pgdg.asc]" \
+		"http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+		>/etc/apt/sources.list.d/pgdg.list
+	apt-get update -qq
+	apt-get install -y -qq "postgresql-$pgver" "postgresql-client-$pgver" >/dev/null
+	for b in "/usr/lib/postgresql/$pgver/bin/"*; do
+		ln -sf "$b" "/usr/local/bin/$(basename "$b")"
+	done
+	# Units the postgres packages enable behind you. Deleting the .wants
+	# symlink IS what `systemctl disable` does, and it works in a chroot,
+	# where systemctl has no /proc to talk to.
+	#
+	# postgresql.service otherwise reports enabled AND active in every guest
+	# while serving nothing - there is no cluster - which is precisely the
+	# shape of thing that costs somebody an hour when psql cannot connect.
+	# sysstat is a recommends that came along for the ride, and its timers
+	# would wake up and collect in every ephemeral VM forever, which is both
+	# waste and noise in anything measuring a VM.
+	rm -f /etc/systemd/system/multi-user.target.wants/postgresql.service
+	rm -f /etc/systemd/system/multi-user.target.wants/sysstat.service
+	rm -f /etc/systemd/system/sysstat.service.wants/sysstat-collect.timer
+	rm -f /etc/systemd/system/sysstat.service.wants/sysstat-summary.timer
+	rm -f /usr/sbin/policy-rc.d
+	apt-get clean
+	# Fail the build here rather than let a gate discover it: PGDG not having
+	# this version for this suite is otherwise a silent fallback to 16.
+	got=$(/usr/local/bin/initdb --version)
+	case $got in
+	"initdb (PostgreSQL) $pgver"*) echo "[build-rootfs] $got" ;;
+	*)
+		echo "[build-rootfs] wanted postgres $pgver, image has: $got" >&2
+		exit 1
+		;;
+	esac
+PGDG
 
 say "installing the harness"
 sudo -n install -d "$TREE/opt/firecode"
@@ -118,6 +193,9 @@ if [[ -n $TOOLS ]]; then
 		chmod -R a+rX /opt/mise
 	"
 fi
+
+# The builder's resolver goes back out - see the copy above.
+sudo -n rm -f "$TREE/etc/resolv.conf"
 
 say "writing the filesystem onto $DEV"
 sudo -n mkfs.ext4 -q -F -L firecode-root -d "$TREE" "$DEV"

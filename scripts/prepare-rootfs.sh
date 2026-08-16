@@ -24,8 +24,12 @@ NO_CACHE=""
 
 usage() {
 	cat <<'EOF'
-usage: firecode prepare [--full] [--force] [--no-cache] [--size 6G]
+usage: firecode prepare [--in-vm] [--full] [--force] [--no-cache] [--size 6G]
 
+  --in-vm     build in a firecode VM instead of in docker, and DO PREFER IT.
+              Docker needs a working bridge resolver, which a host running a
+              loopback DoH proxy does not have - those builds fail looking
+              like broken package lists. The VM has a real network and root.
   --with LIST tools for the base image, which every project inherits.
               mise syntax, quoted: --with "dotnet@10 java@temurin-21 uv"
               remembered, so later rebuilds keep them. --with "" to clear.

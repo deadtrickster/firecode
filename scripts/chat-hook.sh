@@ -196,8 +196,11 @@ rearm = ""
 if mode == "stop" and waiter_name and not waiter:
     rearm = (
         "\n\nNothing is listening for you while you are idle. Start the "
-        "waiter as a BACKGROUND command before you stop:\n"
+        "waiter before you stop:\n"
         "  firecode chat --inbox --as %s\n"
+        "IN THE BACKGROUND, which in claude code means the Bash tool with "
+        "run_in_background: true, and in a plain shell means a trailing &. "
+        "Run it in the foreground and you block until somebody speaks.\n"
         "It blocks until somebody speaks and returns - that return is what "
         "wakes you. Start it again each time it fires; this will keep "
         "reminding you until one is running." % waiter_name)

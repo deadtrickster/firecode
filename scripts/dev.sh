@@ -371,7 +371,8 @@ cmd_repoint() {
 		echo "  durable  $d"
 		# An empty repository holds nothing to lose, and comparing its
 		# unborn HEAD against a real commit refuses a move that is safe.
-		if [[ $n == 0 ]] && [[ -z $(ls -A "$scratch" | grep -v '^\.git$') ]]; then
+		if [[ $n == 0 ]] &&
+			[[ -z $(find "$scratch" -mindepth 1 -maxdepth 1 ! -name .git -print -quit) ]]; then
 			echo "  scratch is an empty placeholder - nothing to preserve"
 			s=$d
 		fi
