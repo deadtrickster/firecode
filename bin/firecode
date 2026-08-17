@@ -5298,6 +5298,22 @@ cmd_gc() {
 	[[ -d $RUNS ]] || return 0
 	# Newest first; anything past the keep count goes entirely.
 	while IFS= read -r d; do
+		# A LIVE RUN IS NEVER SWEPT, whatever the keep count says. This counted
+		# by recency alone, so a busy hour of short runs pushes a long-running
+		# VM past the cutoff and its directory is removed underneath it: the VM
+		# keeps running, and `firecode list` - which reads these directories -
+		# stops reporting it. I did that to four of somebody else's VMs while
+		# reclaiming network slots, and it turns a managed VM into one nobody
+		# can name or stop.
+		#
+		# Liveness is asked of the cgroup, the same way `list` asks it: a cgroup
+		# holds processes exactly while something in it is alive.
+		local cg
+		cg=$(cat "$d/cgroup" 2>/dev/null || echo "")
+		if [[ -n $cg ]] && [[ -s $cg/cgroup.procs || -s $cg/vm/cgroup.procs ]]; then
+			rm -f "$d"/*.ext4
+			continue
+		fi
 		n=$((n + 1))
 		if ((n > keep)); then
 			log "removing $(basename "$d")"
@@ -5320,6 +5336,36 @@ cmd_gc() {
 		# and there is no terminal here to authenticate with anyway.
 		rm -rf "$j" 2>/dev/null || stuck+=("$j")
 	done
+	# RELAYS OUTLIVE THEIR VM AND KEEP A NETWORK SLOT LOCKED FOREVER.
+	#
+	# Each run opens its slot's lock file and starts vsock relays, which
+	# inherit that descriptor. When a run dies without cleanup the relays are
+	# reparented to init and keep the flock, so the slot is claimed by nothing
+	# at all: the tap shows no carrier, the picker still refuses it, and the
+	# next run walks past the last existing tap and asks for one that has to be
+	# created - which needs root and fails.
+	#
+	# Two were found holding slots 1 and 4 for fifteen and sixteen HOURS, from
+	# runs that ended at 01:15 and 02:42. That is two of eight slots gone, and
+	# it is most of why the ceiling on this host kept measuring lower than the
+	# number of taps.
+	#
+	# They are identified by a working directory inside a jail that no longer
+	# exists - not by name and not by a pattern, because a pattern typed here
+	# matches this shell and anything else that happens to look similar. A
+	# process whose cwd was deleted has nothing to go back to.
+	local reaped=0 proc pid cwd
+	for proc in /proc/[0-9]*; do
+		cwd=$(readlink "$proc/cwd" 2>/dev/null) || continue
+		[[ $cwd == "$JAIL_BASE"/firecracker/* ]] || continue
+		# readlink marks a removed directory; either way, gone is gone.
+		cwd=${cwd% (deleted)}
+		[[ -d $cwd ]] && continue
+		pid=${proc#/proc/}
+		kill "$pid" 2>/dev/null && reaped=$((reaped + 1))
+	done
+	((reaped > 0)) && log "reaped $reaped process(es) left behind by a dead run, freeing their network slots"
+
 	log "kept the $keep most recent runs (logs only)"
 	if ((${#stuck[@]})); then
 		log "${#stuck[@]} jail director(ies) need root to remove:"
