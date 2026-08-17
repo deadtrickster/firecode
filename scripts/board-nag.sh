@@ -129,8 +129,19 @@ done
 # Arm it beside the room waiter:
 #   BOARD_NAG_NAME=<you> scripts/board-nag.sh --watch
 if [[ ${1:-} == --watch ]]; then
-	printf 'board has work for %s: %d assigned, %d unowned, %d free VM slot(s)\n%s\n' \
-		"$name" "$mine" "$free" "$slots" "$lines"
+	# SAY WHAT TO DO, NOT WHAT IS TRUE. The first version printed counts, and
+	# the agent that wrote it - me - read "12 unowned rows" as a status line and
+	# went idle in the same turn. A report is something you note; an instruction
+	# is something you carry out, and only one of those changes what happens
+	# next. The operator caught it within minutes.
+	printf 'WORK IS WAITING FOR %s AND YOU ARE IDLE. Do this now, before anything else:\n\n' "$name"
+	printf '%s\n\n' "$lines"
+	printf 'Pick ONE row above and claim it in the room before you start:\n'
+	printf '  %s say --url %s "%s: taking <row title>"\n\n' \
+		"${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy-next}" "$FLOWY_ADDR" "$name"
+	printf 'Then set it active so the board stops offering it to everybody else:\n'
+	printf '  POST %s/api/chat/general/todo  {"id": "<row id>", "status": "active"}\n\n' "$FLOWY_ADDR"
+	printf '%d free VM slot(s) if it needs one. If you are genuinely mid-task, say so in the room and re-arm this watch.\n' "$slots"
 	exit 0
 fi
 
