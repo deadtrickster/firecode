@@ -4424,6 +4424,37 @@ launch() {
 		# operator's to decide, so it is reported rather than hidden - and the
 		# run continues, because a layer this cannot repair may still mount for
 		# a run that owns it read-write.
+		# ONE WRITER, OR NOBODY READS IT DIRECTLY.
+		#
+		# This attaches the main checkout's layer read-only. That is safe only
+		# while nothing has it read-write - and a run IN the main checkout has
+		# exactly that, because it is that run's workspace layer. Two VMs, one
+		# ext4, one of them writing: measured tonight from the file descriptor
+		# modes, and it corrupted the layer three times. The symptom is not a
+		# mount error, it is a VM that boots to a busybox prompt and looks like
+		# a slow gate.
+		#
+		# Liveness comes from the run directories rather than from the process
+		# table - every pattern this file ever matched against ps was wrong in
+		# some way, including matching its own shell.
+		local rd owner busy=0
+		for rd in "$RUNS"/*/; do
+			[[ -f $rd/project && -f $rd/cgroup ]] || continue
+			[[ $(cat "$rd/project" 2>/dev/null) == "$main_dir" ]] || continue
+			local cgp
+			cgp=$(cat "$rd/cgroup" 2>/dev/null)
+			[[ -n $cgp ]] || continue
+			owner=$(cat "$cgp/cgroup.procs" "$cgp"/*/cgroup.procs 2>/dev/null)
+			[[ -n ${owner//[[:space:]]/} ]] && busy=1 && break
+		done
+		if ((busy)); then
+			# The same answer the workspace layer already gives itself when
+			# another run holds it: take a copy rather than share the file.
+			log "the main checkout is running - copying its layer instead of sharing it"
+			cp --sparse=always "$main_layer" "$RUN_DIR/main-layer.ext4" 2>/dev/null &&
+				main_layer="$RUN_DIR/main-layer.ext4"
+		fi
+
 		local fsck_rc=0
 		sbin e2fsck -p "$main_layer" >/dev/null 2>&1 || fsck_rc=$?
 		if ((fsck_rc > 1)); then
