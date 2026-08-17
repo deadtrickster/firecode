@@ -32,7 +32,8 @@ ROOT=${FIRECODE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 
 # Never twice in a row, and never against the off switch the chat hook already
 # honours - two nags arguing with somebody is worse than one.
-input=$(timeout 2 cat 2>/dev/null || true)
+input=""
+[[ ${1:-} == --notify ]] || input=$(timeout 2 cat 2>/dev/null || true)
 grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' <<<"$input" && exit 0
 [[ -f "$ROOT/runs/chat-quiet" ]] && exit 0
 [[ -f "$ROOT/runs/board-quiet" ]] && exit 0
@@ -40,13 +41,44 @@ grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' <<<"$input" && exit 0
 # Which name is this session. Reuses the memo the chat hook writes, rather than
 # guessing: a nag addressed to the wrong agent is worse than no nag.
 session=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$input" | head -1)
+# A timer has no session to read, so it is told which name to speak as.
+[[ -z $session && -n ${BOARD_NAG_NAME:-} ]] && session=""
 memo="${FIRECODE_CHAT_MARKS:-$HOME/.cache/firecode}/session-name-$(printf '%s' "${session:-none}" | tr -c 'A-Za-z0-9._-' '-')"
-name=$(cat "$memo" 2>/dev/null || echo "")
+name=${BOARD_NAG_NAME:-$(cat "$memo" 2>/dev/null || echo "")}
 [[ -n $name && -r "$AGENTS/$name" ]] || exit 0
 
 token=$(cat "$AGENTS/$name" 2>/dev/null) || exit 0
-board=$(curl -sS -m 8 -H "Authorization: Bearer $token" \
-	"$FLOWY_ADDR/api/artifacts?kind=todo&limit=200" 2>/dev/null) || exit 0
+
+# WATCH MODE BLOCKS. A background task that returns immediately wakes its agent
+# immediately and every time, which is a spinning nag rather than a signal. It
+# sleeps between reads and only returns when the board actually has something,
+# or when the deadline runs out - the same three outcomes `flowy inbox` has, so
+# an agent can treat both the same way.
+BOARD_EVERY=${BOARD_EVERY:-120}
+BOARD_DEADLINE=${BOARD_DEADLINE:-3600}
+board_read() {
+	curl -sS -m 8 -H "Authorization: Bearer $token" \
+		"$FLOWY_ADDR/api/artifacts?kind=todo&limit=200" 2>/dev/null
+}
+
+if [[ ${1:-} == --watch ]]; then
+	waited=0
+	while :; do
+		board=$(board_read)
+		if [[ -n $board ]]; then
+			has=$(jq -r --arg me "$name" '[.artifacts[]? |
+				select((.status // "") != "done") |
+				select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)] |
+				length' <<<"$board" 2>/dev/null || echo 0)
+			[[ $has =~ ^[0-9]+$ ]] && ((has > 0)) && break
+		fi
+		((waited >= BOARD_DEADLINE)) && exit 1 # quiet deadline, like the waiter's
+		sleep "$BOARD_EVERY"
+		waited=$((waited + BOARD_EVERY))
+	done
+else
+	board=$(board_read)
+fi
 [[ -n $board ]] || exit 0
 
 # open = anything not done. Counted once, so the numbers and the titles below
@@ -79,6 +111,28 @@ for tap in /sys/class/net/fccode*/carrier; do
 		slots=$((slots + 1))
 	fi
 done
+
+# WATCH MODE: THE SAME SIGNAL THE WAITER USES, not a message in the room.
+#
+# A Stop hook only fires when a turn ENDS, so it cannot reach an agent that is
+# already idle - which is the whole population this is for. Posting to the room
+# would reach them, and would also reach everybody else: a board reminder is not
+# news, and the room is where people talk.
+#
+# So it does what `flowy inbox` does. Run as a BACKGROUND TASK it blocks until
+# the board has something, then EXITS - and the harness wakes its agent because
+# a tracked task completed. One agent, no message, no spam.
+#
+#   board-nag.sh              hook mode: refuse the stop, reason on stderr
+#   board-nag.sh --watch      background task: block until the board has work
+#
+# Arm it beside the room waiter:
+#   BOARD_NAG_NAME=<you> scripts/board-nag.sh --watch
+if [[ ${1:-} == --watch ]]; then
+	printf 'board has work for %s: %d assigned, %d unowned, %d free VM slot(s)\n%s\n' \
+		"$name" "$mine" "$free" "$slots" "$lines"
+	exit 0
+fi
 
 {
 	printf 'The room is quiet and the board is not: %d row(s) assigned to %s, %d unowned, all open. %d free VM slot(s).\n' \
