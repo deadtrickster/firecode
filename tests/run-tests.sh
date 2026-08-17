@@ -434,6 +434,42 @@ test_concurrent_runs() {
 		ok "two runs at once (skipped, needs a VM)"
 		return
 	fi
+
+	# TWO RUNS AT ONCE NEED TWO FREE TAPS, and on a host shared with a fleet
+	# there are often fewer. Without this the check ran anyway and reported
+	# "they used different tap devices: expected 2, got 1" - which reads as a
+	# slot-allocation bug and is really "there was only one slot to be had".
+	# It cost a run to work out that the same failure reproduces on a commit
+	# from before anything I had changed.
+	#
+	# FREE MEANS BOTH LOCKS ARE FREE, and counting only carrier was wrong:
+	# firecode holds a flock on a slot for the WHOLE run, setup and teardown
+	# included, while carrier only goes up once a VM is actually attached. So a
+	# host with four carriers can still have every slot claimed, the picker
+	# walks past the last existing tap, and the run asks for a tap that has to
+	# be created - which needs root. Measured: run A took fccode6 and passed
+	# while run B asked for fccode9 with only four carriers showing.
+	#
+	# Reported rather than silently passed: a check that skips without saying so
+	# is how a suite comes to mean nothing.
+	local free=0 tap slot lock
+	for tap in /sys/class/net/fccode*/carrier; do
+		[[ -r $tap ]] || continue
+		[[ $(cat "$tap" 2>/dev/null) == 0 ]] || continue
+		slot=${tap#/sys/class/net/fccode}
+		slot=${slot%/carrier}
+		lock="$ROOT/state/net/$slot.lock"
+		# No lock file yet means nothing has ever claimed the slot: free.
+		[[ -e $lock ]] || {
+			((free++))
+			continue
+		}
+		if flock -n "$lock" true 2>/dev/null; then ((free++)); fi
+	done
+	if ((free < 2)); then
+		ok "two runs at once (skipped: $free free tap(s), something else holds the rest)"
+		return
+	fi
 	a="$WORK/concurrent-a.log"
 	b="$WORK/concurrent-b.log"
 
