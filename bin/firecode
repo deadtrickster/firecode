@@ -340,7 +340,14 @@ disk_pressure() {
 	# would ever see. It is one word apart from working, which is why it has to
 	# be run rather than read.
 	# character everywhere it is passed on from here.
-	pcent=$(df --output=ipcent "$path" 2>/dev/null | tail -1 | tr -dc '0-9')
+	# `|| true` BECAUSE A WARNING MUST NOT BE ABLE TO KILL A RUN. This file is
+	# `set -euo pipefail`, so a df that refuses its arguments fails the pipeline,
+	# fails the assignment, and ends the script - at the top of the function that
+	# builds the config drive, with stderr already redirected away. That is
+	# exactly what it did: one batch gate died at 1.0s with exit 1, no error
+	# line, and the fleet spent ten minutes reading it as a boot failure. A check
+	# about a silent failure must not be able to fail silently.
+	pcent=$(df --output=ipcent "$path" 2>/dev/null | tail -1 | tr -dc '0-9' || true)
 	# The threshold is a variable so this can be PROVEN to fire. A warning that
 	# has only ever been reasoned about is one nobody has seen work, and the
 	# filesystem it is about is not one a test may fill on purpose.
@@ -5458,7 +5465,10 @@ sweep_scratch() {
 	# SAY THE NUMBER THAT ACTUALLY RUNS OUT. df -h on a tmpfs full of small
 	# files reads comfortable right up to the failure.
 	local used
-	used=$(df --output=ipcent "$root" 2>/dev/null | tail -1 | tr -dc '0-9')
+	# Guarded for disk_pressure's reason: a df that refuses would end the sweep
+	# under pipefail, and a reaper that dies on its own report is worse than one
+	# that never reports.
+	used=$(df --output=ipcent "$root" 2>/dev/null | tail -1 | tr -dc '0-9' || true)
 	if [[ -n $used ]] && ((used >= 80)); then
 		log "WARNING: $root is at ${used}% of its INODES - a write there will fail"
 		log "  with 'No space left on device' while df -h still reads comfortable."
