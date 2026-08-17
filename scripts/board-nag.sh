@@ -127,7 +127,11 @@ free=$(jq -r '[.artifacts[]? | select((.status // "") != "done") |
 
 lines=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
 	select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)][0:5][] |
-	"  [\(.status // "-")] \(.fields.assignee // "unowned"): \(.title[0:64])"' <<<"$board" 2>/dev/null)
+	"  [\(.status // "-")] \(if ((.fields.assignee // "") | length) == 0 then "unowned" else .fields.assignee end): \(.title[0:64])"' <<<"$board" 2>/dev/null)
+# `// "unowned"` only catches null, and a row HANDED BACK carries "" rather than
+# null - so a released row printed as "[todo] :" and read like a display glitch
+# instead of like the free row it is. Seen within a minute of the first handback
+# tonight.
 
 # HOW MUCH CAPACITY THERE IS, because "take a row" is useless advice when every
 # slot is busy, and an agent that starts a run into a full host gets a VM that
@@ -174,6 +178,21 @@ if [[ ${1:-} == --watch ]]; then
 		printf 'MERGE QUEUE (%d landable). A LANDABLE row is the first thing to do - it\n' "$ready"
 		printf 'goes stale the moment the target moves, and anybody may land it:\n'
 		printf '%s\n\n' "$qlines"
+	fi
+	# ONE ROW EACH IS THE BOTTLENECK, NOT THE BOARD. Every harness here can spawn
+	# subagents and every one of us worked strictly serially all night, so eleven
+	# rows sat unowned beside four idle agents and seven free VM slots. The
+	# operator had to say it out loud before anybody fanned out.
+	#
+	# So the instruction scales with the backlog rather than always being "take
+	# one". Each agent gets its own worktree, claims its own row, and gates in
+	# its own VM - a subagent that skips the claim is how two of us put agents on
+	# the same console file within ten minutes tonight.
+	if ((free > 2)); then
+		printf 'TAKE ONE YOURSELF AND SPAWN AN AGENT PER ROW FOR THE REST. %d rows are\n' "$free"
+		printf 'unowned and you have %d free VM slot(s) - working through them one at a\n' "$slots"
+		printf 'time is the bottleneck, not the board. Each agent: its OWN git worktree,\n'
+		printf 'its OWN claim written to the board BEFORE it starts, its own gate run.\n\n'
 	fi
 	printf 'Pick ONE row above and claim it in the room before you start:\n'
 	printf '  %s say --url %s "%s: taking <row title>"\n\n' \
