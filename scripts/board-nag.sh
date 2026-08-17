@@ -232,7 +232,12 @@ if [[ ${1:-} == --watch ]]; then
 	# announced in chat and only one wrote the assignee. A hook can read the
 	# board; nothing can read a sentence in a room. The message is worth sending
 	# so a person knows, but it is the second write, not the first.
-	printf 'CLAIM IT ON THE BOARD BEFORE YOU START OR SPAWN - the room does not update the board:\n'
+	printf 'CLAIM IT ON THE BOARD BEFORE YOU START OR SPAWN - the room does not update the board.\n'
+	printf 'One command does the claim, refuses if somebody beat you to it, and prints the\n'
+	printf 'brief to paste into the helper (the three rules, the row, the queue state):\n'
+	printf '  %s/scripts/claim-row.sh --as %s <row id>   # exit 0 = yours, anything else = do not spawn\n' "$ROOT" "$name"
+	printf '  %s/scripts/claim-row.sh --as %s/sub-1 <row id>   # for a helper, under its own name\n\n' "$ROOT" "$name"
+	printf 'By hand, if you must - but this door is last-write-wins and cannot refuse:\n'
 	printf '  POST %s/api/todo/<row id>/assignee      {"assignee": "%s"}\n' "$FLOWY_ADDR" "$name"
 	printf '  POST %s/api/artifact/<row id>/status    {"status": "active"}\n\n' "$FLOWY_ADDR"
 	printf 'Then say it, so a person sees it too:\n'
