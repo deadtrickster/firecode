@@ -61,10 +61,29 @@ board_read() {
 		"$FLOWY_ADDR/api/artifacts?kind=todo&limit=200" 2>/dev/null
 }
 
+# THE MERGE QUEUE IS WORK TOO, and it is the kind that rots: a branch measured
+# green stops being green the moment master moves, so a row sitting admissible
+# is a gate run somebody is about to have to repeat. Anybody with access to the
+# code may land one - it does not have to be the author.
+#
+# `decided:false` means no verdict was possible at all, so `admissible` under it
+# says nothing. Only count a row ready when the queue actually decided.
+queue_read() {
+	curl -sS -m 8 -H "Authorization: Bearer $token" \
+		"$FLOWY_ADDR/api/merge-queue" 2>/dev/null
+}
+queue_ready() { # rows that can land right now
+	jq -r 'if (.decided // false) then [.items[]? | select(.admissible == true)] | length else 0 end' \
+		<<<"${1:-}" 2>/dev/null || echo 0
+}
+
 if [[ ${1:-} == --watch ]]; then
 	waited=0
 	while :; do
 		board=$(board_read)
+		queue=$(queue_read)
+		ready=$(queue_ready "$queue")
+		[[ $ready =~ ^[0-9]+$ ]] && ((ready > 0)) && break
 		if [[ -n $board ]]; then
 			has=$(jq -r --arg me "$name" '[.artifacts[]? |
 				select((.status // "") != "done") |
@@ -78,6 +97,18 @@ if [[ ${1:-} == --watch ]]; then
 	done
 else
 	board=$(board_read)
+	queue=$(queue_read)
+	ready=$(queue_ready "$queue")
+fi
+
+# The queue lines, built once so the counts and the titles cannot disagree.
+# gating=true is a run measuring that branch RIGHT NOW - shown because starting
+# a second gate on the same tip is the waste this queue exists to prevent.
+qlines=""
+if [[ -n ${queue:-} ]]; then
+	qlines=$(jq -r '[.items[]? | select((.status // "") != "done")][0:5][] |
+		"  " + (if .admissible == true then "LANDABLE" elif (.gating // false) then "gating  " else "blocked " end)
+		+ " \(.branch // "?") -> \(.target // "?")  (\(.assignee // "unowned"))"' <<<"$queue" 2>/dev/null)
 fi
 [[ -n $board ]] || exit 0
 
@@ -89,7 +120,10 @@ free=$(jq -r '[.artifacts[]? | select((.status // "") != "done") |
 	select(((.fields.assignee // "") | length) == 0)] | length' <<<"$board" 2>/dev/null) || exit 0
 
 [[ $mine =~ ^[0-9]+$ && $free =~ ^[0-9]+$ ]] || exit 0
-((mine + free > 0)) || exit 0
+[[ ${ready:-0} =~ ^[0-9]+$ ]] || ready=0
+# A landable branch counts on its own. An empty board with a green row waiting
+# to land is not a quiet night - it is a gate run about to be thrown away.
+((mine + free + ready > 0)) || exit 0
 
 lines=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
 	select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)][0:5][] |
@@ -136,6 +170,11 @@ if [[ ${1:-} == --watch ]]; then
 	# next. The operator caught it within minutes.
 	printf 'WORK IS WAITING FOR %s AND YOU ARE IDLE. Do this now, before anything else:\n\n' "$name"
 	printf '%s\n\n' "$lines"
+	if [[ -n $qlines ]]; then
+		printf 'MERGE QUEUE (%d landable). A LANDABLE row is the first thing to do - it\n' "$ready"
+		printf 'goes stale the moment the target moves, and anybody may land it:\n'
+		printf '%s\n\n' "$qlines"
+	fi
 	printf 'Pick ONE row above and claim it in the room before you start:\n'
 	printf '  %s say --url %s "%s: taking <row title>"\n\n' \
 		"${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy-next}" "$FLOWY_ADDR" "$name"
@@ -155,6 +194,7 @@ fi
 	printf 'The room is quiet and the board is not: %d row(s) assigned to %s, %d unowned, all open. %d free VM slot(s).\n' \
 		"$mine" "$name" "$free" "$slots"
 	printf '%s\n' "$lines"
+	[[ -n $qlines ]] && printf 'merge queue (%d landable):\n%s\n' "$ready" "$qlines"
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
 } >&2
