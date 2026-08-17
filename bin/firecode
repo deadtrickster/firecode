@@ -3588,6 +3588,23 @@ stop_children() {
 	return 0
 }
 
+# cancel_marker records that this run was STOPPED rather than that it broke.
+#
+# One file, written before the teardown that removes the evidence, and best
+# effort throughout: a marker that could fail the cleanup it annotates would be
+# the fourth silent failure in this file tonight.
+cancel_marker() {
+	local sig=${1:-unknown}
+	[[ -n ${RUN_DIR:-} && -d ${RUN_DIR:-} ]] || return 0
+	{
+		printf 'cancelled by SIG%s\n' "$sig"
+		printf 'at %s\n' "$(date -Is 2>/dev/null || true)"
+		printf 'by pid %s\n' "$PPID"
+	} >"$RUN_DIR/cancelled" 2>/dev/null || true
+	log "cancelled (SIG$sig) - marker written, this run did not fail"
+	return 0
+}
+
 cleanup_run() {
 	local status=$?
 	trap - EXIT INT TERM PIPE HUP
@@ -4056,7 +4073,21 @@ launch() {
 		CG_DIR=""
 		log "WARNING: no usable cgroup, so this VM is only tied to this process"
 	fi
-	trap cleanup_run EXIT INT TERM PIPE HUP
+	# A SIGNAL IS A CANCELLATION, AND IT SAYS SO. Torn down by a signal and
+	# died before booting leave the same run directory - cgroup, jail, name,
+	# project, vsock and nothing else - so a cancelled batch gate reads exactly
+	# like a crashed one. That cost two people a diagnosis tonight: 74fb6ca86fd4
+	# and ebd92eac65de were cancelled on purpose and were both read as failures,
+	# while 31d7119692a6 next to them was a real one.
+	#
+	# Each signal is trapped by name rather than folded into the EXIT handler,
+	# because by the time EXIT runs there is nothing left to say WHY.
+	local sig
+	for sig in INT TERM HUP; do
+		# shellcheck disable=SC2064 # $sig must expand now, not at signal time
+		trap "cancel_marker $sig; cleanup_run" "$sig"
+	done
+	trap cleanup_run EXIT PIPE
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
 
