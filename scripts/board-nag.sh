@@ -17,6 +17,11 @@
 #   scripts/board-nag.sh          - as a Stop hook, refuses the stop when the
 #                                   board has work and the room is quiet
 #
+# IF YOU CHANGE THIS, TELL THE ROOM. Every agent here can run it, and a tool
+# nobody knows about is a tool nobody uses - two rescue scripts were written
+# four times over on 2026-08-17 because their authors never said they existed.
+# Post what it is and how to wire it in, once, when it changes.
+#
 # Wire it in as a second Stop hook entry. It never blocks the first one: hooks
 # run independently, and this exits 0 unless it has something to say.
 set -u
