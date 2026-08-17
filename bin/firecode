@@ -5308,9 +5308,19 @@ cmd_gc() {
 		#
 		# Liveness is asked of the cgroup, the same way `list` asks it: a cgroup
 		# holds processes exactly while something in it is alive.
-		local cg
+		# -s IS THE WRONG TEST FOR A CGROUP FILE and it cost another run to find
+		# out. cgroup.procs is a kernel pseudo-file: it reports st_size 0 even
+		# when it lists a dozen pids, so `[[ -s ... ]]` is false for every
+		# living run and the guard never fired once. I shipped it, said live
+		# runs were safe, and then deleted a live run's drives while checking
+		# that claim.
+		#
+		# The content is the answer, so read the content.
+		local cg procs
 		cg=$(cat "$d/cgroup" 2>/dev/null || echo "")
-		if [[ -n $cg ]] && [[ -s $cg/cgroup.procs || -s $cg/vm/cgroup.procs ]]; then
+		procs=""
+		[[ -n $cg ]] && procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null)
+		if [[ -n ${procs//[[:space:]]/} ]]; then
 			# NOTHING AT ALL, not even the drives. The first version of this
 			# guard kept the directory and still removed *.ext4, which is the
 			# image the VM is running on and the one its copy-out reads at
