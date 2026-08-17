@@ -5350,6 +5350,83 @@ cmd_list() {
 	fi
 }
 
+# The scratch projects agents make, which nothing has ever reaped.
+#
+# The spawn server gives an agent a project of its own under a scratch root so
+# it can build something that is not the operator's checkout. Those directories
+# are node_modules and git objects: about 12,000 INODES each, and they outlive
+# the VM, the agent and the day.
+#
+# On 2026-08-17 /tmp reached 1040108 of 1048576 inodes with 32G free. Writes
+# failed ENOSPC while `df -h` read 50% used, so three agents diagnosed random
+# build breakage instead. 84 of the 86 scratch directories were dead and older
+# than twelve hours; two days of them held 95% of everything in /tmp.
+#
+# THREE CONDITIONS, ALL OF THEM, because this is the sweep that has already
+# destroyed six live runs by trusting a listing:
+#
+#   old enough      - a floor in days, so today's work is never a candidate
+#   no live run     - no run directory names it as its project
+#   nothing open    - no process has its cwd or a descriptor inside it, which
+#                     is the check that catches a copy-out finishing after its
+#                     VM stopped
+#
+# Age alone would be wrong and liveness alone would be wrong: a scratch project
+# can sit untouched for a week and still be somebody's workspace this minute.
+sweep_scratch() {
+	local root=${FIRECODE_SCRATCH_ROOT:-/tmp/firecode-scratch}
+	local days=${FIRECODE_SCRATCH_DAYS:-2}
+	[[ -d $root ]] || return 0
+
+	# Which scratch projects a live run is using, read from the run directories
+	# rather than from the process table.
+	local -a busy_projects=()
+	local rd cg procs project
+	for rd in "$RUNS"/*/; do
+		[[ -f $rd/project && -f $rd/cgroup ]] || continue
+		cg=$(cat "$rd/cgroup" 2>/dev/null) || continue
+		[[ -n $cg ]] || continue
+		procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null || true)
+		[[ -n ${procs//[[:space:]]/} ]] || continue
+		project=$(cat "$rd/project" 2>/dev/null) || continue
+		busy_projects+=("$project")
+	done
+
+	local swept=0 dir name held proc target
+	while IFS= read -r dir; do
+		name=$(basename "$dir")
+		# Named by a live run, whether or not anything has it open right now.
+		held=0
+		for project in "${busy_projects[@]}"; do
+			[[ $project == "$dir" || $project == "$dir"/* ]] && held=1 && break
+		done
+		((held)) && continue
+		# Open by anything at all - cwd or descriptor. A directory listing
+		# cannot see this and that is the whole lesson of tonight.
+		for proc in /proc/[0-9]*; do
+			target=$(readlink "$proc/cwd" 2>/dev/null) || continue
+			[[ $target == "$dir" || $target == "$dir"/* ]] && held=1 && break
+		done
+		((held)) && continue
+		if grep -qs -- "$dir" /proc/[0-9]*/maps 2>/dev/null; then
+			continue
+		fi
+		rm -rf "$dir" 2>/dev/null && swept=$((swept + 1))
+	done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$days" 2>/dev/null)
+
+	((swept > 0)) && log "removed $swept scratch project(s) older than $days day(s) from $root"
+	# SAY THE NUMBER THAT ACTUALLY RUNS OUT. df -h on a tmpfs full of small
+	# files reads comfortable right up to the failure.
+	local used
+	used=$(df -i --output=pcent "$root" 2>/dev/null | tail -1 | tr -dc '0-9')
+	if [[ -n $used ]] && ((used >= 80)); then
+		log "WARNING: $root is at ${used}% of its INODES - a write there will fail"
+		log "  with 'No space left on device' while df -h still reads comfortable."
+		log "  df -i $root, and lower FIRECODE_SCRATCH_DAYS (now $days) to reclaim more."
+	fi
+	return 0
+}
+
 cmd_gc() {
 	local keep=${1:-5} n=0 d
 	local -a stuck=()
@@ -5377,7 +5454,14 @@ cmd_gc() {
 		local cg procs
 		cg=$(cat "$d/cgroup" 2>/dev/null || echo "")
 		procs=""
-		[[ -n $cg ]] && procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null)
+		# `|| true`, for the third time in this file and the most expensive one.
+		# A cgroup with no child directories leaves the glob unexpanded, cat
+		# exits 1, and `set -e` ends the SWEEP - silently, at the first run
+		# directory it looks at, with exit 0 and not one line of output. So gc
+		# has been reaping nothing at all: 92 run directories had accumulated
+		# and every "gc clears them" this file prints was a promise it did not
+		# keep. A guard that cannot fail loudly fails quietly instead.
+		[[ -n $cg ]] && procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null || true)
 		if [[ -n ${procs//[[:space:]]/} ]]; then
 			# NOTHING AT ALL, not even the drives. The first version of this
 			# guard kept the directory and still removed *.ext4, which is the
@@ -5456,6 +5540,8 @@ cmd_gc() {
 		kill "$pid" 2>/dev/null && reaped=$((reaped + 1))
 	done
 	((reaped > 0)) && log "reaped $reaped process(es) left behind by a dead run, freeing their network slots"
+
+	sweep_scratch
 
 	log "kept the $keep most recent runs (logs only)"
 	if ((${#stuck[@]})); then
