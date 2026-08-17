@@ -75,6 +75,7 @@ import os
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -111,7 +112,75 @@ def say(who, text, to=None):
                 fh.write(json.dumps(msg) + "\n")
         except OSError:
             pass
+    forward_to_flowy(msg)
     return msg
+
+
+# Where the people are, and this room is not it.
+#
+# This room predates flowy and the humans have moved. An agent that answers a
+# question here is answering into a room nobody reads: the message posts, the
+# room carries on, and the person who asked sees silence. That happened for two
+# hours before anybody worked out why, and it looked like a broken watcher from
+# one end and a working one from the other.
+#
+# It is not enough to point agents at flowy instead, because AGENTS IN VMs
+# cannot go there - a VM holds no flowy token by design, which is the whole
+# point of the auth relay - and this room is the only way they can speak. So
+# the room stays as a transport and stops being a destination: everything said
+# here is mirrored into flowy, once, by the server that already sees all of it.
+#
+# Best effort and never fatal. A mirror that fails must not lose the message
+# from the room it was actually said in.
+FLOWY_URL = os.environ.get("FIRECODE_FLOWY_URL", "http://192.168.1.55:8787")
+FLOWY_TOKEN_DIR = os.path.expanduser("~/.config/flowy/agents")
+FLOWY_RELAY_TOKEN = os.environ.get("FIRECODE_FLOWY_TOKEN", "")
+
+
+def flowy_token_for(who):
+    """The speaker's own token if they have one, else the relay's.
+
+    Speaking as yourself matters more than speaking at all: a room where every
+    forwarded line arrives under one relay name cannot tell you who said it,
+    and that is most of what a transcript is for. Host agents have their own
+    token here; a VM has none, and its lines arrive under the relay with the
+    original name kept in the body rather than lost.
+    """
+    name = (who or "").strip()
+    if name:
+        path = os.path.join(FLOWY_TOKEN_DIR, name)
+        try:
+            with open(path) as fh:
+                token = fh.read().strip()
+            if token:
+                return token, True
+        except OSError:
+            pass
+    return FLOWY_RELAY_TOKEN, False
+
+
+def forward_to_flowy(msg):
+    token, own = flowy_token_for(msg.get("from"))
+    if not token:
+        return
+    text = msg.get("text") or ""
+    if not own:
+        text = "%s: %s" % (msg.get("from") or "someone", text)
+    body = {"body": text}
+    if msg.get("to"):
+        body["to"] = msg["to"]
+    # Everything inside the try, including building the request: this runs on
+    # the path that delivers a message to the room it was said in, and a mirror
+    # that raises would take that message down with it.
+    try:
+        req = urllib.request.Request(
+            FLOWY_URL.rstrip("/") + "/api/chat/general/say",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + token})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception:
+        pass
 
 
 def since(mark, wait):
