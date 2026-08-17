@@ -238,8 +238,17 @@ if [[ ${1:-} == --watch ]]; then
 	printf '  %s/scripts/claim-row.sh --as %s <row id>   # exit 0 = yours, anything else = do not spawn\n' "$ROOT" "$name"
 	printf '  %s/scripts/claim-row.sh --as %s/sub-1 <row id>   # for a helper, under its own name\n\n' "$ROOT" "$name"
 	printf 'By hand, if you must - but this door is last-write-wins and cannot refuse:\n'
-	printf '  POST %s/api/todo/<row id>/assignee      {"assignee": "%s"}\n' "$FLOWY_ADDR" "$name"
-	printf '  POST %s/api/artifact/<row id>/status    {"status": "active"}\n\n' "$FLOWY_ADDR"
+	# `expect` IS WHAT MAKES THIS A CLAIM RATHER THAN A LAST-WRITE-WINS OVERWRITE.
+	# Without it the assignee write always succeeds, so two agents claiming the
+	# same row within a minute both "succeed" and the second silently takes the
+	# first one's work - that happened six times in one night. With expect, the
+	# node compares the holder you expected against the holder it has and refuses
+	# with a 409 naming the winner, so the loser finds out immediately and can
+	# take something else. Send the empty string: you are claiming a row you
+	# believe nobody holds.
+	printf '  POST %s/api/todo/<row id>/assignee      {"assignee": "%s", "expect": ""}\n' "$FLOWY_ADDR" "$name"
+	printf '  POST %s/api/artifact/<row id>/status    {"status": "active"}\n' "$FLOWY_ADDR"
+	printf '  a 409 means somebody claimed it first - it names them. take another row.\n\n'
 	printf 'Then say it, so a person sees it too:\n'
 	printf '  %s say --url %s --room general "%s: taking <row title>"\n\n' \
 		"$(flowy_bin)" "$FLOWY_ADDR" "$name"
