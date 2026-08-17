@@ -195,15 +195,42 @@ sbin() {
 # desktop instead, which is the difference between an unattended run working
 # and not.
 declare -a SUDO=()
+PRIV_UNAVAILABLE=0
 if ((EUID != 0)); then
-	if [[ ! -t 0 && -n ${SUDO_ASKPASS:-} ]] && ! sudo -n true 2>/dev/null; then
+	if sudo -n true 2>/dev/null; then
+		# Cached or NOPASSWD. -n keeps it that way: it can never decide to
+		# prompt later in a run that has no terminal to prompt on.
+		SUDO=(sudo -n)
+	elif [[ -n ${SUDO_ASKPASS:-} ]]; then
 		SUDO=(sudo -A)
-	else
+	elif [[ -t 0 ]]; then
 		SUDO=(sudo)
+	else
+		# NO TTY, NO CACHE, NO ASKPASS. This used to fall through to a plain
+		# `sudo`, which prompts - and a prompt with nowhere to appear kills the
+		# run at whatever privileged step it happened to reach. One VM died
+		# exactly there today, mid-boot, right after its network came up:
+		#
+		#   [firecode] network: fccode9, guest 172.16.9.2 via 172.16.9.1
+		#   sudo: A terminal is required to authenticate
+		#
+		# The run had already built drives and a network by then, so the
+		# failure named the last thing that happened rather than the thing that
+		# was wrong. Now it cannot prompt, and priv() says why the first time
+		# anything needs root.
+		SUDO=(sudo -n)
+		PRIV_UNAVAILABLE=1
 	fi
 fi
 
 priv() {
+	if ((PRIV_UNAVAILABLE)); then
+		die "this step needs root and sudo has no way to ask: no cached credential,
+       no SUDO_ASKPASS, and no terminal to prompt on. Nothing has been changed.
+       Give it one of those first:
+         sudo -v                     - in a terminal on this machine, then retry
+         SUDO_ASKPASS=/usr/bin/ksshaskpass ...   - asks on the desktop instead"
+	fi
 	"${SUDO[@]}" "$@"
 }
 
@@ -3197,6 +3224,39 @@ alloc_net_slot() {
 # user, so afterwards firecracker can open it with no privileges at all.
 net_create_tap() {
 	local dev=$1 slot=$2 owner
+	# A TAP IS THE CONCURRENCY CEILING, and it is invisible until you hit it.
+	#
+	# Slots already made are user-owned and need no privileges, so runs are free
+	# up to however many taps exist - and the FIRST run past that number needs
+	# root, at boot, in a process with no terminal. One died there today after
+	# its network line had already printed, so the log named fccode9 and the
+	# real fact was "eight taps exist".
+	#
+	# Said here rather than left to sudo, because "a terminal is required to
+	# authenticate" describes the mechanism and not the problem.
+	if ((PRIV_UNAVAILABLE)); then
+		local made busy
+		made=$(ip -o link show 2>/dev/null | grep -c 'fccode[0-9]' || true)
+		busy=0
+		local t
+		for t in /sys/class/net/fccode*/carrier; do
+			[[ -r $t ]] && [[ $(cat "$t" 2>/dev/null) == 1 ]] && ((busy++)) || true
+		done
+		die "this run needs tap $dev, and creating one needs root - which cannot be
+       asked for here: no cached credential, no SUDO_ASKPASS, no terminal.
+       Nothing has been changed.
+
+       ${made:-0} tap(s) exist and $busy have carrier, so the slots below this
+       one were taken. NOTE THAT A TAP KEEPS CARRIER WHILE ANY VM HOLDS IT,
+       including one orphaned by a firecode that was killed - so the ceiling is
+       the number of FREE taps, not the number that exist, and 'firecode ps'
+       may show fewer VMs than there are busy slots.
+
+       Either free a slot, or raise the ceiling once in a terminal and it stays
+       raised:
+         sudo ip tuntap add dev $dev mode tap user \$(id -u)
+         sudo ip addr add 172.16.$slot.1/30 dev $dev && sudo ip link set $dev up"
+	fi
 	# Under sudo, id -u is 0. The tap has to belong to whoever will actually
 	# run firecracker, or the whole point of making it persistent is lost.
 	owner=${SUDO_UID:-$(id -u)}
