@@ -4911,6 +4911,7 @@ EOF
 		[[ -n $saved ]] && echo "           $saved"
 		echo "  changed: $(changed_files "$WORKDIR" "$out_dir" | head -5 | tr '\n' ' ')"
 		echo "  diff:    diff -ru --exclude=.git '$WORKDIR' '$out_dir' | less"
+		report_unlanded_commits "$out_dir"
 		[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
 		if ((STATE_PERSISTENT)); then
 			echo "  resume:  firecode $AGENT --continue 'and now also ...'"
@@ -4920,6 +4921,54 @@ EOF
 	fi
 
 	return "$rc"
+}
+
+# Commits the run made that the project has never seen.
+#
+# A run works on a PRIVATE COPY of the workspace, so a `git commit` inside one
+# moves that copy's branch and not yours. From inside the guest the two are
+# indistinguishable: the agent commits, `git log` shows its work on master,
+# and every word of that is true about a master which is not the one on this
+# machine. Four pieces of gate-green work were announced in the room as
+# "landed on master" in a single morning - dependencies, assignee, the worklog
+# door, write-says-what-it-changed - and none of them were on master. Nothing
+# was lost, but nobody knew where any of it was.
+#
+# So the run says it. The report already listed the result, the changed files
+# and the diff, and an agent that had just committed read that as confirmation
+# - none of those four lines distinguishes "your work is in the project" from
+# "your work is in a directory beside it".
+#
+# Never fatal: this is the last thing a finished run prints, and a repo it
+# cannot read is not a reason to fail a run that already passed its gate.
+report_unlanded_commits() {
+	local out_dir=$1 head_sha missing n
+	[[ -d $out_dir/.git && -d $WORKDIR/.git ]] || return 0
+
+	head_sha=$(git -C "$out_dir" rev-parse --short HEAD 2>/dev/null || true)
+	[[ -n $head_sha ]] || return 0
+	# Already in the project - the usual case, and it stays quiet.
+	git -C "$WORKDIR" cat-file -e "${head_sha}^{commit}" 2>/dev/null && return 0
+
+	# Walk back until the histories meet. The bound is because an unrelated
+	# tree - a fresh clone, a different project - would otherwise print its
+	# whole history at somebody who just wanted to know if their work landed.
+	missing=$(git -C "$out_dir" log --format='%h %s' -20 2>/dev/null |
+		while read -r sha subject; do
+			git -C "$WORKDIR" cat-file -e "${sha}^{commit}" 2>/dev/null && break
+			printf '  %s %.68s\n' "$sha" "$subject"
+		done || true)
+	[[ -n $missing ]] || return 0
+
+	n=$(printf '%s\n' "$missing" | wc -l)
+	echo
+	echo "  NOT LANDED: $n commit(s) exist only in the result -"
+	echo "              $WORKDIR does not have them:"
+	printf '%s\n' "$missing" | head -6 | sed 's/^/          /'
+	((n > 6)) && echo "            ... and $((n - 6)) more"
+	echo "              fold them into the project with:"
+	echo "                  firecode land ${RUN_DIR##*/}"
+	return 0
 }
 
 # Read an ext4 image without mounting it, so no root is needed. Files the

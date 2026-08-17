@@ -92,7 +92,14 @@ make_project() {
 	echo "noise" >"$dir/debug.log"
 	git -C "$dir" init -q 2>/dev/null
 	git -C "$dir" add -A 2>/dev/null
-	git -C "$dir" -c user.name=t -c user.email=t@t commit -qm init 2>/dev/null
+	# commit.gpgsign=false because a machine that signs by default cannot sign
+	# from here: there is no tty for pinentry, so the commit dies on a timeout
+	# and leaves a repository with no commits at all. The 2>/dev/null hid that,
+	# and the test that noticed reported it as "git history came along" failing
+	# in the guest - the guest was fine, the fixture had never committed.
+	git -C "$dir" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+		commit -qm init >/dev/null 2>&1 ||
+		echo "make_project: the fixture commit failed, so git tests will lie" >&2
 	echo "$dir"
 }
 
@@ -311,6 +318,40 @@ test_results_come_back() {
 	rm -rf "$result"
 }
 
+# A commit made in a run is not a commit in your project, and the run has to
+# say so. Four pieces of finished work were announced as "landed on master" in
+# one morning by agents who had committed inside a VM and read the result line
+# as confirmation - the work was in a directory beside the project the whole
+# time. What is asserted here is the WARNING, because the copy-out behaviour
+# was always correct and silent, and silence is what everybody misread.
+test_commits_are_reported_unlanded() {
+	local project out result sha
+	project=$(make_project)
+	if ((QUICK)); then
+		ok "a commit that did not land is reported (skipped, needs a VM)"
+		return
+	fi
+	# The identity is given explicitly: a commit that fails because the guest
+	# has no git identity would fail this test for a reason it is not about.
+	out=$(cd "$project" && timeout 240 "$FIRECODE" exec --no-jail --no-net -- \
+		bash -c 'echo inside > INSIDE.txt && git add -A &&
+			git -c user.email=t@example.com -c user.name=t \
+			    commit -qm "committed inside the run"' 2>&1)
+
+	contains "a commit that did not land is reported" "NOT LANDED" "$out"
+	contains "and the report says how to fold it in" "firecode land " "$out"
+
+	result=$(sed -n 's/^  result:  //p' <<<"$out" | head -1)
+	sha=$(git -C "$result" rev-parse --short HEAD 2>/dev/null || true)
+	if [[ -n $sha ]] && ! git -C "$project" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+		ok "and the project really does not have that commit"
+	else
+		no "and the project really does not have that commit" \
+			"result HEAD [$sha] - the warning would have been a lie"
+	fi
+	[[ -n $result ]] && rm -rf "$result"
+}
+
 test_ro_image_cached() {
 	local project ref out1
 	project=$(make_project)
@@ -452,17 +493,29 @@ test_prompt_required() {
 	local project out
 	project=$(make_project)
 
+	# The agent's own flags go after --, because firecode refuses a flag it
+	# does not know rather than passing it on and hoping. These invocations
+	# predated that and were being refused before anything they check was
+	# reached: three checks about argument handling, none of which got as far
+	# as an argument being handled.
+	#
+	# --api-base satisfies the same guard as in arg_massaging: --no-net with
+	# no endpoint is refused before the command is composed.
+	local unattended="--no-jail --no-net --api-base http://127.0.0.1:9/v1 --timeout 1"
+
 	# Flags with no task mean a session you drive, not an unattended run with
 	# nothing to do - so this opens the REPL rather than being refused.
-	out=$("$FIRECODE" claude --workdir "$project" --resume abc123 --dry-run 2>&1)
+	out=$("$FIRECODE" claude --workdir "$project" --dry-run -- --resume abc123 2>&1)
 	contains "a bare --resume opens a session" "mode=interactive" "$out"
 
-	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --timeout 1 \
-		--resume abc123 "carry on" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
+	# shellcheck disable=SC2086  # deliberately word-split: these are separate flags
+	out=$("$FIRECODE" claude --workdir "$project" $unattended \
+		"carry on" -- --resume abc123 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	contains "--resume with a prompt is not refused" "carry on" "$out"
 
-	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --timeout 1 \
-		--model opus "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
+	# shellcheck disable=SC2086  # deliberately word-split: these are separate flags
+	out=$("$FIRECODE" claude --workdir "$project" $unattended \
+		"do a thing" -- --model opus 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	contains "a flag value is not mistaken for a prompt" "do a thing" "$out"
 }
 
@@ -483,12 +536,26 @@ test_arg_massaging() {
 	project=$(make_project)
 	# Unattended claude gets -p and permission bypass added, so it does not
 	# sit at a prompt nobody is watching.
-	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net \
+	#
+	# --api-base is here to satisfy a guard, not to reach anything: an agent
+	# with --no-net and no model endpoint is now refused before it boots,
+	# because such a run only hangs. That refusal happens before the command
+	# is composed, so without this the greps below found an empty string and
+	# these checks failed for a reason that had nothing to do with arguments.
+	local composed="--no-jail --no-net --api-base http://127.0.0.1:9/v1"
+	# shellcheck disable=SC2086  # deliberately word-split: these are separate flags
+	out=$("$FIRECODE" claude --workdir "$project" $composed \
 		--timeout 1 "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
+	if [[ -z $out ]]; then
+		no "the agent command is reported at all" \
+			"nothing matched 'agent command:' - the checks below would pass on an empty string"
+		return
+	fi
 	contains "unattended claude gets --print" "-p" "$out"
 	contains "unattended claude gets permission bypass" "--dangerously-skip-permissions" "$out"
 
-	out=$("$FIRECODE" claude --workdir "$project" --no-jail --no-net --no-auto-flags \
+	# shellcheck disable=SC2086  # deliberately word-split: these are separate flags
+	out=$("$FIRECODE" claude --workdir "$project" $composed --no-auto-flags \
 		--timeout 1 "do a thing" 2>&1 | sed -n 's/.*agent command: //p' | head -1)
 	if [[ $out != *"--dangerously-skip-permissions"* ]]; then
 		ok "--no-auto-flags leaves the command alone"
@@ -642,19 +709,44 @@ test_killed_vm_is_reported_dead() {
 	# A launcher killed outright runs no cleanup, which is how strays were
 	# left behind before. What must not happen is firecode continuing to
 	# report the VM as usable.
-	local vmm
-	vmm=$(pgrep -x firecracker | tail -1)
-	kill -9 "$vmm" 2>/dev/null || true
+	#
+	# The VM is found through its OWN cgroup, never by picking a firecracker
+	# off the machine. This used to `kill -9` the last firecracker in pgrep
+	# and then assert that none was left anywhere - on a host where other
+	# agents run VMs, that killed somebody else's work and then failed
+	# because somebody else's VM was still up. It cost a green gate today and
+	# could have cost a colleague their run. A cgroup names the processes of
+	# exactly one run, which is the same reason firecode itself asks the
+	# cgroup rather than a pattern.
+	local id cg pids
+	id=$("$FIRECODE" list --ids 2>/dev/null | awk -v p="$p" '$2 == p {print $1; exit}')
+	if [[ -z $id ]]; then
+		no "the VM this test started can be named" "not in list --ids for $p"
+		return 0
+	fi
+	cg=$(cat "$ROOT/runs/$id/cgroup" 2>/dev/null)
+	pids=$(cat "$cg/vm/cgroup.procs" 2>/dev/null)
+	if [[ -z $pids ]]; then
+		no "the VM this test started has a live process" "nothing in $cg/vm"
+		return 0
+	fi
+	# shellcheck disable=SC2086  # a list of pids, deliberately word-split
+	kill -9 $pids 2>/dev/null || true
 
 	if wait_until "reported gone" 30 test "$(vms_running)" = "0"; then
 		ok "a VM killed outright stops being listed"
 	else
 		no "a VM killed outright stops being listed" "$("$FIRECODE" list 2>&1 | head -3)"
 	fi
-	if [[ -z $(pgrep -x firecracker) ]]; then
+	# Everything of THIS run: the vm cgroup, the relays beside it, and the
+	# run's own. A cgroup that has been removed reads as empty, which is the
+	# answer we want anyway.
+	local left
+	left=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null | tr '\n' ' ')
+	if [[ -z ${left// /} ]]; then
 		ok "and nothing of it is left running"
 	else
-		no "and nothing of it is left running" "$(pgrep -a firecracker | head -2)"
+		no "and nothing of it is left running" "pids still in its cgroup: $left"
 	fi
 }
 
@@ -790,6 +882,7 @@ run_test paths_mirror_host
 run_test state_persists
 run_test session_import_resumable
 run_test results_come_back
+run_test commits_are_reported_unlanded
 run_test no_relays
 run_test concurrent_runs
 run_test ro_image_cached

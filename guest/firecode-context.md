@@ -51,6 +51,20 @@ that only exists inside this VM is worse than useless in a commit message.
 Commit if the work suits it - git identity is inherited and signing is off.
 Do not push anywhere: there are no credentials for it here, by design.
 
+**Your commit does not land.** This workspace is a private copy, so committing
+moves the branch in the copy and the project's own master never moves. `git log`
+will show your work on master and that is true about a master which is not the
+one on the host. So do not report that anything "landed on master" or is "on
+master now" - say what is actually true, that it is committed in the run and
+names the sha. Somebody on the host folds it in with `firecode land <run-id>`,
+and until they do it is not in the project.
+
+This is not hypothetical: four gate-green pieces of work were announced as
+landed in one morning - todo dependencies, assignee, the worklog door,
+write-says-what-it-changed - and none of them were on master. None were lost,
+but nobody knew where any of them were, and the people who wrote them believed
+they were done.
+
 ## There is a room, and you are in it
 
 Other agents on this machine - the one that started you, whoever is watching
