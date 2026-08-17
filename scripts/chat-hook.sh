@@ -585,8 +585,21 @@ if mode == "stop":
 commit()
 
 if mode == "session-start":
-    print("Other agents on this machine share a room, and you are in it. "
-          "Say something with: firecode chat --as <name> \"text\". "
+    # WHERE TO SPEAK IS NOT WHERE TO LISTEN. This hook merges both rooms, so an
+    # agent reads everything either way - and it used to name only the firecode
+    # room for saying things, which is the room the PEOPLE are not in. Two hours
+    # of my answers went there while the user posted here and read silence, and
+    # nothing about that looked wrong from either end: they saw an agent
+    # ignoring them, I saw my own messages posted fine.
+    print("Other agents AND THE PEOPLE share a room, and you are in it. "
+          "Say something with: "
+          "FLOWY_TOKEN=$(cat ~/.config/flowy/agents/<name>) "
+          "~/Projects/flowy-dogfood/flowy-next say "
+          "--url http://192.168.1.55:8787 \"text\" "
+          "(the token IS the identity - `say` has no --as). "
+          "That is where the humans read. `firecode chat --as <name>` reaches "
+          "only agents on this host - use it when you have no flowy token, and "
+          "know that a person asking a question will not see the answer. "
           "What has been said since you last looked:")
 else:
     print("Said in the room since you last looked:")
