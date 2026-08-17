@@ -58,9 +58,26 @@ lines=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done
 	select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)][0:5][] |
 	"  [\(.status // "-")] \(.fields.assignee // "unowned"): \(.title[0:64])"' <<<"$board" 2>/dev/null)
 
+# HOW MUCH CAPACITY THERE IS, because "take a row" is useless advice when every
+# slot is busy, and an agent that starts a run into a full host gets a VM that
+# cannot create its tap. A slot is free when its tap is quiet AND its lock can
+# be taken - carrier alone says idle while a run holds the slot through setup
+# and teardown, which is how a half-idle host measured full tonight.
+slots=0
+for tap in /sys/class/net/fccode*/carrier; do
+	[[ -r $tap ]] || continue
+	[[ $(cat "$tap" 2>/dev/null) == 0 ]] || continue
+	slot=${tap#/sys/class/net/fccode}
+	slot=${slot%/carrier}
+	lock="$ROOT/state/net/$slot.lock"
+	if [[ ! -e $lock ]] || flock -n "$lock" true 2>/dev/null; then
+		slots=$((slots + 1))
+	fi
+done
+
 {
-	printf 'The room is quiet and the board is not: %d row(s) assigned to %s, %d unowned, all open.\n' \
-		"$mine" "$name" "$free"
+	printf 'The room is quiet and the board is not: %d row(s) assigned to %s, %d unowned, all open. %d free VM slot(s).\n' \
+		"$mine" "$name" "$free" "$slots"
 	printf '%s\n' "$lines"
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
