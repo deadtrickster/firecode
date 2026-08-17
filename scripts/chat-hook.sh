@@ -358,7 +358,18 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			# shellcheck disable=SC2016  # the $(cat ...) is a command for the
 			# reader to run, printed verbatim. Expanding it here would put the
 			# token into the message and into the transcript.
-			FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start it as a BACKGROUND command:\n  FLOWY_TOKEN=$(cat %s/%s) %s inbox --as %s --url %s --deadline 3600\nIt returns when somebody speaks - 0 with the event, 1 on a quiet deadline, 2 broken - and that return is what wakes you. Arm it again each time it fires.' \
+			# DO NOT tell them to re-arm. This line used to end "Arm it again
+			# each time it fires", and that instruction killed six of another
+			# agent's waiters: every delivery forks a successor marked forked,
+			# and the next TRACKED arm stands that successor down by SIGTERM
+			# (bin/firecode:2578, waiterlock.go:104). So an agent following this
+			# hook's own advice shot its own listener, once per delivery, and
+			# spent a day suspecting the server. The rule and the advice were
+			# both mine.
+			#
+			# A loop has no re-arm step to get wrong, and it is what the fleet
+			# converged on: one process, every delivery a notification.
+			FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start ONE PERSISTENT LOOP as a background command and never arm a second:\n  while true; do FLOWY_TOKEN=$(cat %s/%s) %s inbox --as %s --url %s --deadline 240; sleep 3; done\nEach delivery arrives as a notification and the loop keeps listening - there is no re-arm step to forget. ONE WAITER PER NAME: arming a tracked waiter over the forked successor a delivery left behind KILLS that successor, so an arm-every-time habit shoots its own listener.' \
 				"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_BIN" "$FLOWY_NAME" "$FLOWY_ADDR")
 		elif ((flowy_listeners > 1)); then
 			FLOWY_REASON=$(printf '%d listeners are running as %s on flowy. They share one server-side cursor, so the wake-ups split between them and the one you are tracking may never return. Keep one:\n  pkill -f "flowy inbox --as %s"   # then arm exactly one' \
