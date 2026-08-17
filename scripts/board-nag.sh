@@ -179,6 +179,28 @@ if [[ ${1:-} == --watch ]]; then
 		printf 'goes stale the moment the target moves, and anybody may land it:\n'
 		printf '%s\n\n' "$qlines"
 	fi
+	# flowy_bin is the CLI to tell an agent to use, and it must not be a stale one.
+	#
+	# This printed flowy-next for hours. That binary is from 00:34 and reports
+	# 0.8.0+src: it refuses branch/target/gated_tip on mem_write with `unknown
+	# field`, so anybody who followed this text could not file a merge request and
+	# had no idea why. The deployed `flowy` beside it tracks the node. So the
+	# newest of the two wins, measured rather than assumed, and FLOWY_BIN still
+	# overrides for anybody running from a checkout.
+	flowy_bin() {
+		local dir=${FLOWY_LIVE_DIR:-$HOME/Projects/flowy-dogfood} newest=""
+		if [[ -n ${FLOWY_BIN:-} ]]; then
+			printf '%s\n' "$FLOWY_BIN"
+			return
+		fi
+		# `-nt` rather than `ls -t | head`, which shellcheck is right about and
+		# which also answers "the newest of one file" wrong when the other is
+		# missing. Two candidates, one comparison, no parsing.
+		newest="$dir/flowy"
+		[[ -f "$dir/flowy-next" && "$dir/flowy-next" -nt $newest ]] && newest="$dir/flowy-next"
+		printf '%s\n' "$newest"
+	}
+
 	# ONE ROW EACH IS THE BOTTLENECK, NOT THE BOARD. Every harness here can spawn
 	# subagents and every one of us worked strictly serially all night, so eleven
 	# rows sat unowned beside four idle agents and seven free VM slots. The
@@ -188,23 +210,27 @@ if [[ ${1:-} == --watch ]]; then
 	# one". Each agent gets its own worktree, claims its own row, and gates in
 	# its own VM - a subagent that skips the claim is how two of us put agents on
 	# the same console file within ten minutes tonight.
-	if ((free > 2)); then
-		printf 'TAKE ONE YOURSELF AND SPAWN AN AGENT PER ROW FOR THE REST. %d rows are\n' "$free"
-		printf 'unowned and you have %d free VM slot(s) - working through them one at a\n' "$slots"
-		printf 'time is the bottleneck, not the board. Each agent: its OWN git worktree,\n'
-		printf 'its OWN claim written to the board BEFORE it starts, its own gate run.\n\n'
+	if ((free > 0)); then
+		printf 'YOU HAVE HELPER SLOTS AND %d UNOWNED ROW(S). SPAWNING IS NOT A SPECIAL\n' "$free"
+		printf 'OCCASION. Take one yourself and put an agent on each of the rest -\n'
+		printf 'working through them one at a time is the bottleneck, not the board.\n'
+		printf '%d free VM slot(s) for their gates.\n\n' "$slots"
+		printf 'Each agent, without exception:\n'
+		printf '  its OWN git worktree, so two of them cannot write the same file\n'
+		printf '  its OWN claim WRITTEN TO THE BOARD before it starts, not said in the room\n'
+		printf '  its OWN gate run, and its own row in the merge queue\n\n'
 	fi
-	printf 'Pick ONE row above and claim it in the room before you start:\n'
-	printf '  %s say --url %s "%s: taking <row title>"\n\n' \
-		"${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy-next}" "$FLOWY_ADDR" "$name"
-	# TWO WRITES, AND BOTH ARE REQUIRED. Saying "taking this" in the room changes
-	# nothing on the board: I claimed a row out loud at 22:30 and the watch still
-	# offered it to me an hour later, because the row was never written. The
-	# endpoints below are the ones the server actually has - the first version of
-	# this text invented a single POST that answers `unknown field "id"`.
-	printf 'Then WRITE the claim - the room does not update the board:\n'
+	# CLAIM ON THE BOARD FIRST, AND SAY IT SECOND. That order is not style: three
+	# agents spawned onto one row inside ninety seconds tonight because all three
+	# announced in chat and only one wrote the assignee. A hook can read the
+	# board; nothing can read a sentence in a room. The message is worth sending
+	# so a person knows, but it is the second write, not the first.
+	printf 'CLAIM IT ON THE BOARD BEFORE YOU START OR SPAWN - the room does not update the board:\n'
 	printf '  POST %s/api/todo/<row id>/assignee      {"assignee": "%s"}\n' "$FLOWY_ADDR" "$name"
 	printf '  POST %s/api/artifact/<row id>/status    {"status": "active"}\n\n' "$FLOWY_ADDR"
+	printf 'Then say it, so a person sees it too:\n'
+	printf '  %s say --url %s --room general "%s: taking <row title>"\n\n' \
+		"$(flowy_bin)" "$FLOWY_ADDR" "$name"
 	printf '%d free VM slot(s) if it needs one. If you are genuinely mid-task, say so in the room and re-arm this watch.\n' "$slots"
 	exit 0
 fi
