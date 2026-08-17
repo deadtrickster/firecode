@@ -5354,13 +5354,27 @@ cmd_gc() {
 	# exists - not by name and not by a pattern, because a pattern typed here
 	# matches this shell and anything else that happens to look similar. A
 	# process whose cwd was deleted has nothing to go back to.
-	local reaped=0 proc pid cwd
+	# A DELETED CWD IS NOT ENOUGH, and getting this wrong destroyed two people's
+	# finished work. The sweep above removes the jail of a VM that has stopped,
+	# and a firecode COPYING THAT RUN'S RESULTS OUT is still sitting in that
+	# directory - so "cwd is gone" matched the very process whose job it was to
+	# save the work, and killing it left the result directory empty.
+	#
+	# So all three must hold: it is a relay by its own name in /proc (not a
+	# command line somebody could match by accident), its jail is gone, AND it
+	# has been reparented away - a process still owned by a running firecode is
+	# part of a run in progress, whatever its cwd says.
+	local reaped=0 proc pid cwd comm ppid
 	for proc in /proc/[0-9]*; do
+		comm=$(cat "$proc/comm" 2>/dev/null) || continue
+		[[ $comm == socat ]] || continue
 		cwd=$(readlink "$proc/cwd" 2>/dev/null) || continue
 		[[ $cwd == "$JAIL_BASE"/firecracker/* ]] || continue
-		# readlink marks a removed directory; either way, gone is gone.
 		cwd=${cwd% (deleted)}
 		[[ -d $cwd ]] && continue
+		ppid=$(awk '{print $4}' "$proc/stat" 2>/dev/null || echo 0)
+		# Orphaned: init, or the user manager that adopts what init would.
+		((ppid == 1)) || [[ $(cat "/proc/$ppid/comm" 2>/dev/null) == systemd ]] || continue
 		pid=${proc#/proc/}
 		kill "$pid" 2>/dev/null && reaped=$((reaped + 1))
 	done
