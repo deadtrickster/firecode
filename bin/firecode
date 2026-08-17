@@ -4444,7 +4444,13 @@ launch() {
 			local cgp
 			cgp=$(cat "$rd/cgroup" 2>/dev/null)
 			[[ -n $cgp ]] || continue
-			owner=$(cat "$cgp/cgroup.procs" "$cgp"/*/cgroup.procs 2>/dev/null)
+			# `|| true` IS LOAD-BEARING. A cgroup with no child directories
+			# leaves the glob unexpanded, cat exits 1, and `set -e` takes the
+			# whole run down - which is what this did for forty minutes: every
+			# worktree run exited 2 before booting, and the safety check was
+			# the thing breaking runs. A liveness probe must never be able to
+			# fail louder than what it protects.
+			owner=$(cat "$cgp/cgroup.procs" "$cgp"/*/cgroup.procs 2>/dev/null || true)
 			[[ -n ${owner//[[:space:]]/} ]] && busy=1 && break
 		done
 		if ((busy)); then
