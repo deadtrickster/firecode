@@ -310,6 +310,49 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			"$FLOWY_NAME" "$flowy_total" "$(flowy_render)" "$FLOWY_BIN" "$FLOWY_NAME")
 	fi
 
+	# THE HOOK CAN BE THE WAITER, and this is the experiment that decides
+	# whether it should be.
+	#
+	# A Stop hook may block for 600s by default and its stderr on exit 2 is
+	# shown to the agent - which is a whole waiter, with no background task, no
+	# pid file, no fork, no spool and no re-arming. The listener we have instead
+	# wakes the agent BY COMPLETING, so delivering and continuing to listen are
+	# mutually exclusive, and every mechanism around it is a patch on that.
+	#
+	# What is not known is what a person sees while a Stop hook blocks. If the
+	# session looks hung, this belongs to headless runs only. So it is OPT-IN
+	# and it is off unless somebody puts a number in the file:
+	#
+	#   echo 45 > runs/chat-block-seconds    - wait up to 45s at idle
+	#   rm       runs/chat-block-seconds     - back to today's behaviour
+	#
+	# The number is clamped to 300 - well inside the 600s ceiling, because a
+	# hook killed at its timeout is a hook whose exit code nobody honours.
+	if [[ $MODE == stop && $CHAT_QUIET == 0 && -z $FLOWY_REASON && $flowy_total -eq 0 ]] &&
+		[[ -r "$FIRECODE_ROOT/runs/chat-block-seconds" && -n $FLOWY_NAME ]]; then
+		block_for=$(tr -cd '0-9' <"$FIRECODE_ROOT/runs/chat-block-seconds" 2>/dev/null || echo 0)
+		block_for=${block_for:-0}
+		((block_for > 300)) && block_for=300
+		if ((block_for > 0)); then
+			block_log="$FIRECODE_ROOT/runs/chat-block.log"
+			printf '%s begin %ss as %s\n' "$(date -Is)" "$block_for" "$FLOWY_NAME" >>"$block_log"
+			block_out=$(FLOWY_TOKEN=$(cat "$FLOWY_AGENTS/$FLOWY_NAME" 2>/dev/null) \
+				timeout $((block_for + 15)) "$FLOWY_BIN" inbox --as "$FLOWY_NAME" \
+				--url "$FLOWY_ADDR" --deadline "$block_for" 2>/dev/null)
+			block_rc=$?
+			printf '%s end rc=%s bytes=%s\n' "$(date -Is)" "$block_rc" "${#block_out}" >>"$block_log"
+			# 0 is delivery, and delivery is the whole point: say it on stderr
+			# and refuse the stop, which is the one path where the words reach
+			# the agent. Anything else - a quiet deadline, a broken waiter, a
+			# timeout - goes to idle rather than holding the session on a
+			# failure nobody asked about.
+			if ((block_rc == 0)) && [[ -n $block_out ]]; then
+				printf 'The room spoke while you were going idle:\n%s\n' "$block_out" >&2
+				exit 2
+			fi
+		fi
+	fi
+
 	if [[ $MODE == stop && $CHAT_QUIET == 0 ]]; then
 		if ((flowy_listeners == 0)); then
 			# shellcheck disable=SC2016  # the $(cat ...) is a command for the
