@@ -319,8 +319,43 @@ PY
 # ---------------------------------------------------------------- drives
 
 # ext4 image built straight from a directory, no mount and no root.
+# WHAT ACTUALLY RAN OUT, said before the failure that hides it.
+#
+# tmpfs is created with one inode per two pages, so /tmp on this host holds
+# 1048576 files however much room they take. On 2026-08-18 it reached that with
+# 32G free: every write answered "No space left on device" while `df -h` read
+# 50% used, and three agents spent an hour reading it as random build breakage -
+# a gate that failed in npm, a firecode run whose copy-out wrote nothing, and a
+# shell that could not save its own working directory.
+#
+# The error the kernel gives is ENOSPC either way, so nothing downstream can
+# tell the two apart. This can: it looks before the write and names the number
+# that is about to run out, on the filesystem the write lands on rather than on
+# a guess about which one that is.
+disk_pressure() {
+	local path=$1 what=$2 pcent
+	# `--output=ipcent`, NOT `-i --output=pcent`: df refuses that pair outright
+	# ("options -i and --output are mutually exclusive"), so the first version of
+	# this check could never fire and I would have shipped a warning nobody
+	# would ever see. It is one word apart from working, which is why it has to
+	# be run rather than read.
+	# character everywhere it is passed on from here.
+	pcent=$(df --output=ipcent "$path" 2>/dev/null | tail -1 | tr -dc '0-9')
+	# The threshold is a variable so this can be PROVEN to fire. A warning that
+	# has only ever been reasoned about is one nobody has seen work, and the
+	# filesystem it is about is not one a test may fill on purpose.
+	if [[ -n $pcent ]] && ((pcent >= ${FIRECODE_INODE_WARN:-95})); then
+		log "WARNING: the filesystem holding $path is at ${pcent}% of its INODES."
+		log "  $what will fail with 'No space left on device' even though df -h"
+		log "  reads comfortable - inodes run out by file COUNT, not by bytes."
+		log "  df -i $path, and 'firecode gc' reclaims dead scratch projects."
+	fi
+	return 0
+}
+
 mkimage_from_dir() {
 	local src=$1 out=$2 label=$3 size=$4
+	disk_pressure "$(dirname -- "$out")" "packing a drive"
 	# Round up to a whole MiB: firecracker warns about anything that is not a
 	# multiple of the 512 byte sector size, and the tail would be invisible.
 	local mib=$((1024 * 1024))
@@ -4954,6 +4989,11 @@ EOF
 	elif ((SYNC_BACK)); then
 		local out_dir="${DELIVER:-${WORKDIR}-${id#firecode-}}"
 		log "copying the project out to $out_dir"
+		# The copy-out is thousands of small files and it is the last thing a
+		# run does, so it is where inode exhaustion lands - and an empty result
+		# directory reads as "the VM produced nothing" rather than as a full
+		# filesystem. Say which it is before it happens.
+		disk_pressure "$(dirname -- "$out_dir")" "copying the project out"
 		extract_image "$src_drive" "$out_dir"
 		# The run directory remembers what the delivered tree is about to
 		# forget. These markers are deleted from the result - they are
@@ -5418,7 +5458,7 @@ sweep_scratch() {
 	# SAY THE NUMBER THAT ACTUALLY RUNS OUT. df -h on a tmpfs full of small
 	# files reads comfortable right up to the failure.
 	local used
-	used=$(df -i --output=pcent "$root" 2>/dev/null | tail -1 | tr -dc '0-9')
+	used=$(df --output=ipcent "$root" 2>/dev/null | tail -1 | tr -dc '0-9')
 	if [[ -n $used ]] && ((used >= 80)); then
 		log "WARNING: $root is at ${used}% of its INODES - a write there will fail"
 		log "  with 'No space left on device' while df -h still reads comfortable."
