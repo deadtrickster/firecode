@@ -139,8 +139,14 @@ if [[ ${1:-} == --watch ]]; then
 	printf 'Pick ONE row above and claim it in the room before you start:\n'
 	printf '  %s say --url %s "%s: taking <row title>"\n\n' \
 		"${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy-next}" "$FLOWY_ADDR" "$name"
-	printf 'Then set it active so the board stops offering it to everybody else:\n'
-	printf '  POST %s/api/chat/general/todo  {"id": "<row id>", "status": "active"}\n\n' "$FLOWY_ADDR"
+	# TWO WRITES, AND BOTH ARE REQUIRED. Saying "taking this" in the room changes
+	# nothing on the board: I claimed a row out loud at 22:30 and the watch still
+	# offered it to me an hour later, because the row was never written. The
+	# endpoints below are the ones the server actually has - the first version of
+	# this text invented a single POST that answers `unknown field "id"`.
+	printf 'Then WRITE the claim - the room does not update the board:\n'
+	printf '  POST %s/api/todo/<row id>/assignee      {"assignee": "%s"}\n' "$FLOWY_ADDR" "$name"
+	printf '  POST %s/api/artifact/<row id>/status    {"status": "active"}\n\n' "$FLOWY_ADDR"
 	printf '%d free VM slot(s) if it needs one. If you are genuinely mid-task, say so in the room and re-arm this watch.\n' "$slots"
 	exit 0
 fi
