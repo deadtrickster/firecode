@@ -5311,7 +5311,16 @@ cmd_gc() {
 		local cg
 		cg=$(cat "$d/cgroup" 2>/dev/null || echo "")
 		if [[ -n $cg ]] && [[ -s $cg/cgroup.procs || -s $cg/vm/cgroup.procs ]]; then
-			rm -f "$d"/*.ext4
+			# NOTHING AT ALL, not even the drives. The first version of this
+			# guard kept the directory and still removed *.ext4, which is the
+			# image the VM is running on and the one its copy-out reads at
+			# shutdown - so a live run survived the sweep and then delivered an
+			# EMPTY result directory, because extract_image had nothing left to
+			# dump. That is how a green run with 574 checks and a commit at
+			# 2679b8e came back with nothing in it.
+			#
+			# A live run is not a thing to tidy around. It is left exactly as it
+			# is until it stops.
 			continue
 		fi
 		n=$((n + 1))
