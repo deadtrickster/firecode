@@ -231,7 +231,14 @@ if [[ ${1:-} == --watch ]]; then
 	printf 'Then say it, so a person sees it too:\n'
 	printf '  %s say --url %s --room general "%s: taking <row title>"\n\n' \
 		"$(flowy_bin)" "$FLOWY_ADDR" "$name"
-	printf '%d free VM slot(s) if it needs one. If you are genuinely mid-task, say so in the room and re-arm this watch.\n' "$slots"
+	printf '%d free VM slot(s) if it needs one. If you are genuinely mid-task, say so in the room and re-arm this watch.\n\n' "$slots"
+	# THE TOKENS ARE SHARED. Two of five seats were rate limited for five hours
+	# on 2026-08-17 and the operator has asked for terseness three times since.
+	# A long room post costs everybody, so it goes in the nag rather than in
+	# somebody's memory of being told.
+	printf 'BE TERSE. Findings without the retrospective. A room post is a few lines -\n'
+	printf 'the reasoning belongs in the commit message or the row, where it is read\n'
+	printf 'on purpose. Tokens are shared and seats get rate limited.\n'
 	exit 0
 fi
 
