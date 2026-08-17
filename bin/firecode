@@ -4411,7 +4411,28 @@ launch() {
 		# A layer whose VM was killed rather than shut down has a dirty
 		# journal, and the kernel cannot replay one on a read-only mount - it
 		# refuses the mount instead. Replaying it here is cheap when clean.
-		sbin e2fsck -p "$main_layer" >/dev/null 2>&1 || true
+		#
+		# AND WHEN IT IS NOT CLEAN, SAY SO. `-p` fixes only what is trivially
+		# safe and EXITS 4 ON ANYTHING SERIOUS, refusing to touch it - so
+		# `|| true` swallowed the one message that explains what happens next.
+		# What happens next is that the guest cannot mount the layer, init
+		# gives up, and the VM sits at a busybox prompt looking exactly like a
+		# slow gate. I lost fifty minutes to that tonight across two runs, and
+		# hard-killed both of them, which is what corrupted the layer further.
+		#
+		# Exit 0 is clean, 1 is "fixed something". Anything above that is the
+		# operator's to decide, so it is reported rather than hidden - and the
+		# run continues, because a layer this cannot repair may still mount for
+		# a run that owns it read-write.
+		local fsck_rc=0
+		sbin e2fsck -p "$main_layer" >/dev/null 2>&1 || fsck_rc=$?
+		if ((fsck_rc > 1)); then
+			log "WARNING: $main_layer needs repair that e2fsck -p will not do (exit $fsck_rc)"
+			log "  a read-only mount of it FAILS, so a VM inheriting it drops to a rescue"
+			log "  prompt and does nothing. Repair it while NO VM holds it:"
+			log "    e2fsck -fy $main_layer"
+			log "  and do not hard-kill a VM that has it open - that is how it got here."
+		fi
 		lower_drives+=("$main_layer")
 		log "inheriting the layer of $main_dir (this is a worktree of it)"
 	fi
