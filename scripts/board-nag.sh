@@ -85,8 +85,15 @@ if [[ ${1:-} == --watch ]]; then
 		ready=$(queue_ready "$queue")
 		[[ $ready =~ ^[0-9]+$ ]] && ((ready > 0)) && break
 		if [[ -n $board ]]; then
+			# ACTIVE IS NOT WAITING. A row I hold and am working - or that one of
+			# my agents is working - is not work waiting for me, and waking on it
+			# is a nag every three minutes for the whole length of the job. Only
+			# an unowned row, or one of mine that is still sitting at todo,
+			# counts as something to be woken for. The merge queue above is
+			# separate and does wake on a landable row, because that one rots.
 			has=$(jq -r --arg me "$name" '[.artifacts[]? |
 				select((.status // "") != "done") |
+				select((.status // "") != "active") |
 				select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)] |
 				length' <<<"$board" 2>/dev/null || echo 0)
 			[[ $has =~ ^[0-9]+$ ]] && ((has > 0)) && break
