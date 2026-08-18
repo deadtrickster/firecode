@@ -107,6 +107,11 @@ record() {
 		'{at: $at, outcome: $outcome, row: $row, branch: $branch, tip: $tip,
 		  agent: $agent, note: $note, pid: $pid}' >"$STATUS" 2>/dev/null || true
 }
+# Where this drainer remembers what it has already done. Beside the status file
+# the nag reads, because they are the same kind of fact about the same passes.
+STATE=${FLOWY_DRAIN_STATE:-$HOME/.cache/flowy-drain}
+mkdir -p "$STATE" 2>/dev/null || true
+
 say() { printf '[drain] %s\n' "$*"; }
 die() {
 	printf '[drain] REFUSED: %s\n' "$*" >&2
@@ -219,13 +224,34 @@ fi
 say "taking $row - $branch onto $rowtarget"
 
 if [ "$dry" = yes ]; then
-	outcome=dry-run
+	outcome="dry-run"
 	say "dry run: would declare, rebase, pre-gate, gate, record, land"
 	[ "$deploy" = yes ] && say "dry run: and would deploy"
 	exit 0
 fi
 
 # ------------------------------------------------------------ declare first
+
+# A RED THIS DRAINER HAS ALREADY SEEN IS NOT TAKEN AGAIN.
+#
+# The script never retried; a LOOP around it did - claude-host ran --once every
+# sixty seconds and it re-took a red row every minute. My fault rather than the
+# loop's: on red this records nothing, so the queue cannot tell a row nobody has
+# gated from one that just failed, and every caller takes it again forever.
+#
+# The real fix is a queue that can say GATED AND FAILED. It cannot today:
+# gated_tip means "this is the evidence" and MergeAdmissible compares base to
+# tip without asking pass or fail, so recording a red verdict would make the row
+# look LANDABLE. Filed separately; this is what stops the bleeding meanwhile.
+#
+# Keyed by TIP as well as row, so a rebase or a fix is taken immediately - what
+# is refused is repeating a measurement of a tree already measured, which is the
+# rule the whole fleet agreed on this afternoon.
+if [ -f "$STATE/red-$row-$tip" ]; then
+	say "$row at $tip already gated red - $(cat "$STATE/red-$row-$tip")"
+	say "push a fix or rebase; a second run of the same tree measures the same tree"
+	exit 0
+fi
 
 run="drain-$(date -u +%Y%m%dT%H%M%SZ)"
 declared=$(api POST "/api/merge/$row/gate" "$(printf '{"run":"%s"}' "$run")")
@@ -317,7 +343,10 @@ say "rebased onto $rowtarget, tip $tip"
 
 # ------------------------------------------------------------ the gate
 
-log=${TMPDIR:-/tmp}/drain-$row.log
+# KEYED BY ROW AND TIP, not by row. The retry below overwrote the log of the
+# run that mattered with the log of the run that repeated it - so the evidence
+# of the first red was destroyed by the second identical red.
+log=$STATE/drain-$row-$tip.log
 say "gating $tip - about 35 minutes, log at $log"
 if (cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH \
 	LD_LIBRARY_PATH=$HOME/.local/pg17-libs ./run-tests.sh >"$log" 2>&1); then
@@ -330,7 +359,10 @@ else
 	note="$(grep -E "^passed:" "$log" | tail -1) - log at $log"
 	say "RED: $(grep -E '^passed:' "$log" | tail -1)"
 	grep -E '^\s+--- FAIL|^FAIL ' "$log" | head -5 >&2 || true
+	printf 'red at %s, %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		"$(grep -E '^passed:' "$log" | tail -1)" >"$STATE/red-$row-$tip"
 	say "the row stays open and the log stays at $log - a person reads it"
+	say "and $tip will not be gated again by this drainer until it changes"
 	exit 1
 fi
 
