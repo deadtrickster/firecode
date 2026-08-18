@@ -444,6 +444,23 @@ if [ "$deploy" != yes ]; then
 	say "not deploying - green and deployed are two claims, and this run was asked for one"
 	exit 0
 fi
-"$REPO/scripts/deploy.sh"
+# A DEPLOY THAT REFUSES IS ITS OWN OUTCOME, not silence.
+#
+# Measured at 20:52: the deploy refused because the shared checkout had another
+# agent's work in it, the pass exited, and the status file still said "landed" -
+# which is true and useless. The node then caught up only because another row
+# was queued behind this one and its pass deployed. A refusal on the LAST row of
+# the queue never retries: nothing comes after it, so the node stays behind and
+# the only record is a line in a log nobody is reading.
+#
+# So the status carries the state that actually obtains - landed, not deployed -
+# and says why, because "landed but not serving" is the condition row 01M09SKFBQ
+# is entirely about.
+if ! "$REPO/scripts/deploy.sh"; then
+	outcome=deploy-refused
+	note="landed $landed and the deploy refused - master has moved and the node has not"
+	printf '[drain] the branch LANDED and the deploy did not: %s is on master, the node is serving something older\n' "$landed" >&2
+	exit 1
+fi
 outcome=deployed
 note="$landed"

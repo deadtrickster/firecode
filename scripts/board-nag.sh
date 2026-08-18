@@ -175,6 +175,7 @@ if [[ -r $drain_file ]]; then
 		+ (if (.branch // "") != "" then " (\(.branch))" else "" end)
 		+ (if (.note // "") != "" then " - \((.note|gsub("\n";" "))[0:80])" else "" end)
 		+ (if $age > 1800 then "  STALE: nothing has drained in over 30 minutes" else "" end)
+		+ (if (.outcome // "") == "deploy-refused" then "  LANDED BUT NOT SERVING: master has moved and the node has not" else "" end)
 	' "$drain_file" 2>/dev/null || true)
 fi
 [[ -n $drain_status ]] || drain_status="drainer: no status file at $drain_file - it has not run, or nothing is running it"
