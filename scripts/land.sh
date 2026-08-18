@@ -194,6 +194,22 @@ TOKEN=$(cat "$AGENTS/$seat") || {
 	exit 2
 }
 
+# THE GUARD MUST SEE THE SAME IDENTITY THIS SCRIPT IS ACTING AS.
+#
+# The fast-forward below is a git command, and flowy's land guard runs inside
+# git's reference-transaction hook. That hook asks the node whether the caller
+# holds the lock, and it finds the caller through FLOWY_TOKEN, or FLOWY_AGENT
+# plus the agents directory. Neither is necessarily set in the environment that
+# invoked this script - `--as NAME` is this script's way of being told, and the
+# hook cannot see an argument.
+#
+# So a lander that knew perfectly well who it was got refused by a guard that
+# could not tell, and the operator had to know to export FLOWY_AGENT by hand
+# before it would work. Exporting here removes that: the identity the lock was
+# taken under is the identity the guard is handed.
+export FLOWY_AGENT="$seat"
+export FLOWY_TOKEN="$TOKEN"
+
 api() { # api METHOD PATH [BODY] -> body on stdout, non-zero on transport or HTTP error
 	local method=$1 path=$2 body=${3:-} out code
 	if [ -n "$body" ]; then
