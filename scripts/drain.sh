@@ -174,9 +174,33 @@ trap release EXIT
 
 # ------------------------------------------------------------ the tree
 
-git -C "$REPO" worktree add -q --checkout "$WORK" "$branch" 2>/dev/null ||
-	git -C "$WORK" checkout -q "$branch" ||
-	die "cannot put $branch in $WORK"
+# THE WORKTREE, AND WHY THE FIRST RUN DIED HERE.
+#
+# This was `worktree add 2>/dev/null || checkout || die`, and the first real run
+# produced "cannot put the branch in /home/dead/Projects/wt-drain" - which says
+# what did not happen and nothing about why. The reason was that git refuses to
+# check out a branch that is checked out in ANOTHER worktree, and my own
+# worktree held it. Hiding stderr on the first arm threw away the one sentence
+# that explained the failure, which is the defect this fleet has filed four
+# times today under other names.
+#
+# So: stderr is kept, the branch being held elsewhere is refused BY NAME before
+# the attempt, and the fallback only runs when the directory is actually there.
+held=$(git -C "$REPO" worktree list --porcelain |
+	awk -v b="refs/heads/$branch" '$1=="worktree"{w=$2} $1=="branch" && $2==b {print w}' |
+	grep -v "^$WORK$" | head -1)
+if [ -n "$held" ]; then
+	die "$branch is checked out in $held - git will not put it in two worktrees, and
+    a drainer that rebased it from under that one would move somebody's tree while they read it.
+    Free it there, or point FLOWY_DRAIN_WORKTREE at it"
+fi
+
+if [ -d "$WORK" ]; then
+	git -C "$WORK" checkout -q "$branch" || die "cannot check out $branch in $WORK"
+else
+	git -C "$REPO" worktree add --checkout "$WORK" "$branch" ||
+		die "cannot create the drain worktree at $WORK"
+fi
 git -C "$WORK" fetch -q 2>/dev/null || true
 git -C "$WORK" rebase -q "$rowtarget" ||
 	die "$branch does not rebase onto $rowtarget cleanly - a person resolves this"
