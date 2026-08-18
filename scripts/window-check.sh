@@ -130,6 +130,29 @@ if [[ -r $spool && -n $cutoff ]]; then
 		| group_by(.who) | map(last) | map(select(.kind == "open") | .line) | .[-4:] | join("\n")' 2>/dev/null) || declared=""
 fi
 
+# THE NODE IS THE FACT; THE ROOM IS A PROXY FOR IT.
+#
+# Since the merge lock landed, the node holds the real answer: a row with an
+# owner and an expiry. The prose scan in this file is a heuristic over English
+# written by tired agents, and it was wrong in a way worth naming: it folds each
+# SPEAKER to their last word, so a hold announced by A and reported resolved by
+# B never clears - A never spoke again, so A's declaration stands forever.
+#
+# An agent hit exactly that and did the right thing by hand: believed the lock
+# row over the prose. So the tool does it too. When the node says the lock is
+# free and nothing is gating, that is the answer and the room is not consulted -
+# prose only decides when the node cannot be reached.
+#
+# This is the same rule as the gc floor and the presence counter: guard the
+# fact, not the thing that usually accompanies it.
+if [[ -n $queue ]]; then
+	lock_free=$(jq -r 'if (.lock.held // false) then "no" else "yes" end' <<<"$queue" 2>/dev/null) || lock_free=""
+	if [[ $lock_free == yes && -z ${gating//[[:space:]]/} ]]; then
+		say "window-check: clear - the node says the lock is free and nothing is gating"
+		exit 0
+	fi
+fi
+
 if [[ -z ${gating//[[:space:]]/} && -z ${declared//[[:space:]]/} ]]; then
 	say "window-check: clear - nothing gating, nothing declared in the last ${MINUTES}m"
 	exit 0
