@@ -132,6 +132,41 @@ fi
 
 # THE NODE IS THE FACT; THE ROOM IS A PROXY FOR IT.
 #
+# WHAT THIS CANNOT ANSWER, and it cost three refusals on 2026-08-18.
+#
+# It asks whether a window is free. It never asks whether the work waiting for
+# that window still exists. A watcher armed at 10:55 for row 01M0A84ART was
+# still waiting at 11:28; the row had landed at 11:00, and when the window
+# finally opened the watcher declared for work that was already in master. It
+# then held the target against three other agents.
+#
+# ABSENCE OF A LOCK IS NOT PRESENCE OF A JOB. This tool takes no row id, so it
+# cannot ask the second question - and a caller who waits FOR something must
+# re-read that something before acting on the wait. Pass FLOWY_WAITING_FOR=<row>
+# and it will check; without it, it says so rather than implying it looked.
+waiting_for=${FLOWY_WAITING_FOR:-}
+if [ -n "$waiting_for" ]; then
+	still=$(curl -sS -m 5 -H "Authorization: Bearer $token" \
+		"$FLOWY_ADDR/api/artifact/$waiting_for" 2>/dev/null |
+		python3 -c 'import json,sys
+try:
+    a = json.load(sys.stdin)
+except Exception:
+    print("unknown"); raise SystemExit
+a = a.get("artifact", a)
+print(a.get("status") or "empty")' 2>/dev/null || echo unknown)
+	case "$still" in
+	done | withdrawn)
+		printf 'THE WORK IS ALREADY %s: %s. A window is no use to a row that has landed.\n' \
+			"$(printf '%s' "$still" | tr '[:lower:]' '[:upper:]')" "$waiting_for" >&2
+		exit 3
+		;;
+	unknown)
+		printf 'could not read %s, so nothing says the work is still waiting\n' "$waiting_for" >&2
+		;;
+	esac
+fi
+
 # Since the merge lock landed, the node holds the real answer: a row with an
 # owner and an expiry. The prose scan in this file is a heuristic over English
 # written by tired agents, and it was wrong in a way worth naming: it folds each
