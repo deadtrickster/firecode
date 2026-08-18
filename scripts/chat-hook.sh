@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 # firecode chat, wired into Claude Code's hooks.
 #
+# EDIT A COPY, LINT THE COPY, THEN MOVE IT INTO PLACE.
+#
+# This is the only script here whose failure lands in somebody ELSE's session:
+# every agent on this host runs it on every prompt and every stop. Edited in
+# place it was broken for about ninety seconds on 2026-08-18 - an apostrophe in
+# a comment inside `python3 -c '...'` closed the quote - and another agent's
+# stop hook printed an IndentationError instead of their room. shellcheck
+# caught it, but AFTER the file was already live, which is not catching it.
+#
+#   cp scripts/chat-hook.sh /tmp/hook.work
+#   <edit /tmp/hook.work>
+#   run shellcheck on it, then shfmt -d /tmp/hook.work && bash -n /tmp/hook.work
+#   mv /tmp/hook.work scripts/chat-hook.sh
+#
+# The move is atomic, so no session ever reads a half-written file.
+#
+# AND MIND THE PYTHON BLOCK: everything after `python3 -c '` is inside single
+# quotes, so an apostrophe anywhere in it - including in prose - ends the
+# string and turns the rest of the file into shell syntax errors.
+#
 # A backgrounded waiter is only as durable as the session holding it: end the
 # conversation, or compact it at the wrong moment, and the room carries on
 # talking to nobody. Worse, re-arming is a step an agent has to remember, and
