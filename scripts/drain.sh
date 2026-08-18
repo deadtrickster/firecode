@@ -162,7 +162,7 @@ while read -r kind id b t; do
 	}
 	elsewhere=$(git -C "$REPO" worktree list --porcelain |
 		awk -v want="refs/heads/$b" '$1=="worktree"{w=$2} $1=="branch" && $2==want {print w}' |
-		grep -v "^$WORK$" | head -1)
+		grep -v "^$WORK$" | head -1 || true)
 	if [ -n "$elsewhere" ]; then
 		say "skipping $id - $b is checked out in $elsewhere"
 		continue
@@ -229,7 +229,7 @@ trap release EXIT
 # to.
 held=$(git -C "$REPO" worktree list --porcelain |
 	awk -v b="refs/heads/$branch" '$1=="worktree"{w=$2} $1=="branch" && $2==b {print w}' |
-	grep -v "^$WORK$" | head -1)
+	grep -v "^$WORK$" | head -1 || true)
 if [ -n "$held" ]; then
 	die "$branch was checked out in $held between the pick and the declare"
 fi
