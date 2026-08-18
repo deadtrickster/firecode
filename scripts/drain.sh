@@ -186,7 +186,19 @@ say "rebased onto $rowtarget, tip $tip"
 
 # ------------------------------------------------------------ worth gating
 
-(cd "$WORK" && FLOWY_AGENT="$AGENT" bash "$(dirname "$0")/pre-gate.sh" "$branch") ||
+# THE SAME ENVIRONMENT THE GATE GETS, or pre-gate answers about a different one.
+#
+# pre-gate checks that postgres is on PATH, because the suite exits in two
+# seconds without it - and it exports pg17-bin for its OWN initdb probe, which
+# the suite does not inherit. So calling it without that PATH gets a refusal
+# that is true of the caller and false of the run. Measured by hand twenty
+# minutes before this script was first used: "postgres is installed and NOT on
+# your PATH", from a shell whose gate would have worked.
+#
+# FLOWY_AGENT for the other half of the same lesson: without it, pre-gate cannot
+# tell this seat's lock from another's, and it says so rather than guessing.
+(cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH LD_LIBRARY_PATH=$HOME/.local/pg17-libs \
+	FLOWY_AGENT="$AGENT" bash "$(dirname "$0")/pre-gate.sh" "$branch") ||
 	die "pre-gate says this run is not worth starting"
 
 # ------------------------------------------------------------ the gate
