@@ -274,6 +274,15 @@ esac
 # door answers with released:false, so this is safe on every path.
 release() {
 	api POST /api/lock/release "$(printf '{"item":"%s"}' "$row")" >/dev/null 2>&1 || true
+	# AND GIVE THE BRANCH BACK. The worktree keeps whatever it checked out, so
+	# after a pass the seat that owns that branch cannot touch it - git refuses
+	# a branch checked out anywhere else, and the message names a directory they
+	# did not create. claude-host hit this from the other side within minutes of
+	# the first red: their fixture fix could not go on their own branch.
+	#
+	# Detached costs the drainer nothing: the next pass checks out whatever it
+	# picks, and this one is finished with it either way.
+	git -C "$WORK" checkout -q --detach 2>/dev/null || true
 }
 # ONE EXIT TRAP, because bash has one and a second REPLACES the first - the
 # defect this fleet shipped in deploy.sh this evening and caught in the logs an
