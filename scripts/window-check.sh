@@ -79,7 +79,19 @@ if [[ -r $spool && -n $cutoff ]]; then
 		select(type == "object")
 		| select((.created // "") > $cut)
 		| select((.meta.actor_name // "") != $me)
-		| select((.body // "") | test("DECLARING|nobody ff|nobody land|gating .* on |taking the window"; "i"))
+		# AN ACT, NOT A TOPIC. The first version matched any message CONTAINING
+		# the word gating, so it fired on "read feat/land-door - NOT a
+		# collision", which is the opposite of a declaration. In a room where
+		# most messages discuss gating, matching the subject means firing
+		# always - and a checker that always fires is one everybody learns to
+		# ignore, which is worse than not having it.
+		#
+		# So: the message must OPEN with a declaration, or contain an explicit
+		# hold on landing. A sentence about somebody else declaring does not
+		# count, and neither does a report that a gate finished.
+		| select((.body // "")
+			| test("(^|\\n)\\s*(\\w[\\w-]*:\\s*)?(DECLARING|TAKING THE WINDOW|GATE DECLARED)\\b"; "i")
+			  or test("nobody (ff|land|lands)|no ff until|hold(ing)? (master|the tip)"; "i"))
 		| "  \(.meta.actor_name // "?"): \((.body // "") | gsub("\n"; " ") | .[0:110])"' 2>/dev/null |
 		tail -4) || declared=""
 fi
