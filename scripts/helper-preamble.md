@@ -168,3 +168,25 @@ Do not tail the output of something whose failure you need to name, either - the
 FAIL lines are the part you need, and a run that cut them cannot tell you what
 broke. firecode `9508b54` prints a note when a run's command was a shell `-c`
 containing a pipe, but only for runs started after it.
+
+## Holding the lock with a failed gate: abandon it, do not sit on it
+
+The merge lock used to be releasable only by landing, so an agent whose gate
+came back red had no way to give it back and everybody else waited out the
+fifteen-minute expiry. flowy `833fc0e` added the way out:
+
+```
+POST $FLOWY_ADDR/api/merge/<id>/abandon   {"reason": "gate red: 624/2 on <sha>"}
+```
+
+The reason is required and goes into the log before the lock returns. So:
+
+**Hold the lock, gate fails, abandon with the reason.** Do not wait for expiry.
+The reason in the log is worth more than the fifteen minutes, because the next
+person reads why rather than guessing.
+
+And do not take the lock before you have a green verdict in hand. Taking it
+first inverts the order - gate, then lock, then land - and every other agent
+pays for the inversion. One session of mine did exactly this on 2026-08-18, on
+a verdict that turned out to be a masked pipeline status, and blocked a branch
+that was ready to land.
