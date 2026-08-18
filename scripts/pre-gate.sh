@@ -70,8 +70,30 @@ print(lock.get("holder_name", "") if lock.get("held") else "")
 ' 2>/dev/null)
 	if [ -n "$holder" ] && [ "$holder" != "$AGENT" ]; then
 		bad "$target is held by $holder - their run or yours is about to be wasted"
+	elif [ -z "$holder" ]; then
+		# FREE IS NOT GOOD ENOUGH, and this line used to pass on it.
+		#
+		# A verdict is admissible only while its base holds - MergeAdmissible
+		# compares gated_base against the target tip - so anybody landing during
+		# a run invalidates that run by definition, and they are doing nothing
+		# wrong. The lock is what stops the base moving, and a gate that has not
+		# taken it is a gate anybody may waste.
+		#
+		# MEASURED, and this is why it is a refusal rather than a note.
+		# flowy-claude declared before gating for six consecutive landings: four
+		# wasted runs before they started, zero after, six landings from six
+		# runs. Over the same afternoon I gated first and declared after, and
+		# re-ran three unchanged diffs because master moved underneath them.
+		#
+		# The declare door already takes the lock. So "declare, rebase, gate,
+		# record, land" needs no new mechanism - only this check refusing the
+		# order that wastes runs.
+		bad "nobody holds $target, INCLUDING YOU - declare your merge row first
+    POST $NODE/api/merge/{row}/gate  {\"run\": \"...\"}
+    then rebase, gate, record the verdict, land. A gate that has not taken the
+    lock is one anybody can land under, and the loser is whoever finishes second"
 	else
-		say ok "the lock is free or already yours"
+		say ok "the lock is yours, so the base cannot move under this run"
 	fi
 fi
 
@@ -100,6 +122,29 @@ if [ -f "$suite" ] && [ ! -x "$suite" ]; then
 	bad "run-tests.sh is not executable ($(stat -c %a "$suite")) - a fresh worktree cannot ./run it"
 else
 	say ok "the suite is executable"
+fi
+
+# THE GATE COMPILES THE WORKING TREE, NOT THE COMMIT.
+#
+# run-tests.sh does `go build -o "$ROOT/flowy" .` and reads "$ROOT/schema.sql"
+# from the directory it runs in, so an uncommitted edit is measured and a
+# verdict recorded from it names a commit that does not contain what was tested.
+# Everything else here guards against the branch MOVING; nothing guarded against
+# it never having been what was measured in the first place.
+#
+# Asked of the worktree the gate will run in - $PWD - and not of $REPO. Gates
+# run in worktrees now, and the main checkout's cleanliness says nothing about
+# the tree that is about to be compiled.
+#
+# .gitignore already covers what a run leaves behind - the flowy binary and
+# web/dist - so a worktree that has just gated is clean by this test, which is
+# what makes it usable at VERIFY time too.
+dirty=$(git -C "$PWD" status --porcelain 2>/dev/null)
+if [ -n "$dirty" ]; then
+	bad "the tree that would be gated has uncommitted changes - the verdict would name a commit that does not contain what ran:
+$(printf '%s\n' "$dirty" | head -5)"
+else
+	say ok "the working tree is clean, so the commit is what gets compiled"
 fi
 
 jit=$(find /usr/lib/postgresql -name llvmjit.so -type f 2>/dev/null | head -1)
@@ -135,7 +180,16 @@ if [ "${VERIFY:-no}" = yes ]; then
 			"$want" "$have" >&2
 		exit 1
 	fi
-	printf '%s is still %s - the verdict describes the tree that was measured\n' "$branch" "$have"
+	# AND THE TREE IS STILL THE COMMIT. An edit made during the run leaves the
+	# sha untouched, so the check above passes while the thing that ran is not
+	# the thing that would land.
+	dirty=$(git -C "$PWD" status --porcelain 2>/dev/null)
+	if [ -n "$dirty" ]; then
+		printf 'THE TREE CHANGED UNDER ITS OWN GATE - %s is still %s, and the worktree is not:\n%s\n' \
+			"$branch" "$have" "$(printf '%s\n' "$dirty" | head -5)" >&2
+		exit 1
+	fi
+	printf '%s is still %s and the tree is clean - the verdict describes what ran\n' "$branch" "$have"
 	exit 0
 fi
 
