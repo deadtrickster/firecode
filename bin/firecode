@@ -5451,6 +5451,74 @@ cmd_list() {
 #
 # Age alone would be wrong and liveness alone would be wrong: a scratch project
 # can sit untouched for a week and still be somebody's workspace this minute.
+# The copy-out directories every run leaves behind.
+#
+# A finished run copies the project out to <project>-<run id>, which is the
+# delivered tree and the whole point of the run. Nothing has ever removed one.
+# On 2026-08-18 there were 57 of them holding 820,000 inodes - four times what
+# the scratch projects held, and enough to take /tmp to 100% twice in an hour
+# while `df -h` read 52% used. Three agents diagnosed random build breakage.
+#
+# THE DELETION IS THE DANGEROUS PART, because a result directory is the only
+# copy of anything a run produced but nobody committed. So all four must hold:
+#
+#   old enough      - a floor in hours, so a run somebody is still reading is
+#                     never a candidate
+#   a git checkout  - anything else is not something this can reason about, and
+#                     is left alone
+#   already in git  - its HEAD commit exists in the project it came from, so the
+#                     work is in a repository and not only here
+#   clean, and free - no uncommitted changes worth keeping, and no process with
+#                     a descriptor or a working directory inside it
+#
+# The node_modules symlink a worktree carries is ignored when judging clean: it
+# is materialised by the VM, it is in .gitignore, and treating it as somebody's
+# work would keep every directory forever.
+sweep_results() {
+	local hours=${FIRECODE_RESULT_HOURS:-6}
+	local swept=0 dir name proj head repo held target
+
+	while IFS= read -r dir; do
+		name=$(basename "$dir")
+		# <project>-<timestamp>-<pid>, which is what copy-out names them. A
+		# directory that does not match is not ours to judge.
+		[[ $name =~ -[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+		proj=${dir%-[0-9]*-[0-9]*-[0-9]*}
+		[[ -d $dir/.git ]] || continue
+
+		head=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || continue
+		# The project it was copied from, and its main checkout when that is a
+		# worktree - a commit made in a worktree lives in the shared object
+		# store, so asking the main checkout is asking the right repository.
+		repo=$proj
+		[[ -d $repo/.git || -f $repo/.git ]] || continue
+		local main
+		main=$(main_checkout "$repo")
+		[[ -n $main ]] && repo=$main
+		git -C "$repo" cat-file -e "$head" 2>/dev/null || continue
+
+		# Dirty means somebody's uncommitted work, except for the one entry the
+		# VM always creates.
+		local dirty
+		dirty=$(git -C "$dir" status --porcelain 2>/dev/null |
+			grep -cv 'web/node_modules' || true)
+		((dirty == 0)) || continue
+
+		held=0
+		for proc in /proc/[0-9]*; do
+			target=$(readlink "$proc/cwd" 2>/dev/null) || continue
+			[[ $target == "$dir" || $target == "$dir"/* ]] && held=1 && break
+		done
+		((held)) && continue
+
+		rm -rf "$dir" 2>/dev/null && swept=$((swept + 1))
+	done < <(find "${FIRECODE_RESULT_ROOTS:-/tmp $HOME/Projects}" -mindepth 1 -maxdepth 1 \
+		-type d -mmin "+$((hours * 60))" 2>/dev/null)
+
+	((swept > 0)) && log "removed $swept delivered result director(ies) already in git"
+	return 0
+}
+
 sweep_scratch() {
 	local root=${FIRECODE_SCRATCH_ROOT:-/tmp/firecode-scratch}
 	local days=${FIRECODE_SCRATCH_DAYS:-2}
@@ -5623,6 +5691,7 @@ cmd_gc() {
 	((reaped > 0)) && log "reaped $reaped process(es) left behind by a dead run, freeing their network slots"
 
 	sweep_scratch
+	sweep_results
 
 	log "kept the $keep most recent runs (logs only)"
 	if ((${#stuck[@]})); then
