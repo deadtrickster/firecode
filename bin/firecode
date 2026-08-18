@@ -5696,6 +5696,67 @@ sweep_results() {
 	return 0
 }
 
+# A worktree whose directory is gone still holds its branch.
+#
+# `git worktree add /tmp/flowy-x` registers the path in the repository, and
+# /tmp is tmpfs: a reboot, or an agent removing its directory with rm -rf
+# instead of `git worktree remove`, takes the directory and leaves the
+# registration. Git then believes the branch is checked out somewhere, so
+# `git checkout <that branch>` in the shared tree is refused, and the refusal
+# names a path that does not exist - which reads as nonsense to whoever hits
+# it.
+#
+# That happened on 2026-08-18: master was registered to /tmp/flowy-landing,
+# the directory had been reaped, and nobody could put the shared checkout back
+# on master. Three people found it separately before one of them thought to
+# look at `git worktree list`. There were 37 worktrees under /tmp at that
+# moment, so it is not a one-off - every one of them is a branch that becomes
+# unavailable the moment its directory goes.
+#
+# `git worktree prune` removes exactly the registrations whose directory is
+# missing and touches nothing else, which makes it safe to run unattended.
+# Doing it here is right because gc is the thing that already runs regularly
+# and already knows which repositories this host builds.
+sweep_worktrees() {
+	local -a repos=()
+	local rd project main seen
+	# The repositories this host has actually run, off the run records rather
+	# than off a guess about the layout.
+	for rd in "$RUNS"/*/; do
+		[[ -f $rd/project ]] || continue
+		project=$(cat "$rd/project" 2>/dev/null) || continue
+		[[ -n $project && -e $project/.git ]] || continue
+		main=$(main_checkout "$project")
+		[[ -n $main ]] || main=$project
+		seen=0
+		for r in ${repos+"${repos[@]}"}; do
+			[[ $r == "$main" ]] && seen=1 && break
+		done
+		((seen)) || repos+=("$main")
+	done
+
+	local repo out pruned=0
+	for repo in ${repos+"${repos[@]}"}; do
+		# --verbose writes to STDERR, not stdout - captured with 2>&1 because a
+		# reporting feature that discards its own report is the defect this
+		# whole file keeps finding. Written 2>/dev/null first and it logged
+		# nothing while pruning correctly, which is the same silence as a gate
+		# that only reports an exit code.
+		# --verbose names each registration it drops, so this can say WHICH
+		# branch came back rather than only how many. A prune that reports a
+		# number is the same shape as a gate that reports an exit code.
+		out=$(git -C "$repo" worktree prune --verbose 2>&1 || true)
+		[[ -n ${out//[[:space:]]/} ]] || continue
+		while IFS= read -r line; do
+			[[ -n ${line//[[:space:]]/} ]] || continue
+			log "pruned a worktree whose directory is gone: $line"
+			pruned=$((pruned + 1))
+		done <<<"$out"
+	done
+	((pruned > 0)) && log "$pruned stale worktree registration(s) removed - those branches are available again"
+	return 0
+}
+
 sweep_scratch() {
 	local root=${FIRECODE_SCRATCH_ROOT:-/tmp/firecode-scratch}
 	local days=${FIRECODE_SCRATCH_DAYS:-2}
@@ -5907,6 +5968,7 @@ cmd_gc() {
 
 	sweep_scratch
 	sweep_results
+	sweep_worktrees
 
 	log "kept the $keep most recent runs (logs only)"
 	if ((${#stuck[@]})); then
