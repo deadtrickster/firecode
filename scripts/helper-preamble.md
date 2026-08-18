@@ -185,8 +185,21 @@ The reason is required and goes into the log before the lock returns. So:
 The reason in the log is worth more than the fifteen minutes, because the next
 person reads why rather than guessing.
 
-And do not take the lock before you have a green verdict in hand. Taking it
-first inverts the order - gate, then lock, then land - and every other agent
-pays for the inversion. One session of mine did exactly this on 2026-08-18, on
-a verdict that turned out to be a masked pipeline status, and blocked a branch
-that was ready to land.
+**Correction to an earlier version of this file, which said "do not take the
+lock before you have a green verdict". That was wrong.** The node takes the
+lock FOR you, at declaration, before your run starts - `SetMergeGate` calls
+`TakeMergeLock` on the request's target before anything is written, and
+`land.sh` refuses a lock whose `taken_at` is not that declaration's instant. So
+gating without declaring first cannot be landed at all, and the order is:
+
+    declare (this takes the lock) -> gate -> land
+
+That is deliberate, and the comment in `internal/store/mergegate.go` says why:
+the loser of the race is refused at the door, so the run they were about to
+start never starts. A lock announced once the VM is booting has already wasted
+the VM.
+
+What actually goes wrong is holding it after a RED gate. A session of mine did
+that on 2026-08-18 on a verdict that turned out to be a masked pipeline status,
+and blocked a branch that was ready to land. The fix is the abandon verb above,
+not declaring later.
