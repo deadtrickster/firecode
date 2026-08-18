@@ -397,6 +397,72 @@ test_commit_reachability() {
 	fi
 }
 
+# gc DELETES, so what it keeps has to be provable rather than assumed. Two
+# result directories that differ in one respect - one holds a commit that is on
+# a branch in the project, the other holds two commits that are on no branch
+# anywhere - must get opposite treatment, and the kept one must say which
+# commits are keeping it alive. That last part is the whole point: 38 of 103
+# directories survived one reclaim silently, and nobody could tell an abandoned
+# experiment from somebody's only copy.
+#
+# sweep_results runs for real here, taken out of the script, against roots that
+# exist only inside $WORK. FIRECODE_RESULT_ROOTS is what keeps it away from
+# /tmp and ~/Projects.
+test_gc_keeps_unreachable_work() {
+	local root landed orphan out
+	root="$WORK/gcroots"
+	mkdir -p "$root"
+	g() { git -c commit.gpgsign=false -c user.email=t@example.com -c user.name=t "$@"; }
+
+	g init -q "$root/proj"
+	echo base >"$root/proj/f"
+	g -C "$root/proj" add f
+	g -C "$root/proj" commit -qm base
+
+	# Landed: the run's commit ends up on a branch in the project.
+	landed="$root/proj-20260818-101010-1111"
+	g clone -q "$root/proj" "$landed"
+	echo a >"$landed/f"
+	g -C "$landed" commit -qam "work that landed"
+	g -C "$landed" push -q "$root/proj" HEAD:refs/heads/landed
+
+	# Orphaned: two commits, on no ref in either repository.
+	orphan="$root/proj-20260818-101011-2222"
+	g clone -q "$root/proj" "$orphan"
+	echo b >"$orphan/f"
+	g -C "$orphan" commit -qam "the only copy of this"
+	echo c >"$orphan/f"
+	g -C "$orphan" commit -qam "and this"
+
+	# Older than the age floor, which is the backstop for a directory whose run
+	# this host has no record of - and no host has a record of these.
+	touch -d '2 hours ago' "$landed" "$orphan"
+
+	out=$(
+		log() { printf 'gc: %s\n' "$*" >&2; }
+		eval "$(sed -n '/^commit_reachable() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^main_checkout() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^sweep_results() {$/,/^}$/p' "$FIRECODE")"
+		# shellcheck disable=SC2034  # read by the eval'd sweep_results, not by this file
+		RUNS="$WORK/no-such-runs"
+		FIRECODE_RESULT_ROOTS="$root" FIRECODE_RESULT_HOURS=1 sweep_results 2>&1
+	)
+
+	if [[ -d $landed ]]; then
+		no "gc removes a result whose work is on a branch" "$landed survived"
+	else
+		ok "gc removes a result whose work is on a branch"
+	fi
+	if [[ -d $orphan ]]; then
+		ok "gc keeps a result whose work is on no branch"
+	else
+		no "gc keeps a result whose work is on no branch" \
+			"$orphan was the only copy of two commits"
+	fi
+	contains "and names the commits that keep it" "the only copy of this" "$out"
+	contains "and how to land them" "firecode land firecode-20260818-101011-2222" "$out"
+}
+
 test_ro_image_cached() {
 	local project ref out1
 	project=$(make_project)
@@ -965,6 +1031,7 @@ run_test session_import_resumable
 run_test results_come_back
 run_test commits_are_reported_unlanded
 run_test commit_reachability
+run_test gc_keeps_unreachable_work
 run_test no_relays
 run_test concurrent_runs
 run_test ro_image_cached

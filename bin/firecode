@@ -5636,7 +5636,7 @@ sweep_results() {
 	# whose run id names no run this host has a record of. That is either very
 	# old or from another install, and neither is worth guessing about.
 	local hours=${FIRECODE_RESULT_HOURS:-6}
-	local swept=0 dir name proj head repo held target
+	local swept=0 kept=0 kept_report="" unref dir name proj head repo held target
 	# AN ARRAY, because two roots in one quoted string are one path that does not
 	# exist - find then answers nothing and the sweep reports success having
 	# looked at no directory at all. It did exactly that on its first run, and
@@ -5692,7 +5692,26 @@ sweep_results() {
 		local main
 		main=$(main_checkout "$repo")
 		[[ -n $main ]] && repo=$main
-		commit_reachable "$repo" "$head" || continue
+		if ! commit_reachable "$repo" "$head"; then
+			# SAY WHICH, because a silent refusal accumulates. 38 of 103
+			# result directories survived one reclaim on this ground and
+			# nobody could tell from the outside whether a given one was an
+			# abandoned experiment or the last copy of somebody's work - at
+			# roughly 17,000 inodes each, on a tmpfs that hit 100% three times
+			# in twelve hours.
+			#
+			# The walk stops at the first commit that IS on a ref, so the list
+			# is what this directory is the only copy of rather than its whole
+			# history. A person reads it in ten seconds and decides.
+			unref=$(git -C "$dir" log --format='%h %s' -20 2>/dev/null |
+				while read -r sha subject; do
+					commit_reachable "$repo" "$sha" && break
+					printf '      %s %.66s\n' "$sha" "$subject"
+				done || true)
+			kept=$((kept + 1))
+			kept_report+="    $dir  (firecode land firecode-$stamp)"$'\n'"$unref"$'\n'
+			continue
+		fi
 
 		# Dirty means somebody's uncommitted work, except for the one entry the
 		# VM always creates.
@@ -5713,6 +5732,11 @@ sweep_results() {
 	done < <(find "${roots[@]}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 
 	((swept > 0)) && log "removed $swept delivered result director(ies) already in git"
+	if ((kept > 0)); then
+		log "kept $kept result director(ies) holding commits on no branch:"
+		printf '%s' "$kept_report" >&2
+		log "each line names the run that would land it - or remove the directory if it is junk"
+	fi
 	return 0
 }
 
