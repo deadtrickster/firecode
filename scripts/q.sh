@@ -56,9 +56,16 @@ queue)
 			(.items[]? | "req    \(.id[0:10]) \(.status // "-")")'
 	;;
 lock)
-	get "/api/merge-queue" | jq -r 'if (.lock.held // false)
-			then "held by \(.lock.holder_name) for \(.lock.item) until \(.lock.until)"
-			else "free" end'
+	# A LOCK READING IS A CLAIM ABOUT THE PAST, so it says when it was taken.
+	#
+	# Twice on 2026-08-18 somebody waited on a lock that had already been
+	# released, quoting a reading minutes old as if it were current - and both
+	# readings were true when taken. Printing the moment beside the answer makes
+	# a stale quote visible as stale to whoever reads it next, without anybody
+	# having to remember to add it. Remembering is what failed both times.
+	get "/api/merge-queue" | jq -r --arg now "$(date -u +%H:%M:%SZ)" 'if (.lock.held // false)
+			then "held by \(.lock.holder_name) for \(.lock.item) until \(.lock.until)   [read \($now)]"
+			else "free   [read \($now)]" end'
 	;;
 findings)
 	# The three axes and nothing else. The bodies are the bulk of this door and
