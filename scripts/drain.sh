@@ -362,8 +362,23 @@ fi
 # of the first red was destroyed by the second identical red.
 log=$STATE/drain-$row-$tip.log
 say "gating $tip - about 35 minutes, log at $log"
-if (cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH \
-	LD_LIBRARY_PATH=$HOME/.local/pg17-libs ./run-tests.sh >"$log" 2>&1); then
+# FLOWY_AGENT IS UNSET FOR THE SUITE, and this is the drainer changing the
+# meaning of the thing it measures.
+#
+# resolveToken (tui.go:146) checks FLOWY_AGENT BEFORE FLOWY_TOKEN, so a named
+# seat outranks an explicit credential - defensible on its own terms. The
+# drainer exports FLOWY_AGENT because pre-gate needs it to tell its own lock
+# from somebody else's, and the suite then inherited it: every CLI check, even
+# the ones that set FLOWY_TOKEN="$TOKEN_A" themselves, resolved to the
+# orchestrator seat inside a config directory the gate builds fresh and empty.
+#
+# Five checks failed with "peer answered 401: unknown token" on a tree that went
+# 651/0 when its author ran it. Twice, for me, on two different branches - and
+# both times I read the failures as belonging to the diff.
+#
+# pre-gate keeps the variable, the suite does not get it.
+if (cd "$WORK" && env -u FLOWY_AGENT "PATH=$HOME/.local/pg17-bin:$PATH" \
+	"LD_LIBRARY_PATH=$HOME/.local/pg17-libs" ./run-tests.sh >"$log" 2>&1); then
 	outcome=green
 	note=$(grep -E "^passed:" "$log" | tail -1)
 	say "green: $(grep -E '^passed:' "$log" | tail -1)"
