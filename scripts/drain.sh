@@ -138,6 +138,23 @@ code_of() { printf '%s' "$1" | tail -1; }
 body_of() { printf '%s' "$1" | head -n -1; }
 
 # ------------------------------------------------------------ pick one row
+# THE SET IS FRESH BECAUSE THE LOOP IS OUTSIDE THIS SCRIPT, and that is a
+# property worth writing down rather than leaving as luck.
+#
+# One invocation reads the queue once and exits, so every pass sees the rows as
+# they are at the moment it starts. Nothing here caches a row list across
+# passes, and nothing needs to.
+#
+# IF YOU EVER MAKE THIS LOOP INTERNALLY, RE-READ THE QUEUE EACH ITERATION. A
+# loop that freezes its set at start reports about a world that stopped existing
+# when it launched - which is the same defect as a watcher that fixed its row
+# list at boot and reported "no reds on my rows" while two of them were red, and
+# as a brief that told an agent about a window that had closed by the time it
+# acted. Five instances of it in one day, filed as 01M0BFB7WP.
+#
+# The gap between reading and acting is what makes it wrong, and here that gap
+# is thirty-five minutes: the queue read below decides which row a gate spends
+# half an hour on.
 
 queue=$(api GET /api/merge-queue) || die "cannot reach $NODE"
 [ "$(code_of "$queue")" = 200 ] || die "the queue answered $(code_of "$queue")"
