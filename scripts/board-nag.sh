@@ -257,20 +257,14 @@ if [[ ${1:-} == --watch ]]; then
 	# on 2026-08-17 and the operator has asked for terseness three times since.
 	# A long room post costs everybody, so it goes in the nag rather than in
 	# somebody's memory of being told.
-	# CAVEMAN, AS A COMMAND RATHER THAN AN ADJECTIVE.
-	#
-	# "Be terse" has been in this nag since 2026-08-17 and the operator has now
-	# asked seven times, most recently "yeah caveman doesnt survive, i wonder
-	# why". It does not survive because remembering is a step somebody takes
-	# before every message, and the cost of forgetting lands on the reader.
-	#
-	# So the nag stops advising and hands over the thing that refuses: say.sh
-	# rejects anything over six lines and prints the count. A rule you can
-	# forget is a rule; a wrapper that will not send is a mechanism.
-	printf 'SAY IT WITH THIS, NOT WITH flowy say:\n'
-	printf '  %s/scripts/say.sh "one measurement, one decision"\n' "$ROOT"
-	printf 'It REFUSES over six lines. That is the point - three lines is normal, ten is\n'
-	printf 'a report and belongs in the row, where somebody can choose to read it.\n'
+	# TERSENESS IS NOT WHERE THE TOKENS GO, MEASURED 2026-08-18: 174 room messages
+	# were 54k tokens against 200-350k for a single subagent run, so chat was about
+	# 2 percent of a day's spend. The nag used to spend four lines telling people to
+	# be brief; that advice was correct, cheap to follow and irrelevant to the bill.
+	# What actually costs is a wasted gate and a whole payload pulled into context,
+	# so the nag points at those instead.
+	printf 'CHEAPEST WINS: gate ONCE - know the host facts and hold the tip first.\n'
+	printf 'Read fields, not payloads: scripts/q.sh. Wait, do not poll: scripts/run-wait.sh.\n'
 fi
 
 {
@@ -279,9 +273,6 @@ fi
 	printf '%s\n' "$lines"
 	[[ -n $qlines ]] && printf 'merge queue (%d landable):\n%s\n' "$ready" "$qlines"
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
-	# The nag itself must not teach a long room post. It hands over the wrapper
-	# that refuses rather than repeating advice that has been ignored seven times.
-	printf 'Say it with %s/scripts/say.sh - it REFUSES over six lines.\n' "$ROOT"
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
 } >&2
 exit 2

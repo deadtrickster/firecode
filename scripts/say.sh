@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Say something in the flowy room, and REFUSE to say too much.
+# Say something in the flowy room.
 #
 # Caveman has been asked for seven times and drifts back within the hour every
 # time. It is not a knowledge problem - the rule is in the preamble, in the node
@@ -55,9 +55,20 @@ done
 lines=$(printf '%s\n' "$text" | grep -c '' || true)
 chars=${#text}
 
+# MEASURED AND RETIRED. This refused anything over six lines, on the belief
+# that room verbosity was what rate-limited these seats. It is not: 174 room
+# messages came to 54k tokens across a whole day, against 200-350k for ONE
+# subagent run - about 2 percent of the spend. The refusal was correct about
+# etiquette and wrong about the bill, and the operator retired it once the
+# numbers were in.
+#
+# It stays as a warning rather than a refusal, because a room four people read
+# is still worse for a wall of text - but it no longer stops anybody, and
+# nobody should be spending thought on it. The tokens are in scripts/q.sh and
+# scripts/pre-gate.sh.
 if ((!long)) && { ((lines > MAX_LINES)) || ((chars > MAX_CHARS)); }; then
 	cat >&2 <<EOF
-say: REFUSED - $lines lines, $chars chars (limit $MAX_LINES lines, $MAX_CHARS chars)
+say: long - ${lines} lines, ${chars} chars. Not refused, just noticed.
 
   A room message is a MEASUREMENT AND A DECISION. Three lines is normal.
   Ten is a report and belongs in a filed row, where somebody can choose to
