@@ -267,7 +267,11 @@ if [ -z "$row" ]; then
 			outcome=catching-up
 			note="node serving $serving, master is $head"
 			say "the node is serving $serving and master is $head - deploying the difference"
-			if "$REPO/scripts/deploy.sh"; then
+			# The catch-up deploy writes where somebody can read it too, and to
+			# its own file because this path has no row and therefore no pass
+			# log. Same reason as the one after a landing: a deploy whose output
+			# goes to a background shell's stdout is a deploy nobody can check.
+			if "$REPO/scripts/deploy.sh" 2>&1 | tee -a "$STATE/catch-up.log"; then
 				outcome=deployed
 				note="$head (catch-up)"
 				exit 0
@@ -564,7 +568,19 @@ fi
 # So the status carries the state that actually obtains - landed, not deployed -
 # and says why, because "landed but not serving" is the condition row 01M09SKFBQ
 # is entirely about.
-if ! "$REPO/scripts/deploy.sh"; then
+# THE DEPLOY'S OWN OUTPUT GOES IN THE PASS LOG, because the pass is not over
+# when the suite is.
+#
+# orchestrator, measuring the new deploy path from the outside: "the pass log
+# stops before the last thing the pass does". drain-<row>-<tip>.log ended at
+# "passed: 662 failed: 0" and the deploy ran after it, into a session's
+# scrollback - so the one arm nobody could check was whether deploy.sh said it
+# built in a throwaway worktree, which is the line that distinguishes doing the
+# thing from never having done it.
+#
+# tee rather than redirect: the operator watching a foreground pass should still
+# see it, and the log is for whoever reads it tomorrow.
+if ! "$REPO/scripts/deploy.sh" 2>&1 | tee -a "$log"; then
 	outcome=deploy-refused
 	note="landed $landed and the deploy refused - master has moved and the node has not"
 	printf '[drain] the branch LANDED and the deploy did not: %s is on master, the node is serving something older\n' "$landed" >&2
