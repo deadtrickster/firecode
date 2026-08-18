@@ -957,6 +957,26 @@ main_checkout() {
 	echo "${common%/.git}"
 }
 
+# Is this commit on a BRANCH in this repository - not merely in its object
+# store? Those are different questions and git answers them with different
+# commands, which is how three places here came to ask the wrong one.
+#
+# `cat-file -e` says an object exists. A commit made on a detached HEAD, or in
+# a worktree that shares the object store, exists the instant it is written and
+# is reachable from no ref at all. Both of the things this file uses the answer
+# for - "the result directory is redundant, reap it" and "your work is already
+# in the project, stay quiet" - mean REACHABLE, and got existence.
+#
+# Measured 2026-08-18 on a scratch repo: one commit on master and one on a
+# detached HEAD. `cat-file -e` returned 0 for both. `for-each-ref --contains`
+# returned master for the first and nothing for the second.
+commit_reachable() {
+	local repo=$1 sha=$2 refs
+	git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null || return 1
+	refs=$(git -C "$repo" for-each-ref --contains "$sha" --count=1 2>/dev/null || true)
+	[[ -n $refs ]]
+}
+
 # An empty ext4 for one overlay layer. Sparse, so it costs what it holds.
 ensure_layer() {
 	local slug=$1
@@ -5266,14 +5286,14 @@ report_unlanded_commits() {
 	head_sha=$(git -C "$out_dir" rev-parse --short HEAD 2>/dev/null || true)
 	[[ -n $head_sha ]] || return 0
 	# Already in the project - the usual case, and it stays quiet.
-	git -C "$WORKDIR" cat-file -e "${head_sha}^{commit}" 2>/dev/null && return 0
+	commit_reachable "$WORKDIR" "$head_sha" && return 0
 
 	# Walk back until the histories meet. The bound is because an unrelated
 	# tree - a fresh clone, a different project - would otherwise print its
 	# whole history at somebody who just wanted to know if their work landed.
 	missing=$(git -C "$out_dir" log --format='%h %s' -20 2>/dev/null |
 		while read -r sha subject; do
-			git -C "$WORKDIR" cat-file -e "${sha}^{commit}" 2>/dev/null && break
+			commit_reachable "$WORKDIR" "$sha" && break
 			printf '  %s %.68s\n' "$sha" "$subject"
 		done || true)
 	[[ -n $missing ]] || return 0
@@ -5672,7 +5692,7 @@ sweep_results() {
 		local main
 		main=$(main_checkout "$repo")
 		[[ -n $main ]] && repo=$main
-		git -C "$repo" cat-file -e "$head" 2>/dev/null || continue
+		commit_reachable "$repo" "$head" || continue
 
 		# Dirty means somebody's uncommitted work, except for the one entry the
 		# VM always creates.

@@ -352,6 +352,51 @@ test_commits_are_reported_unlanded() {
 	[[ -n $result ]] && rm -rf "$result"
 }
 
+# Existence is not reachability, and this asserts the DIFFERENCE rather than an
+# absolute: a single reading cannot tell a rule being enforced from a rule that
+# was never implemented. Two commits in one repository, identical in every way
+# except that one is on a branch and the other is not, must get opposite
+# answers. `cat-file -e` - what firecode used to ask in three places - answers
+# yes to both, so this test goes red against that version.
+test_commit_reachability() {
+	local repo reachable detached fn
+	repo="$WORK/reach"
+	git init -q "$repo"
+	git -C "$repo" config user.email t@example.com
+	git -C "$repo" config user.name t
+	git -C "$repo" config commit.gpgsign false
+	echo one >"$repo/f"
+	git -C "$repo" add f
+	git -C "$repo" commit -qm one
+	reachable=$(git -C "$repo" rev-parse HEAD)
+	git -C "$repo" checkout -q --detach
+	echo two >"$repo/f"
+	git -C "$repo" commit -qam two
+	detached=$(git -C "$repo" rev-parse HEAD)
+
+	# The function comes out of the script itself rather than being restated
+	# here. A local copy would keep passing while firecode's own answer went
+	# wrong, which is the whole failure this is meant to catch.
+	fn=$(sed -n '/^commit_reachable() {$/,/^}$/p' "$FIRECODE")
+	if [[ -z $fn ]]; then
+		no "commit_reachable can be read out of firecode" "not found in $FIRECODE"
+		return
+	fi
+	eval "$fn"
+
+	if commit_reachable "$repo" "$reachable"; then
+		ok "a commit on a branch is reachable"
+	else
+		no "a commit on a branch is reachable" "$reachable is on master"
+	fi
+	if commit_reachable "$repo" "$detached"; then
+		no "a detached-HEAD commit is not reachable" \
+			"$detached is on no ref, but the check said it was"
+	else
+		ok "a detached-HEAD commit is not reachable"
+	fi
+}
+
 test_ro_image_cached() {
 	local project ref out1
 	project=$(make_project)
@@ -919,6 +964,7 @@ run_test state_persists
 run_test session_import_resumable
 run_test results_come_back
 run_test commits_are_reported_unlanded
+run_test commit_reachability
 run_test no_relays
 run_test concurrent_runs
 run_test ro_image_cached
