@@ -206,6 +206,11 @@ FLOWY_BIN=${FLOWY_BIN:-$(command -v flowy 2>/dev/null)}
 FLOWY_NAME=""
 FLOWY_DELIVERY=""
 FLOWY_REASON=""
+# Whether the NODE says this session's flowy reader is attached. It gates the
+# host-local nag below: an agent whose doorbell is a flowy waiter should not be
+# told the firecode room is unheard, because the sentence reads as a claim
+# about the room they actually use.
+FLOWY_ATTACHED=0
 
 # WHICH NAME IS THIS SESSION, and silence beats a guess.
 #
@@ -288,6 +293,7 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			'[(.listeners // [])[] | select(.reader == $me and .attached)] | length' \
 			<<<"$flowy_presence" 2>/dev/null) || flowy_listeners=0
 		[[ $flowy_listeners =~ ^[0-9]+$ ]] || flowy_listeners=0
+		((flowy_listeners > 0)) && FLOWY_ATTACHED=1
 	fi
 
 	flowy_events=""
@@ -492,6 +498,7 @@ FIRECODE_HOOK_MARK="$MARK" FIRECODE_HOOK_SELF="$NAME" FIRECODE_HOOK_MODE="$MODE"
 	FIRECODE_HOOK_WAITER="$WAITER" FIRECODE_HOOK_WAITER_NAME="$WAITER_NAME" \
 	FIRECODE_HOOK_WAITER_COUNT="$WAITER_COUNT" \
 	FIRECODE_HOOK_FLOWY_REASON="$FLOWY_REASON" \
+	FIRECODE_HOOK_FLOWY_ATTACHED="$FLOWY_ATTACHED" \
 	FIRECODE_HOOK_QUIET="$CHAT_QUIET" \
 	python3 -c '
 import json, os, sys, time
@@ -572,10 +579,25 @@ if mode == "stop" and waiter_name and waiter_count > 1:
         "Arming one per reminder across a long session is how it happens: a "
         "waiter armed during a quiet spell is still blocking, not exited."
         % (waiter_count, waiter_name, waiter_name))
-elif mode == "stop" and waiter_name and not waiter:
+elif mode == "stop" and waiter_name and not waiter and not os.environ.get(
+        "FIRECODE_HOOK_FLOWY_ATTACHED") == "1":
+    # THE FIRECODE ROOM ONLY, and it says so now.
+    #
+    # This nag is about `firecode chat`, the host-local room. An agent whose
+    # listener is a flowy waiter has one attached and reads "nothing is
+    # listening for you" as a claim about the room they actually use - the
+    # orchestrator hit exactly that while `flowy inbox --as orchestrator` was
+    # running and presence said attached seconds earlier.
+    #
+    # So: when the node reports this this session flowy reader attached, the
+    # host-local nag stays quiet. An agent who lives in the flowy room will not
+    # need a second doorbell for a room nobody is talking in, and a nag that is
+    # right about a room the reader will not use is indistinguishable from a
+    # nag that is wrong.
     rearm = (
-        "\n\nNothing is listening for you while you are idle. Start the "
-        "waiter before you stop:\n"
+        "\n\nNothing is listening to the FIRECODE room (host-local chat) while "
+        "you are idle. This is not the flowy room. Start the waiter before you "
+        "stop:\n"
         "  firecode chat --inbox --as %s\n"
         "IN THE BACKGROUND, which in claude code means the Bash tool with "
         "run_in_background: true, and in a plain shell means a trailing &. "
