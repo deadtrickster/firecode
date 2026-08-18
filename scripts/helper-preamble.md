@@ -144,3 +144,27 @@ looked finished, so nobody opened them again.
 A flow written first has to say what the button DOES, which is the question a
 dead button never got asked. A flow written afterwards describes whatever the
 component happens to do, including nothing.
+
+## Never read an exit code as a verdict
+
+A pipeline exits with its LAST stage's status. `./run-tests.sh 2>&1 | tail -20`
+exits 0 whatever the suite did, because that is tail's status. So when you gate:
+
+```
+bash -c ./run-tests.sh          # bare, or put `set -o pipefail;` in front
+```
+
+and read the suite's own summary line - `passed: N failed: M` - not
+`runs/<id>/exit-status`.
+
+Three instances of this landed in one day. One recorded `passed: 624 failed: 2`
+alongside `exit-status: 0`, in a harness where that status is what everybody
+reads as the gate verdict; `tsc | head -8 && echo TSC_CLEAN` printed CLEAN over
+three type errors; and a watcher that exited instantly reported success through
+`| tail`. A gate that cannot go red is worse than no gate, because it is a green
+light nobody rechecks.
+
+Do not tail the output of something whose failure you need to name, either - the
+FAIL lines are the part you need, and a run that cut them cannot tell you what
+broke. firecode `9508b54` prints a note when a run's command was a shell `-c`
+containing a pipe, but only for runs started after it.
