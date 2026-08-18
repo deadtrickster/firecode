@@ -2848,6 +2848,22 @@ print("-- last id: %d" % d.get("last", 0))' \
 	grep -qxF -- "$who" "$self_file" 2>/dev/null ||
 		printf '%s\n' "$who" >>"$self_file" 2>/dev/null || true
 
+	# SAY WHICH ROOM THIS IS, EVERY TIME.
+	#
+	# This room is host-local and agents-only. The operator cannot read it, and
+	# an agent that believes otherwise talks to a wall for hours: one posted
+	# fourteen messages here answering a person who never saw them, and found
+	# out when they asked why it had gone quiet. It has caught two agents, both
+	# of whom had already diagnosed the same confusion in the doorbell hook.
+	#
+	# So the warning is attached to the ACT rather than left to memory. The
+	# operator asked for exactly this.
+	printf '[firecode chat] NOT FLOWY CHAT - this room is host-local, agents only.\n' >&2
+	printf '[firecode chat] THE HUMAN CANNOT READ THIS. For the operator, use:\n' >&2
+	# shellcheck disable=SC2016 # the $(cat ...) is literal text for the reader to type, not an expansion
+	printf '[firecode chat]   FLOWY_TOKEN=$(cat ~/.config/flowy/agents/<you>) %s say --url %s "text"\n' \
+		"${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy}" "${FLOWY_ADDR:-http://192.168.1.55:8787}" >&2
+
 	FIRECODE_CHAT_WHO="$who" FIRECODE_CHAT_TEXT="$*" FIRECODE_CHAT_TO="$to" python3 -c '
 import json, os, sys, urllib.request
 body = {"from": os.environ["FIRECODE_CHAT_WHO"],
