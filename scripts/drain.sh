@@ -213,9 +213,31 @@ verdict=$(api POST "/api/merge/$row/gate" "$(printf '{"run":"%s","gated_tip":"%s
 }
 say "verdict recorded, gated_tip $tip"
 
+# LAND WHERE THE TARGET IS, AND PROVE IT MOVED.
+#
+# flowy-claude hit this by hand minutes after this script was written: they ran
+# the fast-forward INSIDE THE WORKTREE, where HEAD is already the branch, so git
+# answered "Already up to date", the land verb recorded a landing, and master
+# had not moved. The land guard then refused their next attempt, correctly, for
+# a lock nobody held - the queue and the repository disagreeing about what had
+# happened.
+#
+# $REPO is the shared checkout and should be on the target, but "should be" is
+# what that failure was made of. So: refuse if it is not, and afterwards require
+# the target to have actually become the tip that was gated. A no-op merge
+# passes the first check and fails the second.
+on=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+[ "$on" = "$rowtarget" ] ||
+	die "$REPO is on $on, not $rowtarget - a fast-forward there lands nothing and reports success"
+before=$(git -C "$REPO" rev-parse --short HEAD)
+
 FLOWY_TOKEN="$TOKEN" git -C "$REPO" merge --ff-only "$branch" >/dev/null ||
 	die "the fast-forward refused - the land guard or a moved target"
 landed=$(git -C "$REPO" rev-parse --short HEAD)
+[ "$landed" != "$before" ] ||
+	die "$rowtarget is still $before after the merge - nothing landed, and recording one would tell the queue something that did not happen"
+git -C "$REPO" merge-base --is-ancestor "$tip" HEAD ||
+	die "$rowtarget is $landed and does not contain the gated tip $tip"
 land=$(api POST "/api/merge/$row/land" "$(printf '{"sha":"%s"}' "$landed")")
 [ "$(code_of "$land")" = 200 ] || {
 	body_of "$land" >&2
