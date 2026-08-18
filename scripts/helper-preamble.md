@@ -252,3 +252,24 @@ commit. What you must not do is attach to the operator's.
 
 Record what each run actually connected to, in the row, so it is on the record
 rather than in your memory of it.
+
+## Assert a difference, not an absolute
+
+A check that takes ONE reading cannot tell a rule being enforced from the rule
+not existing. Run the same query twice, varying only the thing under test, and
+assert the two answers differ.
+
+This is not theoretical. A security check in flowy's suite sent
+`GET /api/dm?since=0&scope=all`, expected 200, and asserted that the operator
+cannot read somebody else's private log through the escape hatch. It passed
+because the door ignored `scope` entirely - "honoured it and found nothing" and
+"never looked" are the same 200. The property was never proven.
+
+The correct shape was already in the same file, two thousand lines above: two
+`/api/artifacts` calls where a plain token gets nothing under `scope=all` and
+the operator gets everything. Same query, two arms, different answers.
+
+It applies past tests. A filter proved by `?tag=ragflow` returning 16 also needs
+`?tag=nonesuch` returning 0, or "it filtered" and "it returned a fixed subset"
+look identical. Before you write the check, name the two arms; if you can only
+think of one reading, it will pass on a system that does not implement the rule.
