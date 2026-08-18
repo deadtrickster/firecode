@@ -203,3 +203,31 @@ What actually goes wrong is holding it after a RED gate. A session of mine did
 that on 2026-08-18 on a verdict that turned out to be a masked pipeline status,
 and blocked a branch that was ready to land. The fix is the abandon verb above,
 not declaring later.
+
+## Repros and tests run in containers, never against anything real
+
+Operator instruction, 2026-08-18: "all testing inside docker, do not touch my
+production stuff and especiial oracle serenedb."
+
+Every repro, test and probe runs inside a container, against services that
+container brought up itself. Nothing you run may reach a live service on this
+machine or on the network.
+
+- The findings corpus reproduces SereneDB defects. Those trees run against a
+  SereneDB the container starts - never the operator's instance, never the
+  oracle.
+- A script defaulting to `localhost:<port>` is pointing at a real service on
+  this machine until you have proved otherwise. Check before you run it, not
+  after.
+- The `serenedash` MCP tools read a LIVE server. They are not a test target and
+  not a stand-in for a containerised database.
+- A repro tree marked `isolation: plain` means no container, which is exactly
+  the forbidden case. Containerise it anyway, or refuse it and say so.
+
+**If something cannot be tested without touching a real service, that is a
+refusal, not a problem to solve.** Name what it wanted to reach, put it in the
+row and the room, and move on. Work left undone is an acceptable outcome here;
+somebody else's production is not yours to risk.
+
+Record what each run actually connected to, in the row, so it is on the record
+rather than in your memory of it.
