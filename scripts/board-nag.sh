@@ -126,6 +126,40 @@ mine=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done"
 free=$(jq -r '[.artifacts[]? | select((.status // "") != "done") |
 	select(((.fields.assignee // "") | length) == 0)] | length' <<<"$board" 2>/dev/null) || exit 0
 
+# ACTIVE IS A CLAIM, NOT AN OBSERVATION.
+#
+# The operator, 2026-08-18: "you did it only after i poked you. so the active
+# status is misleading". They were right, and it is a defect rather than a
+# comment on one agent: `active` is written once when a row is claimed and
+# nothing checks it again. Three rows sat active overnight, last touched at
+# 15:41 the previous afternoon.
+#
+# The clock already existed - every row carries `updated` - and nothing read it.
+# So this is not new instrumentation, it is a field the board had and never
+# showed, the same shape as free_port() sitting unused beside two hardcoded
+# ports.
+#
+# WHAT THIS CAN AND CANNOT SAY. It sees writes. A session forty minutes into a
+# gate with nothing to record looks exactly like an abandoned claim, so the
+# wording states what was observed - nothing has touched this row - and never
+# the inference, that nobody is working it. The nag is really a symptom
+# detector for a habit gap: working on something should leave a trace, and the
+# fix is a note on the row when a long run starts rather than a cleverer guess
+# here.
+#
+# `updated` moves on ANY write, so a rename reads as work. orchestrator is
+# adding started/last_worked to separate the claim from the evidence; until
+# those land this uses `updated`, which is why the threshold is generous.
+stale_mins=${BOARD_STALE_MINS:-20}
+stale=$(jq -r --arg me "$name" --argjson mins "$stale_mins" '
+	(now - ($mins * 60)) as $cut
+	| [.artifacts[]?
+		| select((.status // "") == "active")
+		| select((.fields.assignee // "") == $me)
+		| select(((.updated // "") | length) > 0)
+		| select((.updated | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0) < $cut)]
+	| length' <<<"$board" 2>/dev/null || echo 0)
+[[ $stale =~ ^[0-9]+$ ]] || stale=0
 [[ $mine =~ ^[0-9]+$ && $free =~ ^[0-9]+$ ]] || exit 0
 [[ ${ready:-0} =~ ^[0-9]+$ ]] || ready=0
 # A landable branch counts on its own. An empty board with a green row waiting
@@ -272,6 +306,13 @@ fi
 		"$mine" "$name" "$free" "$slots"
 	printf '%s\n' "$lines"
 	[[ -n $qlines ]] && printf 'merge queue (%d landable):\n%s\n' "$ready" "$qlines"
+	# The stale line reports WHAT WAS SEEN, never what it means. A session forty
+	# minutes into a gate and an abandoned claim are the same row from here.
+	if ((stale > 0)); then
+		printf '%d of your active row(s) have had no write for over %d minutes - which says nothing about\n' "$stale" "$stale_mins"
+		printf 'whether somebody is working them. If one is yours and running, leave a note on it; if it is\n'
+		printf 'not, hand it back. A claim nobody can see progress on reads as abandoned to everybody else.\n'
+	fi
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
 } >&2
