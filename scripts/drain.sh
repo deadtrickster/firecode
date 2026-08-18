@@ -232,27 +232,6 @@ fi
 
 # ------------------------------------------------------------ declare first
 
-# A RED THIS DRAINER HAS ALREADY SEEN IS NOT TAKEN AGAIN.
-#
-# The script never retried; a LOOP around it did - claude-host ran --once every
-# sixty seconds and it re-took a red row every minute. My fault rather than the
-# loop's: on red this records nothing, so the queue cannot tell a row nobody has
-# gated from one that just failed, and every caller takes it again forever.
-#
-# The real fix is a queue that can say GATED AND FAILED. It cannot today:
-# gated_tip means "this is the evidence" and MergeAdmissible compares base to
-# tip without asking pass or fail, so recording a red verdict would make the row
-# look LANDABLE. Filed separately; this is what stops the bleeding meanwhile.
-#
-# Keyed by TIP as well as row, so a rebase or a fix is taken immediately - what
-# is refused is repeating a measurement of a tree already measured, which is the
-# rule the whole fleet agreed on this afternoon.
-if [ -f "$STATE/red-$row-$tip" ]; then
-	say "$row at $tip already gated red - $(cat "$STATE/red-$row-$tip")"
-	say "push a fix or rebase; a second run of the same tree measures the same tree"
-	exit 0
-fi
-
 run="drain-$(date -u +%Y%m%dT%H%M%SZ)"
 declared=$(api POST "/api/merge/$row/gate" "$(printf '{"run":"%s"}' "$run")")
 case "$(code_of "$declared")" in
@@ -332,6 +311,32 @@ git -C "$WORK" rebase -q "$rowtarget" ||
 
 tip=$(git -C "$WORK" rev-parse --short HEAD)
 say "rebased onto $rowtarget, tip $tip"
+
+# A RED THIS DRAINER HAS ALREADY SEEN IS NOT TAKEN AGAIN.
+#
+# The script never retried; a LOOP around it did - claude-host ran --once every
+# sixty seconds and it re-took a red row every minute. My fault rather than the
+# loop's: on red this records nothing, so the queue cannot tell a row nobody has
+# gated from one that just failed, and every caller takes it again forever.
+#
+# HERE RATHER THAN BEFORE THE DECLARE, because the tip is what identifies the
+# tree and the tip is not known until the rebase. The first cut asked this next
+# to the declare and died on "tip: unbound variable" - a check about a value
+# placed above the line that computes it.
+#
+# The real fix is a queue that can say GATED AND FAILED. It cannot today:
+# gated_tip means "this is the evidence" and MergeAdmissible compares base to
+# tip without asking pass or fail, so recording a red verdict would make the row
+# look LANDABLE. Filed separately; this is what stops the bleeding meanwhile.
+#
+# Keyed by TIP as well as row, so a rebase or a fix is taken immediately - what
+# is refused is repeating a measurement of a tree already measured, which is the
+# rule the whole fleet agreed on this afternoon.
+if [ -f "$STATE/red-$row-$tip" ]; then
+	say "$row at $tip already gated red - $(cat "$STATE/red-$row-$tip")"
+	say "push a fix or rebase; a second run of the same tree measures the same tree"
+	exit 0
+fi
 
 # ------------------------------------------------------------ worth gating
 
