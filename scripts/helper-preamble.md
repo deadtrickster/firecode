@@ -273,3 +273,67 @@ It applies past tests. A filter proved by `?tag=ragflow` returning 16 also needs
 `?tag=nonesuch` returning 0, or "it filtered" and "it returned a fixed subset"
 look identical. Before you write the check, name the two arms; if you can only
 think of one reading, it will pass on a system that does not implement the rule.
+
+## A declaration freezes the BRANCH as well as the base
+
+Once a merge row is declared, its branch is frozen until it lands or the
+declaration is abandoned. No rebase, no cherry-pick, no amend - not even a
+better version of the same change.
+
+I had this half right all day: I thought of a declaration as protecting the
+TARGET from moving under a run. It does, and it also freezes the thing being
+measured. Both ends of the comparison have to hold still or the verdict
+describes neither.
+
+Measured on 2026-08-18: the drainer declared row `01M0B43936` at 19:09:49Z and
+began measuring `feat/diagram-theme`. Minutes later I rebased that branch onto a
+newer master and cherry-picked another commit onto it, batching work. The gate
+was then measuring a tree that no longer existed. Nothing false was recorded
+only because `gated_tip` was still empty when it was noticed.
+
+So: batch BEFORE filing, not after declaring. `scripts/q.sh queue` shows
+`gate_run` per row - if a row has one, that branch is somebody's measurement.
+If you must change it, abandon first and say why:
+
+```
+POST $FLOWY_ADDR/api/merge/<id>/abandon  {"reason": "rebasing to batch"}
+```
+
+## A symlinked node_modules makes somebody else delete your files
+
+A worktree gets its OWN `node_modules` - `cd web && npm ci`, about 40 seconds.
+Never a symlink at another checkout's.
+
+`npm ci` deletes `node_modules` before recreating it. Through a symlink it
+resolves the link first, so it empties the TARGET - another tree - and leaves a
+real directory behind in the worktree that ran it. The damage lands somewhere
+nobody is looking.
+
+It bit this fleet twice in one day. orchestrator shipped eight such links in the
+morning and removed them at 15:35; I made three more in the evening, and at
+21:47 `scripts/deploy.sh` refused with `tsc: not found` because the shared
+`web/node_modules` had zero entries. The deploy was right to refuse and the
+cause was hours old and in a different directory.
+
+Check for the shape before blaming the build:
+
+```
+for w in ~/Projects/flowy-*; do p=$w/web/node_modules; \
+  [ -L "$p" ] && echo "$w -> $(readlink "$p")"; done
+```
+
+## One suite per machine
+
+The gate stands up its own Postgres and its own node, and picks ports by asking
+what is free AT THAT INSTANT. Two suites on one box therefore race for the same
+port, and the loser talks to the winner's node: that shows as red when the
+borrowed node refuses you, and as GREEN when it happens to answer the way you
+expected. Four of tonight's numbers carry that asterisk.
+
+Before starting a gate, ask whether one is running - anchored to the exact argv,
+because `pgrep -f 'run-tests.sh'` matches your own shell and answers "yes,
+somebody is running one" when nobody is:
+
+```
+ps -eo args= | grep -c '^bash \./run-tests\.sh$'
+```
