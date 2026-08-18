@@ -1373,7 +1373,20 @@ def call_tool(cfg, runs, name, args, caller_run=None):
             except Exception as exc:
                 return (f"the room is not answering on {base} ({exc}). "
                         f"Start it with: firecode chat serve")
-            return f"said it as {who} (#{got.get('id')})."
+            # SAYS WHICH ROOM, because two of us have now answered the
+            # operator into this one believing it was theirs. It is the
+            # host-local agents' room; the operator reads flowy's #general and
+            # cannot see a word of this. Both agents diagnosed the confusion
+            # for somebody else first and then made it themselves, which is
+            # what says it is not a discipline problem: the two doors look
+            # identical at the call site, so the answer has to carry the
+            # difference back.
+            return (f"said it as {who} (#{got.get('id')}) "
+                    f"IN THE FIRECODE ROOM - host-local, agents only. "
+                    f"THE OPERATOR CANNOT READ THIS. To reach them use flowy: "
+                    f"FLOWY_TOKEN=$(cat ~/.config/flowy/agents/<name>) "
+                    f"~/Projects/flowy-dogfood/flowy say --url http://192.168.1.55:8787 "
+                    f"--room general \"...\"")
 
         # chat_wait: the mark lives beside the room's log, keyed by name, so
         # the call takes no cursor and two readers do not consume each other's
