@@ -366,8 +366,28 @@ else
 		die "cannot create the drain worktree at $WORK"
 fi
 git -C "$WORK" fetch -q 2>/dev/null || true
-git -C "$WORK" rebase -q "$rowtarget" ||
+# A REFUSAL THAT LEAVES A MESS IS WORSE THAN THE REFUSAL.
+#
+# `git rebase` that hits a conflict does not stop cleanly: it leaves the
+# worktree mid-rebase with conflict markers in the files AND the branch still
+# checked out here. So the row this drainer just gave up on became a row it had
+# PINNED - the next pass skipped it saying "checked out in wt-drain", and its
+# owner found a half-finished rebase in a directory they do not use.
+#
+# Measured on 2026-08-19 by orchestrator, on the ordering fix: aborted the
+# rebase, detached the worktree, rebased by hand. The drainer had made the row
+# unavailable to everyone including itself.
+#
+# So the failure path puts the worktree back the way it found it: abort the
+# rebase, detach the branch, and only then refuse. `blocked` says why, since a
+# conflict is a fact somebody has to act on and this is the one failure the
+# drainer cannot fix and the author always can.
+if ! git -C "$WORK" rebase -q "$rowtarget"; then
+	git -C "$WORK" rebase --abort >/dev/null 2>&1 || true
+	git -C "$WORK" checkout -q --detach >/dev/null 2>&1 || true
+	blocked "$row" "$branch does not rebase onto $rowtarget cleanly - a person resolves this"
 	die "$branch does not rebase onto $rowtarget cleanly - a person resolves this"
+fi
 
 tip=$(git -C "$WORK" rev-parse --short HEAD)
 say "rebased onto $rowtarget, tip $tip"
