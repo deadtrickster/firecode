@@ -59,6 +59,20 @@ missing from the brief.
 
    So the rule is not "be told what everybody is doing", which cannot work for
    a process that cannot receive. It is **ask at the moment of acting**.
+
+   This applies to identifiers as much as to windows. On 2026-08-18 all 40
+   findings were re-filed into their real projects, which is withdraw plus
+   create, so every finding id minted that morning became a 410 and a different
+   row took its place. Two pieces of work met that. One had captured ids into a
+   script and broke, and needed a hand-written 40-row map to repair. The other
+   named no id anywhere: it asked the list door and joined on the document
+   title, so re-running it produced an identical plan carrying the new ids and
+   needed no repair at all.
+
+   **Resolve at the moment of acting and a churn is not an event.** Write down
+   what a thing IS - its title, its branch, its content - and look up the id
+   when you need it. An id you wrote down earlier is a claim about the past, in
+   exactly the way a window you were told about is.
    Anything you must respect has to be queryable when you act, never pushed at
    you beforehand.
 
