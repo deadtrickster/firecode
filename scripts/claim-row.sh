@@ -152,7 +152,11 @@ if ((release)); then
 fi
 
 if [[ -n $holder && $holder != "$name" ]]; then
-	((steal)) || die "row $row is already held by $holder - do not spawn. --steal to take it anyway" 3
+	# The holder is QUOTED. A row raised in the console comes back with the
+	# assignee "me" - the operator's own word for themselves - and the message
+	# then read "row X is already held by me", which a helper reads as "you
+	# already have it" and skips. It means a party literally named me.
+	((steal)) || die "row $row is already held by '$holder' - do not spawn. --steal to take it anyway" 3
 	printf 'claim-row: taking %s from %s (--steal)\n' "$row" "$holder" >&2
 fi
 
