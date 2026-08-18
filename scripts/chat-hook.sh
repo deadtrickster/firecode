@@ -245,6 +245,28 @@ if [[ -z $FLOWY_NAME && ${#flowy_candidates[@]} -eq 1 ]]; then
 	remember_name "$FLOWY_NAME"
 fi
 
+# AND A MEMO IS NOT PROOF EITHER, once a directory has held more than one seat.
+#
+# A session id is remembered against a name, but a memo written from a lucky
+# guess is a guess with a file behind it. On 2026-08-18 this hook told the
+# orchestrator - twice - to start a waiter AS FLOWY-CLAUDE. An agent that
+# complies seizes another agent's reader: it consumes their messages, advances
+# their cursor and wakes nobody, which is precisely the deafness the nag exists
+# to prevent. The hook would have manufactured the fault it is here to catch.
+#
+# So a name only survives into the ARM INSTRUCTION when this machine holds its
+# token AND either this session proved it with a live waiter or the name is the
+# only candidate here. Otherwise the hook still delivers messages and still
+# says the room is unheard - it just refuses to name anybody.
+FLOWY_NAME_PROVED=0
+if [[ -n $FLOWY_NAME ]]; then
+	if waiter_pid_for "$FLOWY_NAME" >/dev/null 2>&1; then
+		FLOWY_NAME_PROVED=1
+	elif [[ ${#flowy_candidates[@]} -eq 1 ]]; then
+		FLOWY_NAME_PROVED=1
+	fi
+fi
+
 if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	flowy_token=$(cat "$FLOWY_AGENTS/$FLOWY_NAME" 2>/dev/null) || flowy_token=""
 	flowy_payload=""
@@ -369,8 +391,15 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			#
 			# A loop has no re-arm step to get wrong, and it is what the fleet
 			# converged on: one process, every delivery a notification.
-			FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start ONE PERSISTENT LOOP as a background command and never arm a second:\n  while true; do FLOWY_TOKEN=$(cat %s/%s) %s inbox --as %s --url %s --deadline 240; sleep 3; done\nEach delivery arrives as a notification and the loop keeps listening - there is no re-arm step to forget. ONE WAITER PER NAME: arming a tracked waiter over the forked successor a delivery left behind KILLS that successor, so an arm-every-time habit shoots its own listener.' \
-				"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_BIN" "$FLOWY_NAME" "$FLOWY_ADDR")
+			if ((FLOWY_NAME_PROVED)); then
+				FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start ONE PERSISTENT LOOP as a background command and never arm a second:\n  while true; do FLOWY_TOKEN=$(cat %s/%s) %s inbox --as %s --url %s --deadline 240; sleep 3; done\nEach delivery arrives as a notification and the loop keeps listening - there is no re-arm step to forget. ONE WAITER PER NAME: arming a tracked waiter over the forked successor a delivery left behind KILLS that successor, so an arm-every-time habit shoots its own listener.' \
+					"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_BIN" "$FLOWY_NAME" "$FLOWY_ADDR")
+			else
+				# Unproved name, so no command and no name. Arming as somebody
+				# else takes over their reader and wakes nobody.
+				FLOWY_REASON=$(printf 'No listener is attached for the name this hook believes you are (%s), but it cannot PROVE that is you - this directory has held more than one seat and no waiter of yours is running.\nStart your own listener under YOUR OWN name, and do not use the name above unless it is yours:\n  while true; do FLOWY_TOKEN=$(cat %s/<you>) %s inbox --as <you> --url %s --deadline 240; sleep 3; done\nArming under another agent name consumes their messages and advances their cursor, which is the deafness this nag exists to prevent.' \
+					"$FLOWY_NAME" "$FLOWY_AGENTS" "$FLOWY_BIN" "$FLOWY_ADDR")
+			fi
 		elif ((flowy_listeners > 1)); then
 			FLOWY_REASON=$(printf '%d listeners are running as %s on flowy. They share one server-side cursor, so the wake-ups split between them and the one you are tracking may never return. Keep one:\n  pkill -f "flowy inbox --as %s"   # then arm exactly one' \
 				"$flowy_listeners" "$FLOWY_NAME" "$FLOWY_NAME")
@@ -648,7 +677,7 @@ if mode == "session-start":
     print("Other agents AND THE PEOPLE share a room, and you are in it. "
           "Say something with: "
           "FLOWY_TOKEN=$(cat ~/.config/flowy/agents/<name>) "
-          "~/Projects/flowy-dogfood/flowy-next say "
+          "~/Projects/flowy-dogfood/flowy say "
           "--url http://192.168.1.55:8787 \"text\" "
           "(the token IS the identity - `say` has no --as). "
           "That is where the humans read. `firecode chat --as <name>` reaches "
