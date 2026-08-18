@@ -75,8 +75,21 @@ cutoff=$(date -u -d "-$MINUTES minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || cuto
 spool="${XDG_RUNTIME_DIR:-$HOME/.cache}/flowy/inbox-spool-$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-').jsonl"
 declared=""
 if [[ -r $spool && -n $cutoff ]]; then
-	declared=$(tail -n 200 "$spool" 2>/dev/null | jq -r --arg me "$NAME" --arg cut "$cutoff" '
-		select(type == "object")
+	# A WINDOW CAN BE CLOSED, AND THE CLOSE IS THE SAME KIND OF MESSAGE AS THE
+	# OPEN. The first version only looked for declarations, so a speaker who
+	# declared and then LANDED still read as holding the tip for fifteen
+	# minutes - it held the window against everybody for the whole of the time
+	# after it had actually been released. A hold that outlives its holder is
+	# the stale-gating field one level up, and it is the reason nobody trusts
+	# that field.
+	#
+	# So each speaker is folded to their LAST word: whoever declared and then
+	# said they landed, reported, released or stood down is not holding
+	# anything. slurped rather than streamed, because that fold needs every
+	# message from a speaker at once.
+	declared=$(tail -n 200 "$spool" 2>/dev/null | jq -rs --arg me "$NAME" --arg cut "$cutoff" '
+		[ .[]
+		| select(type == "object")
 		| select((.created // "") > $cut)
 		| select((.meta.actor_name // "") != $me)
 		# AN ACT, NOT A TOPIC. The first version matched any message CONTAINING
@@ -89,11 +102,19 @@ if [[ -r $spool && -n $cutoff ]]; then
 		# So: the message must OPEN with a declaration, or contain an explicit
 		# hold on landing. A sentence about somebody else declaring does not
 		# count, and neither does a report that a gate finished.
-		| select((.body // "")
-			| test("(^|\\n)\\s*(\\w[\\w-]*:\\s*)?(DECLARING|TAKING THE WINDOW|GATE DECLARED)\\b"; "i")
-			  or test("nobody (ff|land|lands)|no ff until|hold(ing)? (master|the tip)"; "i"))
-		| "  \(.meta.actor_name // "?"): \((.body // "") | gsub("\n"; " ") | .[0:110])"' 2>/dev/null |
-		tail -4) || declared=""
+		| . as $m
+		| ((.body // "")
+			| if test("(^|\\n)\\s*(\\w[\\w-]*:\\s*)?(LANDED|RELEASED)\\b"; "i")
+			     or test("window released|standing down|hold released|master (is )?now [0-9a-f]{7}"; "i")
+			  then "close"
+			  elif test("(^|\\n)\\s*(\\w[\\w-]*:\\s*)?(DECLARING|TAKING THE WINDOW|GATE DECLARED)\\b"; "i")
+			     or test("nobody (ff|land|lands)|no ff until|hold(ing)? (master|the tip)"; "i")
+			  then "open"
+			  else "" end) as $kind
+		| select($kind != "")
+		| {who: ($m.meta.actor_name // "?"), kind: $kind,
+		   line: "  \($m.meta.actor_name // "?"): \(($m.body // "") | gsub("\n"; " ") | .[0:110])"} ]
+		| group_by(.who) | map(last) | map(select(.kind == "open") | .line) | .[-4:] | join("\n")' 2>/dev/null) || declared=""
 fi
 
 if [[ -z ${gating//[[:space:]]/} && -z ${declared//[[:space:]]/} ]]; then
