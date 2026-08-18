@@ -114,3 +114,18 @@ What to do instead, in order:
 2. Ask whether there is a sanctioned way to do it.
 3. If there is not, hand the work back with the reason. An unfinished task with
    a clear cause is worth more than a finished one nobody can audit.
+
+## Land by fast-forward, never by merge
+
+`git merge --ff-only <branch>`. If that refuses, your branch is not based on the
+current tip: rebase it, re-gate it, and land again. Do not merge master into
+your branch and land the merge.
+
+The reason is not neatness. A gate measures one tree; a merge commit creates a
+tree that no gate ever measured - the merge resolution itself is untested code,
+landed on the strength of a verdict about something else. It also makes the
+history a graph rather than a line, and every "is my branch based on the current
+tip" check here assumes a line.
+
+An agent of mine landed c39f9f3 as a merge on 2026-08-18. Nothing broke, and the
+rule was missing from this file rather than from its judgement.
