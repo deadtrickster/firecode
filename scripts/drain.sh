@@ -216,10 +216,24 @@ esac
 # first cut declared, discovered the branch was unavailable, and released -
 # taking and giving back the target once per unavailable row.
 row="" branch="" rowtarget=""
+# A SKIP IS A FACT SOMEBODY ELSE NEEDS. Until 69c3251 these two lines went into
+# this script's own log and nowhere else, so a row nobody could take and a row
+# waiting its turn looked identical to every reader - which is how the queue sat
+# still for nine minutes tonight with three rows in it and nothing said why.
+#
+# The blocked door takes the reason and the row carries it, with the moment it
+# was found. It is a fact about a MOMENT rather than about the row: "checked out
+# in wt-qorder" is true until somebody detaches, so a declaration clears it and
+# every reader treats it as evidence with an age.
+blocked() { # id why
+	api POST "/api/merge/$1/blocked" \
+		"$(printf '{"why":"%s"}' "$(printf '%s' "$2" | sed 's/"/\\"/g')")" >/dev/null 2>&1 || true
+}
 while read -r kind id b t; do
 	[ "$kind" = ROW ] || continue
 	[ "$t" = "$TARGET" ] || {
 		say "skipping $id - it targets $t and this drainer runs $TARGET"
+		blocked "$id" "targets $t, and this drainer runs $TARGET"
 		continue
 	}
 	elsewhere=$(git -C "$REPO" worktree list --porcelain |
@@ -227,6 +241,7 @@ while read -r kind id b t; do
 		grep -v "^$WORK$" | head -1 || true)
 	if [ -n "$elsewhere" ]; then
 		say "skipping $id - $b is checked out in $elsewhere"
+		blocked "$id" "$b is checked out in $elsewhere, so it cannot be rebased here"
 		continue
 	fi
 	row=$id branch=$b rowtarget=$t
