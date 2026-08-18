@@ -81,7 +81,11 @@ alive() {
 # So the marker is checked first: it is the fact, where process absence is a
 # proxy that reads identically before the start and after the end.
 finished() {
-	[[ -f $rundir/exit-status || -d $rundir/result ]]
+	# `result` is a FILE naming the copy-out directory, not the directory - I
+	# wrote -d and it was wrong, so a finished run fell through to the presence
+	# loop and reported "never showed a process". A completion marker tested the
+	# wrong way is not a marker at all.
+	[[ -f $rundir/exit-status || -s $rundir/result || -d $rundir/workdir ]]
 }
 
 # 1. presence. An empty cgroup here is a boot window, not a finish.
