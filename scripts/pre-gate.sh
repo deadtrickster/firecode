@@ -16,7 +16,23 @@ set -uo pipefail
 
 REPO=${FLOWY_REPO:-$HOME/Projects/flowy}
 NODE=${FLOWY_ADDR:-http://192.168.1.55:8787}
-AGENT=${FLOWY_AGENT:-orchestrator}
+# WHO THIS RUN IS, and it is not guessable.
+#
+# The default used to be a name - orchestrator - so any other seat that had not
+# set FLOWY_AGENT was told the lock it had just taken belonged to somebody else.
+# That is not a near miss: the answer was a collision that was not happening,
+# and the correct response to it - do not gate - is the expensive one. Measured
+# on 2026-08-18 by claude-host, who declared, held the lock, and was told
+# "master is held by claude-host - their run or yours is about to be wasted".
+#
+# A missing identity is now its own answer, once, rather than a wrong one at
+# every question that needs a name.
+AGENT=${FLOWY_AGENT:-${BOARD_NAG_NAME:-}}
+if [ -z "$AGENT" ]; then
+	printf 'pre-gate: set FLOWY_AGENT - without a name this cannot tell your own lock\n' >&2
+	printf '          from another seat holding it, and it would answer that they do.\n' >&2
+	exit 2
+fi
 TOKEN_FILE=${FLOWY_TOKEN_FILE:-$HOME/.config/flowy/agents/$AGENT}
 
 branch=${1:-}
@@ -97,16 +113,33 @@ print(lock.get("holder_name", "") if lock.get("held") else "")
 	fi
 fi
 
-# 3. CAN THIS HOST EVEN RUN THE SUITE. Cheaper to ask than to discover in a VM,
-# and a host-local run is free - see run-tests.sh, which needs both of these.
+# 3. CAN THIS HOST EVEN RUN THE SUITE, AND WILL THE SUITE FIND IT.
+#
+# Those are two questions and this used to ask only the first. It ran initdb by
+# its absolute path, with LD_LIBRARY_PATH set here, and reported ok. The gate
+# then died in two seconds with "no initdb/pg_ctl found; install postgresql",
+# because run-tests.sh searches PATH - and PATH belongs to whoever invoked it,
+# not to this script. Measured on 2026-08-18: pre-gate green, gate dead, nothing
+# wrong with the branch.
+#
+# An instrument that arranges the conditions it is testing reports on itself.
+# So the first check is `command -v`, in the caller's own environment, and the
+# absolute-path check stays underneath it to tell "not installed" from
+# "installed and not on your PATH" - which have different fixes.
+if command -v initdb >/dev/null 2>&1 && command -v pg_ctl >/dev/null 2>&1; then
+	say ok "initdb and pg_ctl are on PATH, which is where the suite looks"
+elif [ -x "$HOME/.local/pg17-bin/initdb" ]; then
+	bad "postgres is installed and NOT on your PATH, so the suite exits in two seconds:
+    PATH=\$HOME/.local/pg17-bin:\$PATH LD_LIBRARY_PATH=\$HOME/.local/pg17-libs ./run-tests.sh"
+else
+	say '--' "no pg17-bin here, host-local runs are not available"
+fi
 if [ -x "$HOME/.local/pg17-bin/initdb" ]; then
 	if LD_LIBRARY_PATH="$HOME/.local/pg17-libs" "$HOME/.local/pg17-bin/initdb" --version >/dev/null 2>&1; then
-		say ok "initdb runs with pg17-libs on the path"
+		say ok "and it starts with pg17-libs on the library path"
 	else
 		bad "initdb will not start - check LD_LIBRARY_PATH=$HOME/.local/pg17-libs"
 	fi
-else
-	say '--' "no pg17-bin here, host-local runs are not available"
 fi
 # 4. CAN THE SUITE BE RUN AT ALL. On 2026-08-18 a commit dropped run-tests.sh
 # from 100755 to 100644 and every gate that day passed, because every existing
