@@ -204,14 +204,18 @@ that on 2026-08-18 on a verdict that turned out to be a masked pipeline status,
 and blocked a branch that was ready to land. The fix is the abandon verb above,
 not declaring later.
 
-## Repros and tests run in containers, never against anything real
+## Repros and tests run in containers you started
 
 Operator instruction, 2026-08-18: "all testing inside docker, do not touch my
-production stuff and especiial oracle serenedb."
+production stuff and especiial oracle serenedb." Then, when an earlier version
+of this section read too strictly: "you can always touch real via docker
+compose."
 
-Every repro, test and probe runs inside a container, against services that
-container brought up itself. Nothing you run may reach a live service on this
-machine or on the network.
+So the line is not real-versus-fake. **A real SereneDB is exactly what a repro
+should run against - as long as your container started it.** The rule is: never
+connect to a service you did not bring up. The repro trees already work this
+way; `repro-01-temp-directory.sh` does `docker run -d --rm --name repro-01
+-p 7901:7890` and drives that, which is correct and needs no permission.
 
 - The findings corpus reproduces SereneDB defects. Those trees run against a
   SereneDB the container starts - never the operator's instance, never the
@@ -224,10 +228,13 @@ machine or on the network.
 - A repro tree marked `isolation: plain` means no container, which is exactly
   the forbidden case. Containerise it anyway, or refuse it and say so.
 
-**If something cannot be tested without touching a real service, that is a
-refusal, not a problem to solve.** Name what it wanted to reach, put it in the
-row and the room, and move on. Work left undone is an acceptable outcome here;
-somebody else's production is not yours to risk.
+**Refuse only what wants an EXISTING service.** A tree that expects a database
+already running, or a DSN pointing at one, is the case to stop on: name what it
+wanted to reach, put it in the row and the room, and move on. A tree that starts
+its own is ordinary work - run it.
+
+Bring up whatever the repro needs, including a real SereneDB built from a real
+commit. What you must not do is attach to the operator's.
 
 Record what each run actually connected to, in the row, so it is on the record
 rather than in your memory of it.
