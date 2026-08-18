@@ -217,6 +217,34 @@ while read -r kind id b t; do
 done <<<"$pick"
 
 if [ -z "$row" ]; then
+	# NOTHING TO LAND IS NOT NOTHING TO DO. A deploy that refused - because the
+	# shared checkout was dirty, because the build was interrupted - leaves master
+	# ahead of the node, and nothing retries it: the pass that failed has ended and
+	# the next row is what triggers the next deploy. On an empty queue there is no
+	# next row, so the box stays behind until a person reads the nag.
+	#
+	# So an idle pass asks the two questions it is already holding the answers to -
+	# what is master, what is the node serving - and deploys when they differ. It
+	# is the cheapest possible catch-up: no state, no retry counter, just the same
+	# comparison the deploy itself makes at the end.
+	if [ "$deploy" = yes ]; then
+		serving=$(curl -sS -m 5 "$NODE/api/node" 2>/dev/null |
+			sed -n 's/.*"version":"[^+]*+\([^"]*\)".*/\1/p')
+		head=$(git -C "$REPO" rev-parse --short master 2>/dev/null || true)
+		if [ -n "$serving" ] && [ -n "$head" ] && ! printf '%s' "$head" | grep -q "^$serving"; then
+			outcome=catching-up
+			note="node serving $serving, master is $head"
+			say "the node is serving $serving and master is $head - deploying the difference"
+			if "$REPO/scripts/deploy.sh"; then
+				outcome=deployed
+				note="$head (catch-up)"
+				exit 0
+			fi
+			outcome=deploy-refused
+			note="node still on $serving, master is $head"
+			exit 1
+		fi
+	fi
 	outcome=idle
 	say "nothing takeable in the queue - every row is landed, aimed elsewhere, or open in a worktree"
 	exit 0
