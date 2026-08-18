@@ -43,12 +43,30 @@ missing from the brief.
    from the merge queue:
 
    ```
-   curl -sS -H "Authorization: Bearer $TOKEN" "$FLOWY_ADDR/api/merge-queue" | jq .gating
+   scripts/window-check.sh          # exit 0 clear, exit 3 somebody holds it
    ```
 
-   Non-zero means WAIT. "Admissible" is not permission to land - it says your
-   branch is green against the current tip, not that the tip is free to move.
-   File your branch in the queue and let it land in turn.
+   **Exit 3 means WAIT, then run it again.** It reads the queue's gating flag
+   and the last fifteen minutes of the room, so it sees a window declared after
+   this brief was written - which the brief itself cannot.
+
+   That is the whole reason it exists. On 2026-08-18 a helper declared,
+   checked the queue, saw master unmoved, gated and landed - every step correct
+   - while a window had opened in the room forty seconds after it started. The
+   hold sent to it arrived four minutes late, and a ten-minute gate run was
+   spent producing a verdict that was worthless before it finished. Nobody was
+   careless: a brief is true when it is issued and cannot stay true.
+
+   So the rule is not "be told what everybody is doing", which cannot work for
+   a process that cannot receive. It is **ask at the moment of acting**.
+   Anything you must respect has to be queryable when you act, never pushed at
+   you beforehand.
+
+   "Admissible" is not permission to land either - it says your branch is green
+   against the current tip, not that the tip is free to move. And the queue's
+   default target tip is the DEPLOYED commit, which can be many landings
+   behind, so pass `?target_tip=<full 40-char master sha>` or you will read a
+   refusal that is about the node's uptime rather than your branch.
 
 ## When you finish
 
