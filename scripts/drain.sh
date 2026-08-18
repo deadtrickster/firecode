@@ -51,6 +51,12 @@ TOKEN_FILE=${FLOWY_TOKEN_FILE:-$HOME/.config/flowy/agents/$AGENT}
 # and deploy.sh refuses a dirty tree for the same reason.
 WORK=${FLOWY_DRAIN_WORKTREE:-$HOME/Projects/wt-drain}
 TARGET=${FLOWY_DRAIN_TARGET:-master}
+# ABSOLUTE, ONCE. $(dirname "$0") is relative to where this was invoked, and the
+# gate step runs inside a `cd "$WORK"` subshell - so a relative path resolved
+# there looked for the script under the worktree and found nothing. Run five got
+# all the way through declare, worktree and rebase before dying on
+# "./scripts/pre-gate.sh: No such file or directory".
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 once=no deploy=${FLOWY_DRAIN_DEPLOY:-no} dry=no
 while [ $# -gt 0 ]; do
@@ -261,7 +267,7 @@ say "rebased onto $rowtarget, tip $tip"
 # FLOWY_AGENT for the other half of the same lesson: without it, pre-gate cannot
 # tell this seat's lock from another's, and it says so rather than guessing.
 (cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH LD_LIBRARY_PATH=$HOME/.local/pg17-libs \
-	FLOWY_AGENT="$AGENT" bash "$(dirname "$0")/pre-gate.sh" "$branch") ||
+	FLOWY_AGENT="$AGENT" bash "$HERE/pre-gate.sh" "$branch") ||
 	die "pre-gate says this run is not worth starting"
 
 # ------------------------------------------------------------ the gate
