@@ -421,6 +421,24 @@ stage_project() {
 	# No repository, or git could not answer: copy what is there.
 	((listed)) || rsync "${rs[@]}" "$workdir"/ "$stage"/ 2>/dev/null || true
 
+	# ANOTHER CHECKOUT'S WORKTREE REGISTRATIONS MEAN NOTHING IN HERE, and left
+	# in place they refuse work the agent was sent to do:
+	#
+	#   fatal: 'feat/raiser' is already used by worktree at /home/dead/...
+	#
+	# .git/worktrees holds one directory per worktree the HOST has, each naming
+	# a host path. The VM has none of them, but git believes the registration
+	# and refuses to check out any branch one of them holds - which is most
+	# branches on a machine where every agent works in a worktree. A gate that
+	# hits it exits 128 before running a test and reads exactly like a red
+	# suite; it cost a gate tonight and the run had to be read by hand to see
+	# that git, not the code, had refused.
+	#
+	# The worktree path above already excludes this directory when it builds a
+	# standalone .git. This is the same rule for a MAIN checkout, whose .git is
+	# copied whole.
+	rm -rf "$stage/.git/worktrees" 2>/dev/null || true
+
 	# A git worktree's .git is a file pointing into the main checkout, which is
 	# not in the VM - so git in there would find no repository at all, and the
 	# agent could not read history or commit. Give the copy a real .git from
