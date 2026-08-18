@@ -361,6 +361,34 @@ fi
 
 echo
 log "agent exited with status $rc"
+
+# An exit status that came out of a pipeline is the LAST command's.
+#
+# `bash -c './run-tests.sh 2>&1 | tail -20'` exits 0 no matter what
+# run-tests.sh did, because that is tail's status. A caller reading
+# runs/<id>/exit-status as the verdict is then reading a constant, and a gate
+# that cannot go red is worse than no gate - it is a green light nobody
+# checks.
+#
+# Measured, not theorised: run firecode-20260818-090746-69426 recorded
+# `passed: 624 failed: 2` and exit-status 0. It was the third instance that
+# day; the other two masked a type error and a watcher that exited instantly.
+#
+# This does not fix the status - `set -o pipefail` is the caller's to add, and
+# turning it on here would break the `| head` idiom, where SIGPIPE is the
+# intended end. It says so out loud instead, at the moment the status is
+# printed, so nobody reads a pipeline's zero as a suite's zero.
+# Narrow on purpose: only a shell -c command has a pipeline the harness
+# handed to a shell. A pipe character inside a prompt for an AI agent is
+# text, not a pipeline, and warning about it would train people to skip the
+# warning that matters.
+if [[ $AGENT == bash || $AGENT == sh ]] &&
+	[[ " ${AGENT_ARGS[*]} " == *" -c "* ]] &&
+	[[ ${AGENT_ARGS[*]} == *"|"* ]]; then
+	log "NOTE: the command contains a pipeline, so status $rc is its LAST"
+	log "      stage's, not the first's. If this is a gate, read the suite's"
+	log "      own summary line, or re-run with 'set -o pipefail;' in front."
+fi
 # Bookkeeping stays out of the project until the gate has run.
 #
 # These markers used to be written into the project root immediately, and the
