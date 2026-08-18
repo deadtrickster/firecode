@@ -131,8 +131,7 @@ for it in q.get("items") or []:
     if not (it.get("branch") or "").strip():
         continue
     print("ROW", it["id"], it["branch"], it.get("target") or "master")
-    raise SystemExit
-print("EMPTY")
+print("END")
 ')
 
 case "$pick" in
@@ -141,14 +140,41 @@ HELD*)
 	say "somebody is landing or deploying - not racing them"
 	exit 0
 	;;
-EMPTY)
-	say "nothing queued to drain"
-	exit 0
-	;;
 esac
 
-read -r _ row branch rowtarget <<<"$pick"
-[ "$rowtarget" = "$TARGET" ] || die "row $row targets $rowtarget, and this drainer runs $TARGET"
+# WHICH ROW IS TAKEABLE, ASKED BEFORE ANYTHING IS DECLARED.
+#
+# The first three real runs all died on the top row and never looked at the
+# rest: a branch checked out in somebody's worktree cannot be rebased here, and
+# refusing the whole run for it means one seat with an editor open blocks the
+# queue for everybody. A reason that is about the WORKSPACE is a reason to try
+# the next row; a reason about the TREE is a reason to stop.
+#
+# And this happens before the declare, because declaring takes the lock: the
+# first cut declared, discovered the branch was unavailable, and released -
+# taking and giving back the target once per unavailable row.
+row="" branch="" rowtarget=""
+while read -r kind id b t; do
+	[ "$kind" = ROW ] || continue
+	[ "$t" = "$TARGET" ] || {
+		say "skipping $id - it targets $t and this drainer runs $TARGET"
+		continue
+	}
+	elsewhere=$(git -C "$REPO" worktree list --porcelain |
+		awk -v want="refs/heads/$b" '$1=="worktree"{w=$2} $1=="branch" && $2==want {print w}' |
+		grep -v "^$WORK$" | head -1)
+	if [ -n "$elsewhere" ]; then
+		say "skipping $id - $b is checked out in $elsewhere"
+		continue
+	fi
+	row=$id branch=$b rowtarget=$t
+	break
+done <<<"$pick"
+
+if [ -z "$row" ]; then
+	say "nothing takeable in the queue - every row is landed, aimed elsewhere, or open in a worktree"
+	exit 0
+fi
 say "taking $row - $branch onto $rowtarget"
 
 if [ "$dry" = yes ]; then
@@ -197,13 +223,15 @@ trap release EXIT
 #
 # So: stderr is kept, the branch being held elsewhere is refused BY NAME before
 # the attempt, and the fallback only runs when the directory is actually there.
+# Asked again, after the declare, because the window between the pick and here
+# is one where somebody can open a worktree. It is a die rather than a skip now:
+# the lock is ours and the row is chosen, so there is nothing left to fall back
+# to.
 held=$(git -C "$REPO" worktree list --porcelain |
 	awk -v b="refs/heads/$branch" '$1=="worktree"{w=$2} $1=="branch" && $2==b {print w}' |
 	grep -v "^$WORK$" | head -1)
 if [ -n "$held" ]; then
-	die "$branch is checked out in $held - git will not put it in two worktrees, and
-    a drainer that rebased it from under that one would move somebody's tree while they read it.
-    Free it there, or point FLOWY_DRAIN_WORKTREE at it"
+	die "$branch was checked out in $held between the pick and the declare"
 fi
 
 if [ -d "$WORK" ]; then
