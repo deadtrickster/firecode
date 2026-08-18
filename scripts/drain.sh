@@ -102,6 +102,7 @@ queue=$(api GET /api/merge-queue) || die "cannot reach $NODE"
 # judgement of whether a verdict would be honoured, and asking it here rather
 # than reimplementing gated_base against target_tip is what keeps this script
 # from disagreeing with the door it is about to call.
+# shellcheck disable=SC2016  # the python is deliberately unexpanded by the shell
 pick=$(body_of "$queue" | python3 -c '
 import json, sys
 q = json.load(sys.stdin)
@@ -110,11 +111,21 @@ if lock.get("held"):
     print("HELD", lock.get("holder_name", "somebody"), lock.get("item", ""))
     raise SystemExit
 for it in q.get("items") or []:
-    # Not admissible YET is the ordinary case for a row nobody has gated - it
-    # is exactly what this script is for. What it must not take is a row that
-    # is already gating (somebody else is on it) or already landed.
-    if it.get("gating"):
-        continue
+    # Not admissible YET is the ordinary case for a row nobody has gated - it is
+    # exactly what this script is for.
+    #
+    # A `gating` FLAG IS NOT SKIPPED, and that is deliberate rather than sloppy.
+    # This code is only reached when the lock is FREE, because the block above
+    # stops the run otherwise. Nobody can be gating a row without holding the
+    # target - declaring is what takes it - so a gating flag seen from here is
+    # residue from a run that died, and skipping it means the drainer refuses
+    # forever to retry the row it abandoned itself.
+    #
+    # Measured: run one declared a row and then died on a worktree it could not
+    # make. Run two skipped that same row - the only one it had any business
+    # taking - and moved to another seat row. The flag expires on its own after
+    # GateBelievedFor, so the old rule was "wait out a timer for a state that is
+    # already known to be false".
     if (it.get("status") or "") in ("done", "abandoned"):
         continue
     if not (it.get("branch") or "").strip():
