@@ -150,6 +150,34 @@ free=$(jq -r '[.artifacts[]? | select((.status // "") != "done") |
 # `updated` moves on ANY write, so a rename reads as work. orchestrator is
 # adding started/last_worked to separate the claim from the evidence; until
 # those land this uses `updated`, which is why the threshold is generous.
+
+# WHAT THE DRAINER LAST DID, and how long ago.
+#
+# The operator's ask, 2026-08-18: "then nagger shows last drainer status - thats
+# how you catch stalls and errors." The drainer writes one json object at every
+# exit (scripts/drain.sh); this reads it and reports the AGE beside the outcome,
+# because "landed" from three hours ago and "landed" from a minute ago are the
+# same word and different facts.
+#
+# NO FILE IS ITS OWN ANSWER: a drainer that has never run and one whose status
+# file was wiped look identical from here, and both are worth saying out loud
+# rather than passing over in silence.
+drain_status=""
+drain_file=${FLOWY_DRAIN_STATUS:-$HOME/.cache/flowy-drain/status.json}
+if [[ -r $drain_file ]]; then
+	drain_status=$(jq -r '
+		def ago($s): if $s < 90 then "\($s)s ago"
+			elif $s < 5400 then "\(($s/60)|floor)m ago"
+			else "\(($s/3600)|floor)h ago" end;
+		((now - ((.at // "1970-01-01T00:00:00Z") | fromdateiso8601? // 0)) | floor) as $age
+		| "drainer: \(.outcome // "?") \(ago($age))"
+		+ (if (.row // "") != "" then " on \(.row[0:10])" else "" end)
+		+ (if (.branch // "") != "" then " (\(.branch))" else "" end)
+		+ (if (.note // "") != "" then " - \((.note|gsub("\n";" "))[0:80])" else "" end)
+		+ (if $age > 1800 then "  STALE: nothing has drained in over 30 minutes" else "" end)
+	' "$drain_file" 2>/dev/null || true)
+fi
+[[ -n $drain_status ]] || drain_status="drainer: no status file at $drain_file - it has not run, or nothing is running it"
 stale_mins=${BOARD_STALE_MINS:-20}
 stale=$(jq -r --arg me "$name" --argjson mins "$stale_mins" '
 	(now - ($mins * 60)) as $cut
@@ -313,6 +341,7 @@ fi
 		printf 'whether somebody is working them. If one is yours and running, leave a note on it; if it is\n'
 		printf 'not, hand it back. A claim nobody can see progress on reads as abandoned to everybody else.\n'
 	fi
+	printf '%s\n' "$drain_status"
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
 } >&2

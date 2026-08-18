@@ -76,9 +76,42 @@ done
 	exit 2
 }
 
+# WHAT THE LAST PASS DID, where something that is not this process can read it.
+#
+# The operator's ask, 2026-08-18: "then nagger shows last drainer status - thats
+# how you catch stalls and errors." A drainer whose output goes to whichever
+# session started it is a drainer nobody can check on, and the failure that
+# matters most - it stopped running at all - is invisible from inside it.
+#
+# ONE JSON OBJECT AT A FIXED PATH, rewritten on every exit, so that the nag and
+# the node's own reader answer the same question with the same bytes rather than
+# each parsing a log differently. `at` is what makes it useful: "landed" from
+# three hours ago and "landed" from a minute ago are the same word and different
+# facts, so every reader reports the AGE and not just the outcome.
+STATUS=${FLOWY_DRAIN_STATUS:-$HOME/.cache/flowy-drain/status.json}
+mkdir -p "$(dirname "$STATUS")" 2>/dev/null || true
+outcome="started"
+note=""
+record() {
+	# jq rather than printf, because `note` carries a refusal in somebody's own
+	# words - quotes, newlines and all - and a status file that stops parsing
+	# the day a message contains a quote is a status file nobody trusts.
+	jq -n --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		--arg outcome "$outcome" \
+		--arg row "${row:-}" \
+		--arg branch "${branch:-}" \
+		--arg tip "${tip:-}" \
+		--arg agent "$AGENT" \
+		--arg note "$note" \
+		--argjson pid "$$" \
+		'{at: $at, outcome: $outcome, row: $row, branch: $branch, tip: $tip,
+		  agent: $agent, note: $note, pid: $pid}' >"$STATUS" 2>/dev/null || true
+}
 say() { printf '[drain] %s\n' "$*"; }
 die() {
 	printf '[drain] REFUSED: %s\n' "$*" >&2
+	outcome=refused
+	note=$*
 	exit 1
 }
 
@@ -142,6 +175,7 @@ print("END")
 
 case "$pick" in
 HELD*)
+	outcome=held
 	say "the target is ${pick#HELD }"
 	say "somebody is landing or deploying - not racing them"
 	exit 0
@@ -178,12 +212,14 @@ while read -r kind id b t; do
 done <<<"$pick"
 
 if [ -z "$row" ]; then
+	outcome=idle
 	say "nothing takeable in the queue - every row is landed, aimed elsewhere, or open in a worktree"
 	exit 0
 fi
 say "taking $row - $branch onto $rowtarget"
 
 if [ "$dry" = yes ]; then
+	outcome=dry-run
 	say "dry run: would declare, rebase, pre-gate, gate, record, land"
 	[ "$deploy" = yes ] && say "dry run: and would deploy"
 	exit 0
@@ -213,7 +249,16 @@ esac
 release() {
 	api POST /api/lock/release "$(printf '{"item":"%s"}' "$row")" >/dev/null 2>&1 || true
 }
-trap release EXIT
+# ONE EXIT TRAP, because bash has one and a second REPLACES the first - the
+# defect this fleet shipped in deploy.sh this evening and caught in the logs an
+# hour later. So the lock and the status line are given back by the same
+# handler, in that order: the lock first, because a stalled status line costs a
+# reader a question and a held lock costs everybody the next fifteen minutes.
+finish() {
+	release
+	record
+}
+trap finish EXIT
 
 # ------------------------------------------------------------ the tree
 
@@ -276,9 +321,13 @@ log=${TMPDIR:-/tmp}/drain-$row.log
 say "gating $tip - about 35 minutes, log at $log"
 if (cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH \
 	LD_LIBRARY_PATH=$HOME/.local/pg17-libs ./run-tests.sh >"$log" 2>&1); then
+	outcome=green
+	note=$(grep -E "^passed:" "$log" | tail -1)
 	say "green: $(grep -E '^passed:' "$log" | tail -1)"
 else
 	# RECORDED, NOT RETRIED, and not diagnosed either.
+	outcome=red
+	note="$(grep -E "^passed:" "$log" | tail -1) - log at $log"
 	say "RED: $(grep -E '^passed:' "$log" | tail -1)"
 	grep -E '^\s+--- FAIL|^FAIL ' "$log" | head -5 >&2 || true
 	say "the row stays open and the log stays at $log - a person reads it"
@@ -324,6 +373,8 @@ land=$(api POST "/api/merge/$row/land" "$(printf '{"sha":"%s"}' "$landed")")
 	body_of "$land" >&2
 	die "the land door answered $(code_of "$land") AFTER the branch was merged - master is at $landed and the queue does not know"
 }
+outcome=landed
+note="$landed"
 say "landed $landed"
 
 # ------------------------------------------------------------ and only then
@@ -333,3 +384,5 @@ if [ "$deploy" != yes ]; then
 	exit 0
 fi
 "$REPO/scripts/deploy.sh"
+outcome=deployed
+note="$landed"
