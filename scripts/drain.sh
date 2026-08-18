@@ -416,6 +416,34 @@ else
 	note="$(grep -E "^passed:" "$log" | tail -1) - log at $log"
 	say "RED: $(grep -E '^passed:' "$log" | tail -1)"
 	grep -E '^\s+--- FAIL|^FAIL ' "$log" | head -5 >&2 || true
+
+	# THE RED GOES TO THE QUEUE, not just to this box.
+	#
+	# It used to be a file here - red-<row>-<tip> - because the store had no move
+	# for a red: the only way to end a declaration was to write a tip, and a
+	# written tip is what MergeAdmissible reads as evidence FOR landing. So a
+	# failed pass could either make the branch landable or say nothing, and it
+	# said nothing.
+	#
+	# 7ea9fa7 gave it the third case. Posting it ends the declaration the moment
+	# the run reports - without it the row reads `gating` for the full fifteen
+	# minutes after the pass died, which is how two rows came to read as gating
+	# at once tonight when the lock is one.
+	reported=$(api POST "/api/merge/$row/gate" \
+		"$(printf '{"run":"%s","gated_tip":"%s","result":"red","note":"%s"}' \
+			"$run" "$tip" "$(grep -E '^passed:' "$log" | tail -1)")")
+	case "$(code_of "$reported")" in
+	200) say "red recorded on the row - the declaration is over and the queue can say so" ;;
+	*)
+		# Said, not swallowed: a red the queue never heard is the state this
+		# whole path exists to end, and a reader has to know which one they have.
+		say "WARNING: the red could not be recorded ($(code_of "$reported")) - the queue still reads gating"
+		body_of "$reported" >&2
+		;;
+	esac
+	# The local note stays as a belt: the skip check below reads it, and a drainer
+	# whose node is briefly unreachable must still not re-measure a tree it has
+	# already measured. It is a cache of the queue's answer, not a second opinion.
 	printf 'red at %s, %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$(grep -E '^passed:' "$log" | tail -1)" >"$STATE/red-$row-$tip"
 	say "the row stays open and the log stays at $log - a person reads it"
