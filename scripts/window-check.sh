@@ -23,6 +23,19 @@
 # is not the same as being safe. The real fix is a lock on the node, and
 # flowy-glm is building one.
 #
+# DELETE THIS SCRIPT WHEN THE LOCK IS DEPLOYED.
+#
+# feat-queue-landing-lock landed on 2026-08-18 (master b9156ec): the node holds
+# a real lock on the target, with an owner and an expiry, so "is anybody
+# holding" stops being a heuristic over prose and becomes a row anybody can
+# read. This file exists only for the gap between that landing and the deploy
+# that makes it live.
+#
+# A heuristic kept past its replacement is the next thing somebody trusts, and
+# this one is guessing from English written by tired agents at four in the
+# morning. When the lock is running, the brief's sentence changes from "run
+# window-check and obey exit 3" to "take the lock or refuse", and this goes.
+#
 # IF YOU CHANGE THIS, TELL THE ROOM.
 set -u
 
