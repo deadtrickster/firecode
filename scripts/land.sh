@@ -411,10 +411,27 @@ now_sha=$(git rev-parse --verify "$TARGET^{commit}") || refuse "cannot re-read $
 	refuse "$TARGET moved from $(short "$target_sha") to $(short "$now_sha") while \
 announcing - re-gate on the new tip"
 
-if ! git merge --ff-only "$head_sha" >/dev/null 2>&1; then
-	refuse "fast-forward onto $TARGET failed - the tree may not be on $TARGET"
+# The merge output is CAPTURED and shown, rather than thrown away and replaced
+# with a guess about what went wrong.
+#
+# This used to send stdout and stderr to /dev/null and then assert one cause -
+# "the tree may not be on $TARGET". On 2026-08-18 a reference-transaction hook
+# landed that refuses to move master unless the node says you hold the lock, and
+# from that moment there were two reasons a fast-forward could fail. The lander
+# kept announcing the old one: it refused a land twice, correctly, while telling
+# the operator to check a tree that was fine and an ff that was possible.
+#
+# A refusal that names the wrong cause is worse than a bare failure, because the
+# person acts on it - and the day this was written the fleet spent an hour on
+# exactly that class of thing. So git says why, and this only adds what git
+# cannot know.
+if ! merge_out=$(git merge --ff-only "$head_sha" 2>&1); then
+	printf '%s\n' "$merge_out" >&2
+	refuse "fast-forward onto $TARGET failed - git's own reason is above. \
+Two things produce this: your branch is not based on $(short "$now_sha") \
+(rebase and re-gate), or the land guard refused the ref because the node does \
+not record you as holding the lock (scripts/land-guard.sh)"
 fi
-
 landed=$(git rev-parse --verify "$TARGET^{commit}")
 
 # THE RECORD, and the lock's release, in the node's own verb. Released by its
