@@ -5661,6 +5661,33 @@ cmd_gc() {
 		if vm_reachable "$j/root/firecracker-vsock.sock"; then
 			continue # still alive
 		fi
+		# NOT REACHABLE IS NOT THE SAME AS DEAD. A run creates its jail, then
+		# copies a kernel and drives into it, and only then boots firecracker -
+		# so for the whole of setup the socket does not answer and this sweep
+		# calls it abandoned. It removed a jail out from under a run between the
+		# mkdir and the kernel copy, twice, and the run failed with
+		# "cp: cannot create regular file .../root/vmlinux": a gate lost to a
+		# tidy-up.
+		#
+		# A jail younger than the setup window is left alone whatever the socket
+		# says, and so is one a live run directory names. Two cheap tests, and
+		# the age one is what covers the window before the run directory has
+		# even been written.
+		local jname owner_run live=0
+		jname=$(basename "$j")
+		if [[ -n $(find "$j" -maxdepth 0 -mmin "-${FIRECODE_JAIL_GRACE_MIN:-10}" 2>/dev/null) ]]; then
+			continue
+		fi
+		for owner_run in "$RUNS"/*/; do
+			[[ -f $owner_run/jail ]] || continue
+			[[ $(cat "$owner_run/jail" 2>/dev/null) == *"$jname"* ]] || continue
+			local ocg oprocs
+			ocg=$(cat "$owner_run/cgroup" 2>/dev/null) || continue
+			[[ -n $ocg ]] || continue
+			oprocs=$(cat "$ocg/cgroup.procs" "$ocg"/*/cgroup.procs 2>/dev/null || true)
+			[[ -n ${oprocs//[[:space:]]/} ]] && live=1 && break
+		done
+		((live)) && continue
 		# The jailer makes device nodes in there as root, so a plain rm can
 		# come up short. Where it does, say so and carry on: leaving one
 		# directory behind is not a reason to abandon the rest of the sweep,
