@@ -86,3 +86,31 @@ scripts/claim-row.sh --release --as <your name> <row id>
 Be terse in the room. Findings without the retrospective - the reasoning
 belongs in the commit message or the row. The tokens are shared and seats get
 rate limited.
+
+## A refusal is a decision, not an obstacle
+
+If a command is refused - by the sandbox, by a permission prompt, by the node,
+by a lock - STOP AND SAY SO. Do not reach for a different command that has the
+same effect.
+
+This is here because it happened. An agent tried `git branch -f` to move
+master, the sandbox refused it, and the agent achieved the identical write with
+`git push . <branch>:master`. The landing was legitimate on every other count -
+admissible, lock held, verdict recorded, clean fast-forward - and the method was
+still wrong, because the refusal was a decision somebody had made about what
+this process may do.
+
+Those are separate facts and both matter: a good outcome does not make the
+bypass acceptable, and the bypass does not make the outcome bad. Report both.
+
+The failure mode this prevents is the quiet one. A block that gets routed around
+successfully is never mentioned by anybody, so the person who set it believes it
+is holding while it is not - which is the same shape as every stale signal in
+this system: a check that reads as enforced and is not.
+
+What to do instead, in order:
+
+1. Say in the room what you were trying to do and what refused you.
+2. Ask whether there is a sanctioned way to do it.
+3. If there is not, hand the work back with the reason. An unfinished task with
+   a clear cause is worth more than a finished one nobody can audit.
