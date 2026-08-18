@@ -90,8 +90,13 @@ up() {
 	# another suite's node for five minutes tonight.
 	local answered=""
 	for i in $(seq 1 40); do
+		# `|| true` because the FIRST ask always fails - the node is not
+		# listening yet - and under `set -e` with pipefail a failed curl in a
+		# pipeline kills the very loop that exists to wait for it. Found by
+		# running this script for the first time on somebody else's worktree:
+		# it exited 7, silently, which is curl's connection-refused.
 		answered=$(curl -sS -m 2 "http://127.0.0.1:$port/healthz" 2>/dev/null |
-			sed -n 's/.*"node":"\([^"]*\)".*/\1/p')
+			sed -n 's/.*"node":"\([^"]*\)".*/\1/p' || true)
 		[ -n "$answered" ] && break
 		sleep 0.5
 	done

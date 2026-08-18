@@ -119,37 +119,53 @@ if [[ -n ${queue:-} ]]; then
 fi
 [[ -n $board ]] || exit 0
 
-# open = anything not done. Counted once, so the numbers and the titles below
-# cannot disagree with each other.
-mine=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
-	select((.fields.assignee // "") == $me)] | length' <<<"$board" 2>/dev/null) || exit 0
-free=$(jq -r '[.artifacts[]? | select((.status // "") != "done") |
-	select(((.fields.assignee // "") | length) == 0)] | length' <<<"$board" 2>/dev/null) || exit 0
-
-# ACTIVE IS A CLAIM, NOT AN OBSERVATION.
+# WHAT THE NODE SAYS, asked once.
+#
+# The operator, 2026-08-18: "please move the logic of the work nagger to the go
+# side and the nagger then will be a simple http call."
+#
+# Everything below this line used to be computed here: pull 200 rows, decide in
+# jq what counts as open, compare `updated` against a threshold this script
+# carried, and count assignees. Four seats each held a copy of those rules and
+# they had already disagreed twice about what `active` means. GET /api/nag
+# answers all of it for the CALLING token, so this asks and prints.
+#
+# The old jq is not kept as a fallback on purpose. A fallback that computes the
+# same thing differently is the disagreement being fixed, waiting for the day
+# the door is briefly unreachable.
+nag=$(curl -sS -m 8 -H "Authorization: Bearer $token" "$FLOWY_ADDR/api/nag" 2>/dev/null)
+if [[ -z $nag ]] || ! jq -e . >/dev/null 2>&1 <<<"$nag"; then
+	# A node that cannot be read is not a board with nothing on it, and saying
+	# so beats printing zeroes that read as a quiet board.
+	printf 'board: the node did not answer /api/nag, so this says nothing about the board\n' >&2
+	exit 0
+fi
+mine=$(jq -r '.mine // 0' <<<"$nag")
+free=$(jq -r '.unowned // 0' <<<"$nag")
+stale=$(jq -r '.stale // 0' <<<"$nag")
+stale_mins=$(jq -r '((.stale_after_seconds // 1200) / 60) | floor' <<<"$nag")
+# THE DISTRIBUTION PROBE, printed whenever it is not "ok" - which includes
+# "alone" and "empty", because a reader who never sees the line cannot tell a
+# balanced board from a probe that is not running.
+workload=$(jq -r '
+	.workload as $w
+	| "board: \($w.open) open, \($w.unowned) with nobody on them"
+	+ (if ($w.top // "") != "" then " - most on \($w.top) at \(($w.top_share * 100) | floor)%" else "" end)
+	+ (if $w.verdict == "rebalance" then "\nREBALANCE: one seat is past 80% of the open board. The operator asked that this one stop and be spread."
+	   elif $w.verdict == "check" then "\ncheck: one seat is past half the open board - worth asking what is going on."
+	   elif $w.verdict == "alone" then "\n(one seat carrying all of it, which is the only share it could have)"
+	   else "" end)' <<<"$nag")
+# ACTIVE IS A CLAIM, NOT AN OBSERVATION - and the node counts it now.
 #
 # The operator, 2026-08-18: "you did it only after i poked you. so the active
-# status is misleading". They were right, and it is a defect rather than a
-# comment on one agent: `active` is written once when a row is claimed and
-# nothing checks it again. Three rows sat active overnight, last touched at
-# 15:41 the previous afternoon.
+# status is misleading". The rule and the threshold moved into the node with
+# everything else (see api_nag.go), which is where they belong: four scripts
+# each deciding what `active` means is how two of them came to disagree.
 #
-# The clock already existed - every row carries `updated` - and nothing read it.
-# So this is not new instrumentation, it is a field the board had and never
-# showed, the same shape as free_port() sitting unused beside two hardcoded
-# ports.
-#
-# WHAT THIS CAN AND CANNOT SAY. It sees writes. A session forty minutes into a
-# gate with nothing to record looks exactly like an abandoned claim, so the
-# wording states what was observed - nothing has touched this row - and never
-# the inference, that nobody is working it. The nag is really a symptom
-# detector for a habit gap: working on something should leave a trace, and the
-# fix is a note on the row when a long run starts rather than a cleverer guess
-# here.
-#
-# `updated` moves on ANY write, so a rename reads as work. orchestrator is
-# adding started/last_worked to separate the claim from the evidence; until
-# those land this uses `updated`, which is why the threshold is generous.
+# What this file still owns is the WORDING, and it is deliberate. The count
+# says a row has had no write, never that nobody is working it - a session
+# forty minutes into a gate looks exactly like an abandoned claim from the
+# outside, and the honest sentence is the one that says what was seen.
 
 # WHAT THE DRAINER LAST DID, and how long ago.
 #
@@ -179,15 +195,6 @@ if [[ -r $drain_file ]]; then
 	' "$drain_file" 2>/dev/null || true)
 fi
 [[ -n $drain_status ]] || drain_status="drainer: no status file at $drain_file - it has not run, or nothing is running it"
-stale_mins=${BOARD_STALE_MINS:-20}
-stale=$(jq -r --arg me "$name" --argjson mins "$stale_mins" '
-	(now - ($mins * 60)) as $cut
-	| [.artifacts[]?
-		| select((.status // "") == "active")
-		| select((.fields.assignee // "") == $me)
-		| select(((.updated // "") | length) > 0)
-		| select((.updated | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0) < $cut)]
-	| length' <<<"$board" 2>/dev/null || echo 0)
 [[ $stale =~ ^[0-9]+$ ]] || stale=0
 [[ $mine =~ ^[0-9]+$ && $free =~ ^[0-9]+$ ]] || exit 0
 [[ ${ready:-0} =~ ^[0-9]+$ ]] || ready=0
@@ -342,6 +349,7 @@ fi
 		printf 'whether somebody is working them. If one is yours and running, leave a note on it; if it is\n'
 		printf 'not, hand it back. A claim nobody can see progress on reads as abandoned to everybody else.\n'
 	fi
+	printf '%s\n' "$workload"
 	printf '%s\n' "$drain_status"
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
