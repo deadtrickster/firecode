@@ -5477,6 +5477,16 @@ cmd_list() {
 sweep_results() {
 	local hours=${FIRECODE_RESULT_HOURS:-6}
 	local swept=0 dir name proj head repo held target
+	# AN ARRAY, because two roots in one quoted string are one path that does not
+	# exist - find then answers nothing and the sweep reports success having
+	# looked at no directory at all. It did exactly that on its first run, and
+	# the only reason it was caught is that the inode count did not move.
+	local -a roots=()
+	if [[ -n ${FIRECODE_RESULT_ROOTS:-} ]]; then
+		read -r -a roots <<<"$FIRECODE_RESULT_ROOTS"
+	else
+		roots=(/tmp "$HOME/Projects")
+	fi
 
 	while IFS= read -r dir; do
 		name=$(basename "$dir")
@@ -5512,7 +5522,7 @@ sweep_results() {
 		((held)) && continue
 
 		rm -rf "$dir" 2>/dev/null && swept=$((swept + 1))
-	done < <(find "${FIRECODE_RESULT_ROOTS:-/tmp $HOME/Projects}" -mindepth 1 -maxdepth 1 \
+	done < <(find "${roots[@]}" -mindepth 1 -maxdepth 1 \
 		-type d -mmin "+$((hours * 60))" 2>/dev/null)
 
 	((swept > 0)) && log "removed $swept delivered result director(ies) already in git"
@@ -5582,6 +5592,17 @@ cmd_gc() {
 	[[ -d $RUNS ]] || return 0
 	# Newest first; anything past the keep count goes entirely.
 	while IFS= read -r d; do
+		# A RUN, AND NOT EVERY DIRECTORY THAT HAPPENS TO SIT HERE. runs/spawn
+		# holds the spawn server's per-run logs and is not a run: it has no
+		# name file, no cgroup, and nothing in it belongs to any single VM. This
+		# loop counted it as one, found no live processes, and swept it away
+		# with 85 log files in it while four VMs were running - which left every
+		# watcher grepping those logs blind, mine included.
+		#
+		# It was invisible until tonight only because gc had been dying at its
+		# first directory for weeks (see the `|| true` above): making a broken
+		# sweep work is also making its bugs work.
+		[[ -f $d/name || -f $d/cgroup || -f $d/vsock ]] || continue
 		# A LIVE RUN IS NEVER SWEPT, whatever the keep count says. This counted
 		# by recency alone, so a busy hour of short runs pushes a long-running
 		# VM past the cutoff and its directory is removed underneath it: the VM
