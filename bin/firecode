@@ -5597,6 +5597,24 @@ cmd_list() {
 # is materialised by the VM, it is in .gitignore, and treating it as somebody's
 # work would keep every directory forever.
 sweep_results() {
+	# THE FLOOR WAS THE BUG, and it was mine.
+	#
+	# This used to refuse anything younger than six hours, which is safe and
+	# useless in the same breath: a busy morning makes result directories that
+	# are MINUTES old, so the sweep declined to touch the exact things filling
+	# the disk. /tmp reached 100% inodes three times in twelve hours and every
+	# reclaim was done by hand, with these same conditions, because the tool
+	# that knew them refused to apply them.
+	#
+	# Age was always a proxy for the question that matters: IS THE RUN THAT
+	# WROTE THIS FINISHED. Ask that instead. A run is finished when its run
+	# directory is gone, or when its cgroup holds no processes - which is what
+	# `list` and gc already read, and which the copy-out has completed by
+	# definition, since the copy-out is the run's own last act.
+	#
+	# The age floor stays as a BACKSTOP for one case only: a result directory
+	# whose run id names no run this host has a record of. That is either very
+	# old or from another install, and neither is worth guessing about.
 	local hours=${FIRECODE_RESULT_HOURS:-6}
 	local swept=0 dir name proj head repo held target
 	# AN ARRAY, because two roots in one quoted string are one path that does not
@@ -5617,6 +5635,33 @@ sweep_results() {
 		[[ $name =~ -[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
 		proj=${dir%-[0-9]*-[0-9]*-[0-9]*}
 		[[ -d $dir/.git ]] || continue
+
+		# THE RUN THAT WROTE IT, AND WHETHER IT IS STILL GOING. The suffix is
+		# the run's own id, so this is a lookup rather than a guess.
+		local stamp rundir rcg rprocs
+		# The trailing <date>-<time>-<pid> IS the run id, minus the prefix the
+		# run directory carries. Taken off the end rather than by splitting on
+		# the project name, because a project name can itself contain digits
+		# and dashes.
+		# BASH_REMATCH from the pattern this loop already matched, so the run id
+		# is READ rather than reconstructed - a fixed-length slice breaks the
+		# day a pid is one digit longer.
+		stamp=${BASH_REMATCH[0]#-}
+		rundir="$RUNS/firecode-$stamp"
+		if [[ -d $rundir ]]; then
+			rcg=$(cat "$rundir/cgroup" 2>/dev/null || true)
+			if [[ -n $rcg ]]; then
+				rprocs=$(cat "$rcg/cgroup.procs" "$rcg"/*/cgroup.procs 2>/dev/null || true)
+				# Still running: leave it entirely alone, whatever its age.
+				[[ -n ${rprocs//[[:space:]]/} ]] && continue
+			fi
+			# The run directory exists and nothing is in its cgroup, so the run
+			# has finished and its copy-out with it. No age test.
+		else
+			# No run directory: this host has no record of the run that wrote
+			# it, so fall back to the age floor rather than guessing.
+			[[ -n $(find "$dir" -maxdepth 0 -mmin "+$((hours * 60))" 2>/dev/null) ]] || continue
+		fi
 
 		head=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || continue
 		# The project it was copied from, and its main checkout when that is a
@@ -5644,8 +5689,8 @@ sweep_results() {
 		((held)) && continue
 
 		rm -rf "$dir" 2>/dev/null && swept=$((swept + 1))
-	done < <(find "${roots[@]}" -mindepth 1 -maxdepth 1 \
-		-type d -mmin "+$((hours * 60))" 2>/dev/null)
+		# Every candidate is considered; the run-finished test above decides.
+	done < <(find "${roots[@]}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 
 	((swept > 0)) && log "removed $swept delivered result director(ies) already in git"
 	return 0
