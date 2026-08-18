@@ -4544,17 +4544,100 @@ launch() {
 			owner=$(cat "$cgp/cgroup.procs" "$cgp"/*/cgroup.procs 2>/dev/null || true)
 			[[ -n ${owner//[[:space:]]/} ]] && busy=1 && break
 		done
+		local main_copy=0 main_source=$main_layer
 		if ((busy)); then
 			# The same answer the workspace layer already gives itself when
 			# another run holds it: take a copy rather than share the file.
+			#
+			# --reflink=auto asks the filesystem for a copy-on-write clone
+			# first, which would be instant and atomic and would end the tearing
+			# described below outright. It does not help here: the state
+			# directory on this host is ext4 on LVM, and `cp --reflink=always`
+			# inside it answers "Operation not supported" - measured, not
+			# assumed, because the answer depends entirely on the filesystem
+			# under $STATE_DIR. So cp silently falls back to a full read and
+			# the repair below is what actually carries this. On a state
+			# directory that lives on btrfs or XFS the clone succeeds, the copy
+			# is a point-in-time image rather than a smear, and asking cost
+			# nothing.
 			log "the main checkout is running - copying its layer instead of sharing it"
-			cp --sparse=always "$main_layer" "$RUN_DIR/main-layer.ext4" 2>/dev/null &&
-				main_layer="$RUN_DIR/main-layer.ext4"
+			local cp_rc=0
+			cp --reflink=auto --sparse=always "$main_layer" \
+				"$RUN_DIR/main-layer.ext4" 2>"$RUN_DIR/main-layer-cp.log" ||
+				cp_rc=$?
+			if ((cp_rc)); then
+				# A FAILED COPY MUST NOT FALL BACK TO SHARING IT. The old form
+				# was `cp ... 2>/dev/null && main_layer=<the copy>`, so cp
+				# running out of space - and this host's state filesystem sits
+				# at 92% while a layer is 9.4G - left main_layer pointing at the
+				# live original with the error thrown away, and the run then did
+				# exactly the thing this whole branch exists to prevent: attach
+				# a mounted, actively written ext4 to a second VM. That is what
+				# corrupted the layer three times. Failing loudly is the only
+				# safe answer.
+				rm -f "$RUN_DIR/main-layer.ext4"
+				die "could not copy the layer of $main_dir (cp exit $cp_rc).
+       Sharing the original is not an option - a VM is writing to it right
+       now, and a second VM reading it is what corrupts it.
+         why:  $RUN_DIR/main-layer-cp.log
+         free: $(df -h "$STATE_DIR" | awk 'NR==2 {print $4}') on $STATE_DIR
+       Free some space, or wait for the run in $main_dir to finish."
+			fi
+			main_layer="$RUN_DIR/main-layer.ext4"
+			main_copy=1
 		fi
 
 		local fsck_rc=0
-		sbin e2fsck -p "$main_layer" >/dev/null 2>&1 || fsck_rc=$?
-		if ((fsck_rc > 1)); then
+		sbin e2fsck -p "$main_layer" >"$RUN_DIR/main-layer-fsck.log" 2>&1 || fsck_rc=$?
+		# A COPY TAKEN FROM A MOUNTED FILESYSTEM IS TORN BY CONSTRUCTION, and
+		# repairing it is free.
+		#
+		# cp reads this image sequentially over several seconds while the other
+		# VM has it mounted read-write, so the superblock comes from one instant
+		# and the journal from a later one. Measured: of thirty copies taken
+		# from two different live layers, every one came back with a journal
+		# e2fsck had to recover - the copy is never a clean image, only ever a
+		# dirty one that happens to be recoverable. What was reported from a
+		# real run is the case where it is not, e2fsck exit 8. Whether the two
+		# halves merely disagree about the journal or disagree about the block
+		# bitmap is luck; `-p` refuses the second kind unattended, and is right
+		# to on a shared image.
+		#
+		# Measured on this same layer with the repair suppressed: the guest
+		# printed "cannot mount /dev/vda read-only" and dropped to a busybox
+		# prompt, and the run then sat there. That is the whole symptom.
+		#
+		# But this one is PRIVATE. It lives in $RUN_DIR, no other VM can see it,
+		# and it is thrown away when the run ends - so there is nothing to lose
+		# by repairing it and a whole run to lose by refusing. The workspace
+		# layer below has taken exactly this path since the eight-concurrent-run
+		# failure; the inherited layer only warned, and a guest that cannot
+		# mount it drops to a busybox prompt that looks like a slow gate rather
+		# than like a damaged image. That symptom cost fifty minutes.
+		if ((main_copy)) && ((fsck_rc >= 4)); then
+			log "the inherited layer was copied from a live filesystem - repairing the copy"
+			fsck_rc=0
+			sbin e2fsck -y "$main_layer" >>"$RUN_DIR/main-layer-fsck.log" 2>&1 ||
+				fsck_rc=$?
+			# Written as an if rather than `((fsck_rc < 4)) && fsck_rc=0`,
+			# because that form evaluates to 1 when the repair failed and
+			# `set -e` would then kill the run at the exact point it is trying
+			# to explain itself.
+			if ((fsck_rc < 4)); then fsck_rc=0; fi
+		fi
+		if ((fsck_rc > 1)) && ((main_copy)); then
+			# Refuse rather than attach an image already known to be unmountable.
+			# Booting on it produces a rescue prompt and no diagnosis; stopping
+			# here produces both.
+			die "the inherited layer of $main_dir was copied from a running VM and
+       came out damaged beyond what e2fsck -y will repair (exit $fsck_rc).
+       A VM given this image cannot mount it and drops to a rescue prompt,
+       so this run stops here instead.
+         what happened: $RUN_DIR/main-layer-fsck.log
+         the source:    $main_source
+       Let the run in $main_dir finish and try again, or repair the source
+       while NO VM holds it:  e2fsck -fy $main_source"
+		elif ((fsck_rc > 1)); then
 			log "WARNING: $main_layer needs repair that e2fsck -p will not do (exit $fsck_rc)"
 			log "  a read-only mount of it FAILS, so a VM inheriting it drops to a rescue"
 			log "  prompt and does nothing. Repair it while NO VM holds it:"
@@ -4645,7 +4728,12 @@ launch() {
 		fsck_rc=0
 		sbin e2fsck -y "$workspace_layer" >>"$RUN_DIR/layer-fsck.log" 2>&1 ||
 			fsck_rc=$?
-		((fsck_rc < 4)) && fsck_rc=0
+		# An if, not `((fsck_rc < 4)) && fsck_rc=0`. That form is a top-level
+		# statement whose value is 1 whenever the repair did NOT succeed, and
+		# under `set -euo pipefail` that kills the run silently - right where
+		# the code below is trying to print the one message that explains what
+		# went wrong. The repair failing is exactly when the diagnosis matters.
+		if ((fsck_rc < 4)); then fsck_rc=0; fi
 	fi
 	if ((fsck_rc == 1)); then
 		log "repaired the workspace layer (it was left dirty by an earlier run)"
