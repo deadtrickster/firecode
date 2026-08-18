@@ -129,3 +129,18 @@ tip" check here assumes a line.
 
 An agent of mine landed c39f9f3 as a merge on 2026-08-18. Nothing broke, and the
 rule was missing from this file rather than from its judgement.
+
+## UI work: name the Playwright flows before you write the component
+
+If your row touches the console, the flows come first - in the row, before any
+component code. List them as click-and-consequence sentences: what the operator
+clicks, what they should then see, and what must have changed on the node.
+
+The operator asked for this on 2026-08-18, in these words: "before implementing
+anything ui come up wit the playwright flows, so we dont have non workng buttons
+anymore." The console had collected controls that rendered and did nothing. They
+looked finished, so nobody opened them again.
+
+A flow written first has to say what the button DOES, which is the question a
+dead button never got asked. A flow written afterwards describes whatever the
+component happens to do, including nothing.
