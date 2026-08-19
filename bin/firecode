@@ -372,6 +372,67 @@ mkimage_from_dir() {
 	sbin mkfs.ext4 -q -F -L "$label" -d "$src" "$out"
 }
 
+# A SHARED CHECKOUT IS NOT A WORKSPACE, and packing a dirty one measures a
+# population nobody chose.
+#
+# stage_project takes the WORKING TREE - `git ls-files --cached --others`, which
+# is deliberate and right for a worktree of your own, where the untracked file
+# you just wrote is most of what you are being sent to work on. In the SHARED
+# checkout it means "master plus whatever another agent happened to be half-way
+# through typing", and 01M080XA77 lists what that cost in one day:
+#
+#   a gate reported 481/500 green about code the requester did not have
+#   a gate failed on another agent's commits, which the requester debugged as
+#     their own
+#   master was accused of being red on numbers from a tree nobody recognised
+#   an integration run came back 547 passed 0 failed AND STILL FAILED, on two
+#     files another agent was mid-edit on when the snapshot was taken
+#
+# THE TEST IS NOT "IS IT DIRTY". A worktree of your own is dirty all day and
+# that is the point of it. What makes a tree shared is that it is the MAIN
+# checkout of a repository other worktrees hang off - git answers that exactly:
+# a linked worktree's git dir is .git/worktrees/<name> while the common dir is
+# .git, and in the main checkout the two are the same path.
+#
+# TRACKED CHANGES ONLY, which is the row's own wording and the shape that bit:
+# an untracked file in the shared checkout is somebody's new work and packing it
+# is at worst generous, while a modified tracked file is an edit in flight
+# against a commit the run will report by name.
+shared_tree_guard() {
+	local dir=$1 gitdir common trees dirty
+	gitdir=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 0
+	common=$(cd "$dir" && realpath -m "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null) || return 0
+	[[ $gitdir == "$common" ]] || return 0 # a worktree of your own - yours to dirty
+	trees=$(git -C "$dir" worktree list --porcelain 2>/dev/null | grep -c '^worktree ')
+	((trees > 1)) || return 0 # nobody else is in this repository
+	dirty=$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)
+	[[ -n $dirty ]] || return 0
+
+	# THE BYPASS SAYS SO OUT LOUD. A refusal somebody silences quietly is a
+	# refusal that stops being read - the land guard learned this in 6dc27a9.
+	if [[ -n ${FIRECODE_PACK_SHARED_DIRTY:-} ]]; then
+		log "PACKING A DIRTY SHARED CHECKOUT ON PURPOSE (FIRECODE_PACK_SHARED_DIRTY):"
+		printf '%s\n' "$dirty" | head -20 | sed 's/^/       /' >&2
+		log "whatever this run measures, it is not $(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+		return 0
+	fi
+
+	die "$dir is the shared checkout of a repository with $trees worktrees, and it
+       has uncommitted tracked changes. Packing it would gate master plus
+       whoever is mid-edit, and the run would report a commit that does not
+       contain what ran:
+
+$(printf '%s\n' "$dirty" | head -20 | sed 's/^/         /')
+
+       Work in a worktree of your own - it is one command and nothing of yours
+       ends up in anybody else's snapshot:
+
+         git -C $dir worktree add -b <branch> ~/Projects/wt-<name> master
+         firecode run --project ~/Projects/wt-<name> ...
+
+       If packing somebody's work in flight is genuinely what you want,
+       FIRECODE_PACK_SHARED_DIRTY=1 says so and the run prints what it took."
+}
 # Lay the project out for imaging. Build artefacts are the difference between
 # a 150K drive and a 10G one, so ignored files are left behind by default.
 # Hardlinked where the filesystems allow it, so this copies no data.
@@ -4328,6 +4389,11 @@ launch() {
 	else
 		((RESUME_TREE)) && log "no previous tree for this project, starting from $WORKDIR"
 		local src_stage="$RUN_DIR/src"
+		# ASKED HERE, WHERE THE TREE IS ABOUT TO BECOME A MEASUREMENT. Not in
+		# stage_project itself: --add-dir stages read-only context with the same
+		# function, and refusing to let somebody READ a colleague's half-written
+		# file is a different and much weaker claim than refusing to gate it.
+		shared_tree_guard "$WORKDIR"
 		stage_project "$WORKDIR" "$src_stage"
 		src_size=$(size_for_dir "$src_stage" $((4 * 1024 * 1024 * 1024)))
 		log "packing $WORKDIR into a $((src_size / 1024 / 1024 / 1024))G drive"
