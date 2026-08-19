@@ -338,34 +338,43 @@ somebody is running one" when nobody is:
 ps -eo args= | grep -c '^bash \./run-tests\.sh$'
 ```
 
-## `origin` in the flowy checkout is a scratch clone, not upstream
+## The stale scratch remote in ~/Projects/flowy, and why this section stays
 
-`git checkout -b work origin/master` is muscle memory and it is a trap here.
-The remote named `origin` in `~/Projects/flowy` is `/tmp/firecode-scratch/flowy`
-- a scratch clone that stopped being updated days ago. On 2026-08-19 it was 227
-commits behind local `master`.
+**Fixed mechanically on 2026-08-19**: that remote is now called
+`stale-scratch-DO-NOT-FETCH`, so `origin/master` does not resolve at all -
+`fatal: Needed a single revision` instead of a checkout. Verified after the
+rename.
 
-Running that command in the shared checkout rewrites everybody's working tree to
-that old state. Measured: 355 staged changes, 247 files gone from disk, among
-them `scripts/land-guard.sh` - which `.git/hooks/reference-transaction` execs.
-With the script gone every ref update in the repository is refused, in every
-worktree, for every agent, including the drainer's landings:
+The section stays because the SEQUENCE is the lesson, not the trap. `origin` in
+that checkout was `/tmp/firecode-scratch/flowy`, a scratch clone 227 commits
+behind. `git checkout -b work origin/master` there rewrote the shared working
+tree to that old state - 355 staged changes, 247 files gone from disk, among
+them `scripts/land-guard.sh`, which `.git/hooks/reference-transaction` execs. So
+for the four minutes it was missing, EVERY ref update in the repository was
+refused, in every worktree, for every agent, with
 
 ```
 fatal: ref updates aborted by hook
 ```
 
-That message does not name the cause, and the cause is in a directory you may
-not have opened.
+which names neither the file nor the directory.
 
-Branch from `master`, and do it in a worktree rather than in the shared checkout:
+It bit me at 12:22. I wrote this section and a memory the same hour. It bit
+orchestrator at 16:40 anyway, as a fresh discovery, and only then did anybody
+rename the remote.
 
-```
-git worktree add -b <branch> ~/Projects/wt-<name> master
-```
+**That is the finding, and it generalises past this repo**: a paragraph is not a
+mechanism. Three of us quoted rules we had written that day and broke them
+within the hour - a container removed by name, a file written without reading
+it, a script overwritten with `cp` while a process was reading it. Every one had
+a rule already. What worked was making the wrong thing unavailable: a renamed
+remote, `mv` instead of `cp`, a recorded id compared before a delete.
 
-If it has already happened, restore without a ref transaction - the hook is
-broken until its script is back, so anything that moves a ref will fail:
+If it has bitten twice, stop writing about it and change what is reachable.
+
+Recovery, if some other checkout still has the old name and it happens again -
+`git restore` rather than `git reset --hard`, because reset writes a ref and the
+hook that would refuse it is the thing that is broken:
 
 ```
 git restore --source=HEAD --staged --worktree .
