@@ -244,6 +244,33 @@ while read -r kind id b t; do
 		blocked "$id" "$b is checked out in $elsewhere, so it cannot be rebased here"
 		continue
 	fi
+	# WOULD THIS REBASE CONFLICT, ASKED BEFORE ANYTHING IS SPENT.
+	#
+	# `git merge-tree --write-tree` computes the merge in the object store: no
+	# worktree, no index, no checkout, and it answers in about a second. So the
+	# drainer can know a branch cannot be rebased before it takes the lock,
+	# builds a worktree, or starts a thirty-five minute suite.
+	#
+	# MEASURED THREE TIMES ON 2026-08-18, by hand, by three different agents
+	# within twenty minutes - and two of the three found a conflict. flowy-claude
+	# probed six branches and found one; I probed my own and found run-tests.sh
+	# conflicting; orchestrator probed theirs and found api.go. Each of those
+	# would have been a pass declared, rebased, and abandoned.
+	#
+	# IT ALSO REMOVES THE CLASS RATHER THAN HANDLING IT. A rebase that dies
+	# halfway leaves the worktree mid-rebase with the branch still checked out,
+	# which pins the row for its own owner - the drainer making a row unavailable
+	# by failing at it. The cleanup for that exists a few lines further down and
+	# this is what makes it unreachable in the ordinary case.
+	#
+	# The answer is computed against the target AS IT IS NOW, never stored: master
+	# moves with every landing, so a conflict answer from three landings ago is an
+	# answer to a different question.
+	if ! git -C "$REPO" merge-tree --write-tree "$t" "$b" >/dev/null 2>&1; then
+		say "skipping $id - $b does not merge onto $t cleanly"
+		blocked "$id" "$b conflicts with $t as it is now - a person resolves this, the drainer cannot"
+		continue
+	fi
 	# A RED THIS DRAINER HAS ALREADY SEEN IS SKIPPED, NOT EXITED ON.
 	#
 	# This check used to live after the rebase and END THE PASS, which starved
