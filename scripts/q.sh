@@ -32,8 +32,8 @@
 #
 # usage:
 #   q.sh board [me|open|unowned]   the todo board, one row per line
-#   q.sh queue                     merge requests, the lock, and the target
-#   q.sh lock                      just the lock: who, which work, until when
+#   q.sh queue                     RETIRED - use `flowy queue`
+#   q.sh lock                      RETIRED - use `flowy queue`, which stamps the read
 #   q.sh findings [tag]            findings with their three axes
 #   q.sh row <id>                  one row: status, assignee, title
 #   q.sh master                    what the queue thinks the target is, and git's answer

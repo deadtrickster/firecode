@@ -291,9 +291,9 @@ newer master and cherry-picked another commit onto it, batching work. The gate
 was then measuring a tree that no longer existed. Nothing false was recorded
 only because `gated_tip` was still empty when it was noticed.
 
-So: batch BEFORE filing, not after declaring. `scripts/q.sh queue` shows
-`gate_run` per row - if a row has one, that branch is somebody's measurement.
-If you must change it, abandon first and say why:
+So: batch BEFORE filing, not after declaring. `flowy queue` marks a row `gating`
+when a run is measuring it - if it says that, the branch is somebody else's
+measurement. If you must change it, abandon first and say why:
 
 ```
 POST $FLOWY_ADDR/api/merge/<id>/abandon  {"reason": "rebasing to batch"}
@@ -400,3 +400,38 @@ firecode spawn-server                   # refuses, and says since when and wheth
 And when the answer is "stale", `firecode spawn-server restart` - not
 `firecode spawn-server`, which is a refusal, and never `pkill -f`, which matches
 the shell running the server as well and leaves the old one holding the port.
+
+## What is already in scripts/, so you do not write it again
+
+This file's own rule, applied to itself: a tool nobody knows about is a tool
+nobody uses. Two rescue scripts were written four times over on 2026-08-17
+because their authors never said they existed, and three of the entries below
+exist only because somebody hand-rolled the same loop four times in one night.
+
+Every one takes `FLOWY_AGENT=<you>` and refuses rather than speaking as the
+operator.
+
+```
+say.sh          say something in the room; refuses a message over six lines
+board-nag.sh    what work is waiting for you; --watch BLOCKS on the node's
+                /api/nag/wait until the counts you act on change
+q.sh            the board, findings, one row, and what the target is
+                (queue and lock are retired - `flowy queue` does both better)
+claim-row.sh    win a row or do not spawn: a claim you can lose, and be told
+drain.sh --once one landing chain: pick, declare, rebase, pre-gate, gate,
+                record, land. One at a time per box, held by a flock
+pre-gate.sh     is this gate run worth its 35 minutes. --row <id> asks the node
+                the queue's half instead of guessing at it
+land.sh         land a gated branch, refusing every way it can be wrong
+run-wait.sh     wait for a firecode run and print what it MEASURED, not its exit
+busy.sh         is a gate running on this box, asked in the one form that does
+                not answer about the asker. --wait blocks until the box is free
+bundle.sh       fetch the bundle the node is SERVING and refuse the SPA
+                fallback, which answers 200 with html and greps to zero
+scratch-node.sh a flowy node of your own in ninety seconds, on a port nothing
+                holds, proved by node name. `down` removes only what it started
+```
+
+If you add one, put it here in the same breath. If you retire a verb, grep for
+it first - this file pointed at `q.sh queue` for hours after that verb started
+answering "retired", which is a preamble sending people to a refusal.
