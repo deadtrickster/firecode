@@ -65,25 +65,30 @@ board)
 			| sort_by(.status)[]
 			| "\(.id) \(.status[0:6]) \((.fields.assignee // "-")[0:12]) \(.title[0:48])"'
 	;;
-queue)
-	get "/api/merge-queue" | jq -r '
-			"target \(.target_tip[0:12]) from=\(.tip_from) gating=\(.gating)",
-			(if (.lock.held // false)
-			 then "lock   \(.lock.holder_name) item=\(.lock.item[0:10]) until=\(.lock.until[11:19])"
-			 else "lock   free" end),
-			(.items[]? | "req    \(.id) \(.status // "-")")'
-	;;
-lock)
-	# A LOCK READING IS A CLAIM ABOUT THE PAST, so it says when it was taken.
+queue | lock)
+	# RETIRED, 2026-08-19: `flowy queue` does this and does it better.
 	#
-	# Twice on 2026-08-18 somebody waited on a lock that had already been
-	# released, quoting a reading minutes old as if it were current - and both
-	# readings were true when taken. Printing the moment beside the answer makes
-	# a stale quote visible as stale to whoever reads it next, without anybody
-	# having to remember to add it. Remembering is what failed both times.
-	get "/api/merge-queue" | jq -r --arg now "$(date -u +%H:%M:%SZ)" 'if (.lock.held // false)
-			then "held by \(.lock.holder_name) for \(.lock.item) until \(.lock.until)   [read \($now)]"
-			else "free   [read \($now)]" end'
+	# These parsed the merge queue's json into lines, which was the right shape
+	# and the wrong place: /api/merge-queue answered a map[string]any, so the
+	# console, the drainer, the wait door and this file each rebuilt the answer
+	# by hand and drifted. That is how I came to read `blocked_why` off a surface
+	# that nests it and report a defect that did not exist.
+	#
+	# The verb decodes the node's own type, so the two ends cannot disagree. It
+	# also prints the branch and the owner beside each row, and stamps the moment
+	# it read the lock - the thing added here after two people quoted a stale
+	# lock reading minutes old.
+	#
+	# And it refuses to speak as the operator by default, which this never
+	# checked: every q.sh read without FLOWY_AGENT used the operator's token.
+	{
+		printf 'q: retired - use "flowy queue". It decodes the type the node itself\n'
+		printf '   writes rather than parsing this shape by hand, names the branch and\n'
+		printf '   owner on each row, stamps the moment it read the lock, and refuses\n'
+		printf '   to speak as the operator by default - which this never checked.\n\n'
+		printf '   FLOWY_AGENT=%s flowy queue --url %s\n' "$NAME" "$ADDR"
+	} >&2
+	exit 2
 	;;
 findings)
 	# The three axes and nothing else. The bodies are the bulk of this door and
