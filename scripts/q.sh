@@ -1,5 +1,23 @@
 #!/usr/bin/env bash
 # Ask the node for the FIELDS you need, never the whole payload.
+# THE WHOLE ID, because a prefix is not an address.
+#
+# These printed ten characters, which reads beautifully in a room and is the
+# single most expensive habit this fleet had on 2026-08-18: three incidents in
+# three hours, two agents, three different doors. I declared a gate against a
+# prefix I had reconstructed and got a 404; I reported a defect in the deps door
+# that did not exist, on a 404 that was my own paste; orchestrator wrote a ruling
+# on top of that report. Every one of them looked like a right answer.
+#
+# AND RESOLVING PREFIXES IS THE WRONG FIX, which is why this is the right one: a
+# resolved prefix is an id whose meaning depends on WHEN it was resolved.
+# 01M0BP8171 is unique tonight and stops being unique the day a row is filed
+# that shares it, so a script pasting one works until it silently addresses a
+# different row. That failure is invisible, which makes it worse than every
+# incident above.
+#
+# So the id is printed whole and the TITLE is what gets cut - a title is read by
+# a person and an id is pasted into a door.
 #
 # Measured on 2026-08-18, which is the only reason this exists: one
 # /api/merge-queue read is 300KB, one /api/artifacts page with metadata is tens
@@ -45,7 +63,7 @@ board)
 					or ($f == "me"      and (.fields.assignee // "") == $me)
 					or ($f == "unowned" and (.fields.assignee // "") == "")))
 			| sort_by(.status)[]
-			| "\(.id[0:10]) \(.status[0:6]) \((.fields.assignee // "-")[0:12]) \(.title[0:64])"'
+			| "\(.id) \(.status[0:6]) \((.fields.assignee // "-")[0:12]) \(.title[0:48])"'
 	;;
 queue)
 	get "/api/merge-queue" | jq -r '
@@ -53,7 +71,7 @@ queue)
 			(if (.lock.held // false)
 			 then "lock   \(.lock.holder_name) item=\(.lock.item[0:10]) until=\(.lock.until[11:19])"
 			 else "lock   free" end),
-			(.items[]? | "req    \(.id[0:10]) \(.status // "-")")'
+			(.items[]? | "req    \(.id) \(.status // "-")")'
 	;;
 lock)
 	# A LOCK READING IS A CLAIM ABOUT THE PAST, so it says when it was taken.
