@@ -64,6 +64,19 @@ up() {
 		-p "$PGPORT:5432" postgres:17-alpine >/dev/null ||
 		die "could not start postgres - is one already on $PGPORT?"
 	dsn="postgres://postgres:scratch@127.0.0.1:$PGPORT/flowy?sslmode=disable"
+	# WHOSE CONTAINER THIS IS, written down at the moment it is started.
+	#
+	# `down` used to remove any container matching $NAME-pg, and $NAME defaults
+	# to flowy-scratch - so a `scratch-node.sh down` typed with no environment
+	# removes whatever is answering to the default name, which on a box four
+	# agents share is usually somebody else's. Measured on 2026-08-19: I swept
+	# what I thought were my own leftovers and killed a scratch database that had
+	# been up 24 minutes and was not mine.
+	#
+	# The id rather than the name, because the name is what collides. A container
+	# recreated by somebody else has a different id, so a stale state file cannot
+	# authorise removing theirs.
+	docker inspect -f '{{.Id}}' "$NAME-pg" >"$STATE/container.id" 2>/dev/null || true
 
 	export PATH="$PGBIN:$PATH" LD_LIBRARY_PATH="$PGLIBS"
 	local i
@@ -114,7 +127,38 @@ down() {
 		kill "$(cat "$STATE/node.pid")" 2>/dev/null || true
 		rm -f "$STATE/node.pid"
 	fi
+	# ONLY THE CONTAINER THIS STATE DIRECTORY STARTED.
+	#
+	# This used to be `docker rm -f "$NAME-pg"`, and $NAME defaults to
+	# flowy-scratch, so a `down` typed with no environment removed whatever was
+	# answering to the default name. On a box four agents share that is usually
+	# somebody else's node. Measured on 2026-08-19: I swept what I believed were
+	# my own leftovers and killed a scratch database that had been up for 24
+	# minutes and belonged to another seat, which from inside their check looks
+	# like the store falling over.
+	#
+	# The recorded id is the authority, not the name: the name is the thing that
+	# collides, and a container somebody else recreated under the same name has a
+	# different id. No state file means this shell never started one, and the
+	# honest answer to "remove the container you started" is then that there
+	# isn't one.
+	want=$(cat "$STATE/container.id" 2>/dev/null || true)
+	have=$(docker inspect -f '{{.Id}}' "$NAME-pg" 2>/dev/null || true)
+	case "$want" in
+	"")
+		[ -n "$have" ] && say "$NAME-pg is running and this state directory did not start it - left alone"
+		say "down (nothing of mine to remove)"
+		return 0
+		;;
+	esac
+	if [ -n "$have" ] && [ "$have" != "$want" ]; then
+		say "$NAME-pg is a DIFFERENT container from the one started here - left alone"
+		say "   started: $(printf '%.12s' "$want")  running: $(printf '%.12s' "$have")"
+		rm -f "$STATE/container.id"
+		return 0
+	fi
 	docker rm -f "$NAME-pg" >/dev/null 2>&1 || true
+	rm -f "$STATE/container.id"
 	say "down"
 }
 
