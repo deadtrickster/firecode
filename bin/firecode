@@ -6585,6 +6585,60 @@ spawn-server)
 		log "spawn server restarted on the code that is on disk now"
 		exit 0
 	fi
+	# STARTING A SECOND ONE IS NOT WHAT ANYBODY MEANT, and until now it answered
+	# with a Python traceback ending in `OSError: [Errno 98] Address already in
+	# use`. That reads as a broken tool. What it actually means is "the thing you
+	# are trying to start is already running", which is the answer somebody
+	# typing this wants, along with WHICH server and HOW OLD its code is.
+	#
+	# It matters more here than anywhere else in this file, because the server's
+	# own staleness note told people to run exactly this command - so the fix
+	# for "you are talking to stale code" was a traceback, and the next step
+	# after that traceback is usually `pkill`, which matches the shell running
+	# the server as well, kills that, and leaves the old server holding the
+	# port. That is the loop that had my server six hours behind its own source
+	# while I told people the fixes were live.
+	#
+	# THE PORT IS READ FROM THE ARGUMENTS, not assumed. `--port 9999` is somebody
+	# deliberately standing up a second server beside the first, and refusing
+	# that would be this guard inventing a collision that is not happening -
+	# which is the same defect pre-gate.sh had when it defaulted the agent name.
+	# ASKING WHAT IT IS is not asking to start one. Without this line
+	# `spawn-server --help` was refused with "nothing to start", which is the
+	# guard answering a question nobody asked - measured the first time it ran.
+	if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+		exec python3 "$ROOT/mcp/firecode-spawn.py" "$@"
+	fi
+	want_port=9770
+	prev=""
+	for arg in ${@+"$@"}; do
+		[[ $prev == --port ]] && want_port=$arg
+		prev=$arg
+	done
+	running=$(ss -lntp 2>/dev/null |
+		sed -n "s/.*:$want_port .*pid=\([0-9]*\).*/\1/p" | head -1) || true
+	if [[ -n ${running:-} ]]; then
+		since=$(ps -o lstart= -p "$running" 2>/dev/null | sed 's/^ *//')
+		# ITS SOURCE, NOT ITS BINARY. The server loads every .py in mcp/ once and
+		# never again, so what makes it stale is a file newer than the moment it
+		# started - the same question staleness_note asks from the inside, asked
+		# here where somebody can act on it.
+		newest=""
+		[[ -n $since ]] && newest=$(find "$ROOT/mcp" -maxdepth 1 -name '*.py' -newermt "$since" 2>/dev/null | head -3)
+		log "a spawn server is already running on $want_port (pid $running, since ${since:-unknown})"
+		if [[ -n $newest ]]; then
+			log "and its source has changed since it started:"
+			printf '%s\n' "$newest" | sed 's/^/         /' >&2
+			log "it is answering with the OLD code - restart before concluding anything"
+		fi
+		die "nothing to start. What you probably want:
+
+         firecode spawn-server restart      bounce it onto the code on disk
+         firecode spawn-server ps           what it is running right now
+
+       Do not pkill it: the pattern matches the shell running the server as
+       well, so it kills that and leaves the server holding the port."
+	fi
 	exec python3 "$ROOT/mcp/firecode-spawn.py" "$@"
 	;;
 test)

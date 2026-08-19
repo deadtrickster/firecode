@@ -90,7 +90,7 @@ def staleness_note(config_path=None):
             + SERVER_INFO["loaded"] + " and " + " and ".join(stale)
             + " changed on disk after that. It is still running the old "
             "version - what you read in the files is not what answered you. "
-            "Restart it (firecode spawn-server) before concluding anything "
+            "Restart it (firecode spawn-server restart) before concluding anything "
             "about a fix.")
 
 GUIDE_URI = "firecode://guide"
