@@ -77,31 +77,71 @@ queue_ready() { # rows that can land right now
 		<<<"${1:-}" 2>/dev/null || echo 0
 }
 
+# THE WAIT IS THE NODE'S NOW. This loop used to be a poll: read 200 rows, decide
+# in jq whether any of them counted as work, sleep, repeat. Both halves of that
+# were wrong in the same way - the sleep meant the answer was up to BOARD_EVERY
+# seconds old, and the jq was a FIFTH copy of "what counts as work" beside the
+# node's, this file's report half, the console's and the drainer's. Four seats
+# had already disagreed twice about what `active` means.
+#
+# GET /api/nag/wait blocks until the counts a seat acts on change and returns at
+# once when they do, so the interval below is a ceiling on how long a quiet wait
+# lasts rather than a floor on how late the news arrives.
+nag_wait() { # cursor, seconds - blocks up to seconds, prints the nag json
+	local out
+	if out=$(curl -sS --fail -m "$(($2 + 10))" -H "Authorization: Bearer $token" \
+		"$FLOWY_ADDR/api/nag/wait?since=$1&window=$2" 2>/dev/null); then
+		printf '%s' "$out"
+		return 0
+	fi
+	# A NODE WITHOUT THE DOOR IS NOT A NODE WITHOUT THE ANSWER. /api/nag landed
+	# first and answers the same counts, decided in the same place; only the
+	# blocking is missing. So an older node degrades to a poll of the node's own
+	# arithmetic rather than back to this file deciding for itself - which is
+	# the thing that had four seats disagreeing.
+	#
+	# --fail on both, so a 404 or a 401 is a failure here rather than an error
+	# body that parses to zero work and reads as a quiet board.
+	sleep "$2"
+	curl -sS --fail -m 8 -H "Authorization: Bearer $token" \
+		"$FLOWY_ADDR/api/nag" 2>/dev/null
+}
+
 if [[ ${1:-} == --watch ]]; then
 	waited=0
+	cursor=""
 	while :; do
-		board=$(board_read)
+		# THE MERGE QUEUE IS ITS OWN QUESTION and it is asked first, because a
+		# landable row rots: it stops being landable the moment master moves,
+		# and the nag door knows nothing about it.
 		queue=$(queue_read)
 		ready=$(queue_ready "$queue")
 		[[ $ready =~ ^[0-9]+$ ]] && ((ready > 0)) && break
-		if [[ -n $board ]]; then
-			# ACTIVE IS NOT WAITING. A row I hold and am working - or that one of
-			# my agents is working - is not work waiting for me, and waking on it
-			# is a nag every three minutes for the whole length of the job. Only
-			# an unowned row, or one of mine that is still sitting at todo,
-			# counts as something to be woken for. The merge queue above is
-			# separate and does wake on a landable row, because that one rots.
-			has=$(jq -r --arg me "$name" '[.artifacts[]? |
-				select((.status // "") != "done") |
-				select((.status // "") != "active") |
-				select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)] |
-				length' <<<"$board" 2>/dev/null || echo 0)
-			[[ $has =~ ^[0-9]+$ ]] && ((has > 0)) && break
+
+		before=$SECONDS
+		nag=$(nag_wait "$cursor" "$BOARD_EVERY")
+		# A NODE THAT DID NOT ANSWER IS NOT A QUIET BOARD. Without this the loop
+		# spins at curl's failure speed and calls it waiting - and a waiter that
+		# burns a core to learn nothing is worse than one that is late.
+		if [[ -z $nag ]]; then
+			sleep "$BOARD_EVERY"
+			waited=$((waited + BOARD_EVERY))
+			((waited >= BOARD_DEADLINE)) && exit 1
+			continue
 		fi
+		cursor=$(jq -r '.cursor // ""' <<<"$nag" 2>/dev/null || echo "")
+		# WHAT COUNTS AS WORK WAITING FOR THIS SEAT, and every one of these
+		# three is the node's count rather than this file's reading of a row:
+		# a row nobody is on, a row this seat holds and has not started, and a
+		# claim of its own that has gone quiet.
+		work=$(jq -r '((.unowned // 0) + (.mine_todo // 0) + (.stale // 0))' \
+			<<<"$nag" 2>/dev/null || echo 0)
+		[[ $work =~ ^[0-9]+$ ]] && ((work > 0)) && break
+
+		waited=$((waited + SECONDS - before))
 		((waited >= BOARD_DEADLINE)) && exit 1 # quiet deadline, like the waiter's
-		sleep "$BOARD_EVERY"
-		waited=$((waited + BOARD_EVERY))
 	done
+	board=$(board_read)
 else
 	board=$(board_read)
 	queue=$(queue_read)
