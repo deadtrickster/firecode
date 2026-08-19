@@ -675,8 +675,23 @@ say "verdict recorded, gated_tip $tip"
 # the target to have actually become the tip that was gated. A no-op merge
 # passes the first check and fails the second.
 on=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
-[ "$on" = "$rowtarget" ] ||
+if [ "$on" != "$rowtarget" ]; then
+	# SAID ON THE ROW, not only in this log. The refusal itself is right and has
+	# been since it was written; what was missing is that it stalls the WHOLE
+	# QUEUE and announces it to a status file on one box.
+	#
+	# Measured 2026-08-19: a seat parked the shared checkout on its own branch
+	# while waiting for a gate, four rows queued behind it, and I found it by
+	# reading the drainer's status for another reason. Nothing was broken and
+	# nobody could see it.
+	#
+	# This does not stop the next seat parking it - only working in a worktree
+	# does that, and we all already do. It makes the stall self-announcing,
+	# which is the same rule the conflict and checked-out skips follow: the
+	# thing that tried writes why it could not, where everybody reads.
+	blocked "$row" "the shared checkout $REPO is on $on, not $rowtarget - nothing can land until it is back. Whoever parked it: git -C $REPO checkout $rowtarget"
 	die "$REPO is on $on, not $rowtarget - a fast-forward there lands nothing and reports success"
+fi
 before=$(git -C "$REPO" rev-parse --short HEAD)
 
 FLOWY_TOKEN="$TOKEN" git -C "$REPO" merge --ff-only "$branch" >/dev/null ||
