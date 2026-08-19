@@ -519,7 +519,7 @@ fi
 # FLOWY_AGENT for the other half of the same lesson: without it, pre-gate cannot
 # tell this seat's lock from another's, and it says so rather than guessing.
 (cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH LD_LIBRARY_PATH=$HOME/.local/pg17-libs \
-	FLOWY_AGENT="$AGENT" bash "$HERE/pre-gate.sh" "$branch") ||
+	FLOWY_AGENT="$AGENT" bash "$HERE/pre-gate.sh" "$branch" --row "$row") ||
 	die "pre-gate says this run is not worth starting"
 
 # ------------------------------------------------------------ the gate
