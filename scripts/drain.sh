@@ -244,6 +244,29 @@ while read -r kind id b t; do
 		blocked "$id" "$b is checked out in $elsewhere, so it cannot be rebased here"
 		continue
 	fi
+	# A RED THIS DRAINER HAS ALREADY SEEN IS SKIPPED, NOT EXITED ON.
+	#
+	# This check used to live after the rebase and END THE PASS, which starved
+	# the queue: a parked row at the head meant every row behind it was never
+	# looked at, and nothing drained for twelve minutes tonight with two rows
+	# waiting and one of them the fix for the other.
+	#
+	# So it is a skip like any other, and it happens BEFORE the declare - which
+	# means it cannot use the post-rebase tip. It uses the pair that determines
+	# that tip instead: the branch as it is now and the target as it is now. If
+	# both are what they were when the red was recorded, the rebase would produce
+	# the tree that was already measured, so there is nothing to learn.
+	#
+	# Either one moving takes the row immediately, which is the property the
+	# whole fleet agreed on: what is refused is repeating a measurement, never
+	# refusing a tree nobody has measured.
+	bsha=$(git -C "$REPO" rev-parse --short "$b" 2>/dev/null || true)
+	tsha=$(git -C "$REPO" rev-parse --short "$t" 2>/dev/null || true)
+	if [ -n "$bsha" ] && [ -n "$tsha" ] &&
+		grep -qxF "$bsha $tsha" "$STATE/red-$id" 2>/dev/null; then
+		say "skipping $id - $b at $bsha onto $t at $tsha was already gated red"
+		continue
+	fi
 	row=$id branch=$b rowtarget=$t
 	break
 done <<<"$pick"
@@ -500,8 +523,17 @@ else
 	# The local note stays as a belt: the skip check below reads it, and a drainer
 	# whose node is briefly unreachable must still not re-measure a tree it has
 	# already measured. It is a cache of the queue's answer, not a second opinion.
+	# Recorded twice, because two different readers ask two different questions.
+	# The tip-keyed file answers "have I measured this exact tree", which the
+	# post-rebase check reads. The per-row file records the BRANCH and TARGET
+	# that produced that tree, which is what the pick loop can ask BEFORE a
+	# declare - it has no tip yet, and getting one costs a lock and a rebase.
 	printf 'red at %s, %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$(grep -E '^passed:' "$log" | tail -1)" >"$STATE/red-$row-$tip"
+	printf '%s %s\n' \
+		"$(git -C "$REPO" rev-parse --short "$branch" 2>/dev/null || echo unknown)" \
+		"$(git -C "$REPO" rev-parse --short "$rowtarget" 2>/dev/null || echo unknown)" \
+		>>"$STATE/red-$row"
 	say "the row stays open and the log stays at $log - a person reads it"
 	say "and $tip will not be gated again by this drainer until it changes"
 	exit 1
