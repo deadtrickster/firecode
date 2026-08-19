@@ -224,7 +224,7 @@ for it in q.get("items") or []:
         continue
     if not (it.get("branch") or "").strip():
         continue
-    print("ROW", it["id"], it["branch"], it.get("target") or "master")
+    print("ROW", it["id"], it["branch"], it.get("target") or "master", it.get("project") or "-")
 print("END")
 ')
 
@@ -258,18 +258,73 @@ row="" branch="" rowtarget=""
 # was found. It is a fact about a MOMENT rather than about the row: "checked out
 # in wt-qorder" is true until somebody detaches, so a declaration clears it and
 # every reader treats it as evidence with an age.
+
+# WHICH CHECKOUT A ROW'S BRANCH LIVES IN.
+#
+# 01M0DZPFP1. A merge row carries a branch and a target and NOT a repository -
+# the drainer supplied one from its own configuration, which is invisible while
+# one project files merge rows and wrong the moment a second does. Picking the
+# wrong checkout is not a failure that announces itself: it rebases a branch
+# from one project onto another project's master, gates the result, and records
+# a verdict about a tree nobody asked about.
+#
+# The row already carries a project - every artifact does. What is missing is
+# the map from a project to a checkout ON THIS MACHINE, and that is firecode's
+# to know: the node has no checkout and cannot answer it.
+#
+#   FLOWY_DRAIN_REPOS="flowy=/home/dead/Projects/flowy,serenedb=/home/dead/Projects/serenedb"
+#
+# UNSET MEANS WHAT IT MEANT BEFORE. One project, one checkout, $FLOWY_REPO for
+# every row - so a drainer nobody reconfigures behaves exactly as it did, and
+# the map is what a second project turns on rather than a migration everybody
+# has to do first.
+REPOS=${FLOWY_DRAIN_REPOS:-}
+
+# repo_for prints the checkout a row's project lives in, or nothing when this
+# machine has none for it.
+#
+# A PROJECT WITH NO CHECKOUT IS A REFUSAL, not a skip, and that is the half that
+# matters. Silently working only the rows it happens to have a repo for looks
+# exactly like an idle queue - which is the shape that had four rows waiting
+# behind a parked checkout tonight with nothing said. See the blocked() call.
+repo_for() { # project
+	local want=$1 pair
+	[ -n "$REPOS" ] || {
+		printf '%s' "$REPO"
+		return 0
+	}
+	# A row with no project takes the default too: it predates projects being
+	# on rows, and refusing it would be this map deciding about history.
+	[ -n "$want" ] && [ "$want" != "-" ] || {
+		printf '%s' "$REPO"
+		return 0
+	}
+	local IFS=,
+	for pair in $REPOS; do
+		case "$pair" in
+		"$want"=*) printf '%s' "${pair#*=}" && return 0 ;;
+		esac
+	done
+	return 1
+}
 blocked() { # id why
 	api POST "/api/merge/$1/blocked" \
 		"$(printf '{"why":"%s"}' "$(printf '%s' "$2" | sed 's/"/\\"/g')")" >/dev/null 2>&1 || true
 }
-while read -r kind id b t; do
+while read -r kind id b t proj; do
 	[ "$kind" = ROW ] || continue
 	[ "$t" = "$TARGET" ] || {
 		say "skipping $id - it targets $t and this drainer runs $TARGET"
 		blocked "$id" "targets $t, and this drainer runs $TARGET"
 		continue
 	}
-	elsewhere=$(git -C "$REPO" worktree list --porcelain |
+	# THE CHECKOUT THIS ROW'S BRANCH LIVES IN, before anything is spent on it.
+	rowrepo=$(repo_for "$proj") || {
+		say "skipping $id - no checkout on this machine for project $proj"
+		blocked "$id" "this drainer has no checkout for project $proj - it cannot rebase or gate the branch. Add it to FLOWY_DRAIN_REPOS on the box that runs the drainer, or run a drainer where that project lives"
+		continue
+	}
+	elsewhere=$(git -C "$rowrepo" worktree list --porcelain |
 		awk -v want="refs/heads/$b" '$1=="worktree"{w=$2} $1=="branch" && $2==want {print w}' |
 		grep -v "^$WORK$" | head -1 || true)
 	if [ -n "$elsewhere" ]; then
@@ -299,7 +354,7 @@ while read -r kind id b t; do
 	# The answer is computed against the target AS IT IS NOW, never stored: master
 	# moves with every landing, so a conflict answer from three landings ago is an
 	# answer to a different question.
-	if ! git -C "$REPO" merge-tree --write-tree "$t" "$b" >/dev/null 2>&1; then
+	if ! git -C "$rowrepo" merge-tree --write-tree "$t" "$b" >/dev/null 2>&1; then
 		say "skipping $id - $b does not merge onto $t cleanly"
 		blocked "$id" "$b conflicts with $t as it is now - a person resolves this, the drainer cannot"
 		continue
@@ -320,14 +375,18 @@ while read -r kind id b t; do
 	# Either one moving takes the row immediately, which is the property the
 	# whole fleet agreed on: what is refused is repeating a measurement, never
 	# refusing a tree nobody has measured.
-	bsha=$(git -C "$REPO" rev-parse --short "$b" 2>/dev/null || true)
-	tsha=$(git -C "$REPO" rev-parse --short "$t" 2>/dev/null || true)
+	bsha=$(git -C "$rowrepo" rev-parse --short "$b" 2>/dev/null || true)
+	tsha=$(git -C "$rowrepo" rev-parse --short "$t" 2>/dev/null || true)
 	if [ -n "$bsha" ] && [ -n "$tsha" ] &&
 		grep -qxF "$bsha $tsha" "$STATE/red-$id" 2>/dev/null; then
 		say "skipping $id - $b at $bsha onto $t at $tsha was already gated red"
 		continue
 	fi
-	row=$id branch=$b rowtarget=$t
+	# THE CHOSEN ROW DECIDES THE CHECKOUT for everything after this loop, which
+	# is why REPO is assigned here rather than read from the environment: the
+	# rest of the pass - worktree, rebase, gate, land - is about ONE row, and
+	# that row names its project.
+	row=$id branch=$b rowtarget=$t REPO=$rowrepo
 	break
 done <<<"$pick"
 
