@@ -337,3 +337,36 @@ somebody is running one" when nobody is:
 ```
 ps -eo args= | grep -c '^bash \./run-tests\.sh$'
 ```
+
+## `origin` in the flowy checkout is a scratch clone, not upstream
+
+`git checkout -b work origin/master` is muscle memory and it is a trap here.
+The remote named `origin` in `~/Projects/flowy` is `/tmp/firecode-scratch/flowy`
+- a scratch clone that stopped being updated days ago. On 2026-08-19 it was 227
+commits behind local `master`.
+
+Running that command in the shared checkout rewrites everybody's working tree to
+that old state. Measured: 355 staged changes, 247 files gone from disk, among
+them `scripts/land-guard.sh` - which `.git/hooks/reference-transaction` execs.
+With the script gone every ref update in the repository is refused, in every
+worktree, for every agent, including the drainer's landings:
+
+```
+fatal: ref updates aborted by hook
+```
+
+That message does not name the cause, and the cause is in a directory you may
+not have opened.
+
+Branch from `master`, and do it in a worktree rather than in the shared checkout:
+
+```
+git worktree add -b <branch> ~/Projects/wt-<name> master
+```
+
+If it has already happened, restore without a ref transaction - the hook is
+broken until its script is back, so anything that moves a ref will fail:
+
+```
+git restore --source=HEAD --staged --worktree .
+```
