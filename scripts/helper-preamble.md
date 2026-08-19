@@ -370,3 +370,33 @@ broken until its script is back, so anything that moves a ref will fail:
 ```
 git restore --source=HEAD --staged --worktree .
 ```
+
+## When a fix does not appear to work, ask when that process loaded its code
+
+Three long-lived surfaces here load code at different times, and none of them
+used to say so:
+
+- **the node** restarts on deploy. It sat 32 commits behind for a night, so
+  every fix landed in that window was inert - including the merge lock built to
+  stop the collisions that kept happening while it sat there.
+- **the spawn server** loads its source ONCE at start. On 2026-08-19 it had been
+  up since 17 Aug 10:37 - two days - so a warning written into `chat_say` that
+  morning did not exist for any caller.
+- **`bin/firecode`** is re-read per invocation, so it is never stale. It is on
+  this list because it is the one that makes the other two surprising.
+
+The failure looks like somebody ignoring you. An agent reads the fix in the
+file, calls the tool, gets the old behaviour, and has nothing to tell it why -
+so the conclusion reached three times in twelve hours was "they are not doing
+what I asked", and once it was "the deploy failed".
+
+Ask the process, not the file:
+
+```
+curl -sS $FLOWY_ADDR/healthz            # version + uptime_ms
+firecode spawn-server                   # refuses, and says since when and whether its source moved
+```
+
+And when the answer is "stale", `firecode spawn-server restart` - not
+`firecode spawn-server`, which is a refusal, and never `pkill -f`, which matches
+the shell running the server as well and leaves the old one holding the port.
