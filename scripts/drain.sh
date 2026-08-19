@@ -502,6 +502,25 @@ say "rebased onto $rowtarget, tip $tip"
 if [ -f "$STATE/red-$row-$tip" ]; then
 	say "$row at $tip already gated red - $(cat "$STATE/red-$row-$tip")"
 	say "push a fix or rebase; a second run of the same tree measures the same tree"
+	# AND REMEMBER IT WHERE THE PICK LOOP CAN READ IT, which is the half that was
+	# missing and the reason this stalled a queue.
+	#
+	# There are two red memories and they answer two questions: the tip-keyed
+	# file above answers "have I measured this exact tree", which is only
+	# answerable AFTER a rebase; the per-row file records the branch and target
+	# shas that produced it, which is what the pick loop can ask BEFORE spending
+	# a declare and a lock. A pass that reached here proved the tree is already
+	# measured and did not write the second one, so every later pass declared,
+	# locked, rebased and arrived back here - and this exits the PASS, so
+	# whatever was queued behind this row never got looked at at all.
+	#
+	# Measured by orchestrator on 2026-08-19 against 01M0D2TXH8: the pick loop
+	# was not what held it, this was.
+	printf '%s %s\n' \
+		"$(git -C "$REPO" rev-parse --short "$branch" 2>/dev/null || echo unknown)" \
+		"$(git -C "$REPO" rev-parse --short "$rowtarget" 2>/dev/null || echo unknown)" \
+		>>"$STATE/red-$row"
+	blocked "$row" "already gated red at $tip - $(cat "$STATE/red-$row-$tip"). Push a fix or rebase; the drainer will not measure the same tree twice"
 	exit 0
 fi
 
