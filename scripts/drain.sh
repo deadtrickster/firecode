@@ -76,6 +76,39 @@ done
 	exit 2
 }
 
+# ONE DRAINER AT A TIME, ON THIS MACHINE.
+#
+# Nothing enforced this and the shape it fails in is quiet. Two passes both pick
+# the same admissible row, both declare, and the second is refused at the lock -
+# that half is fine. What is not fine is the gate: the loser has already spent a
+# worktree, a rebase and up to 35 minutes measuring a tree it will never land,
+# and both passes write $STATUS, so the nag reports whichever finished last as
+# "the drainer" and the other run becomes invisible.
+#
+# A flock on a file descriptor rather than a pid file: the kernel drops it when
+# the process dies, however it dies, so a drainer killed mid-gate does not leave
+# a lock nobody can explain. `-n` because waiting is wrong here - a second
+# drainer is not early, it is redundant.
+#
+# BEFORE THE STATUS FILE IS TOUCHED, deliberately. A refusal that wrote "another
+# drainer is running" into $STATUS would overwrite the status of the pass that
+# IS running, and the nag would report the drainer as refused while it was
+# working - the same signal carrying two meanings, which is this fleet's most
+# expensive recurring defect.
+DRAIN_LOCK=${FLOWY_DRAIN_LOCK:-${TMPDIR:-/tmp}/flowy-drain.lock}
+exec 9>"$DRAIN_LOCK" || {
+	printf 'drain: cannot open %s\n' "$DRAIN_LOCK" >&2
+	exit 2
+}
+if ! flock -n 9; then
+	printf 'drain: another drainer holds %s - not starting a second one.\n' "$DRAIN_LOCK" >&2
+	printf '       Its status is in %s and its age is what tells you whether it is\n' \
+		"${FLOWY_DRAIN_STATUS:-$HOME/.cache/flowy-drain/status.json}" >&2
+	printf '       stuck. This exits 3 without writing that file, so the running\n' >&2
+	printf '       pass keeps its own last word.\n' >&2
+	exit 3
+fi
+
 # WHAT THE LAST PASS DID, where something that is not this process can read it.
 #
 # The operator's ask, 2026-08-18: "then nagger shows last drainer status - thats
