@@ -587,9 +587,33 @@ else
 	# the run reports - without it the row reads `gating` for the full fifteen
 	# minutes after the pass died, which is how two rows came to read as gating
 	# at once tonight when the lock is one.
+	# AND WHAT FAILED, not only how many.
+	#
+	# 01M0DXTNPM: every red this session ended with somebody typing a variant of
+	# `grep -n "^FAIL" -A 12 "$log" | head -25` to find out what broke. Four
+	# times by me on three rows, and two other seats did it in the room with
+	# their own spellings.
+	#
+	# The count alone cannot be acted on. "passed: 668 failed: 1" sends a reader
+	# to a log, and THE LOG LIVES ON WHICHEVER BOX RAN THE GATE - so for anybody
+	# else it is a fact with no way to check it. The first failure's own line
+	# fits in the note and travels with the row, which means `flowy queue` shows
+	# it to a seat that has no access to this machine at all.
+	#
+	# THE FIRST ONE, and the count says how many more. 31 failures with one cause
+	# read as 31 problems for an hour today until somebody read the first and saw
+	# every other was the same refusal.
+	#
+	# Quoted with %s through jq's own escaping below - a check name carries
+	# quotes and apostrophes ("a person's own row"), and a note that stops
+	# parsing is a note nobody sees.
+	first=$(grep -aE '^FAIL ' "$log" 2>/dev/null | head -1 | sed 's/ (exit [0-9]*)$//')
+	count=$(grep -aE '^passed:' "$log" 2>/dev/null | tail -1)
+	note=$count
+	[ -n "$first" ] && note="$count - $first"
 	reported=$(api POST "/api/merge/$row/gate" \
-		"$(printf '{"run":"%s","gated_tip":"%s","result":"red","note":"%s"}' \
-			"$run" "$tip" "$(grep -E '^passed:' "$log" | tail -1)")")
+		"$(jq -nc --arg run "$run" --arg tip "$tip" --arg note "$note" \
+			'{run: $run, gated_tip: $tip, result: "red", note: $note}')")
 	case "$(code_of "$reported")" in
 	200) say "red recorded on the row - the declaration is over and the queue can say so" ;;
 	*)
