@@ -620,7 +620,17 @@ fi
 
 # ------------------------------------------------------------ record and land
 
-verdict=$(api POST "/api/merge/$row/gate" "$(printf '{"run":"%s","gated_tip":"%s"}' "$run" "$tip")")
+# THE COUNT RIDES THE VERDICT, from the same line this pass already greps for
+# its own status file. flowy 791719b made a green carry a note and the landing
+# repeat it, and the drainer is the caller that has the number - the suite's own
+# "passed: N failed: M". Without this the door can carry it and nothing does.
+#
+# A green with no count was the asymmetry: a red has carried its note since the
+# verdict became a row, so the outcome nobody has to explain is the one whose
+# evidence was thrown away - exactly when a landing is announced to the room.
+count=$(grep -aE '^passed:' "$log" 2>/dev/null | tail -1)
+verdict=$(api POST "/api/merge/$row/gate" \
+	"$(printf '{"run":"%s","gated_tip":"%s","note":"%s"}' "$run" "$tip" "$count")")
 [ "$(code_of "$verdict")" = 200 ] || {
 	body_of "$verdict" >&2
 	die "recording the verdict answered $(code_of "$verdict")"
