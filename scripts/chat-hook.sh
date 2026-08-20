@@ -383,7 +383,11 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			(.actor_name // .meta.actor_name // (.actor // "?")[-8:]) +
 			(if (.room // "") != "" then " in #" + .room else "" end) + ": " +
 			((.body // "") | gsub("\n"; " ") | .[0:160]) +
-			(if (.thread // "") != "" then "\n      reply into it: --thread " + .thread else "" end)' \
+			(if (.thread // "") != "" or (.room // "") != ""
+			 then "\n      reply into it:"
+			      + (if (.room // "") != "" then " --room " + .room else "" end)
+			      + (if (.thread // "") != "" then " --thread " + .thread else "" end)
+			 else "" end)' \
 			<<<"$flowy_events" 2>/dev/null
 	}
 
