@@ -12,7 +12,7 @@
 #   GET  /api/merge-queue            the next row that is decided and admissible
 #   POST /api/merge/{id}/gate        declare - THIS TAKES THE LOCK
 #   git rebase master                the tree that lands is the tree measured
-#   pre-gate.sh <branch>             is this run worth its 35 minutes
+#   pre-gate.sh <branch>             is this run worth its five minutes
 #   ./run-tests.sh                   the gate
 #   POST /api/merge/{id}/gate        record the verdict, with gated_tip
 #   git merge --ff-only + POST land  land, through the door that writes the chain
@@ -96,7 +96,7 @@ done
 # Nothing enforced this and the shape it fails in is quiet. Two passes both pick
 # the same admissible row, both declare, and the second is refused at the lock -
 # that half is fine. What is not fine is the gate: the loser has already spent a
-# worktree, a rebase and up to 35 minutes measuring a tree it will never land,
+# worktree, a rebase and five minutes measuring a tree it will never land,
 # and both passes write $STATUS, so the nag reports whichever finished last as
 # "the drainer" and the other run becomes invisible.
 #
@@ -219,8 +219,8 @@ body_of() { printf '%s' "$1" | head -n -1; }
 # acted. Five instances of it in one day, filed as 01M0BFB7WP.
 #
 # The gap between reading and acting is what makes it wrong, and here that gap
-# is thirty-five minutes: the queue read below decides which row a gate spends
-# half an hour on.
+# is a whole gate: the queue read below decides which row the next five minutes
+# are spent on.
 
 queue=$(api GET /api/merge-queue) || die "cannot reach $NODE"
 [ "$(code_of "$queue")" = 200 ] || die "the queue answered $(code_of "$queue")"
@@ -372,7 +372,7 @@ while read -r kind id b t proj; do
 	# `git merge-tree --write-tree` computes the merge in the object store: no
 	# worktree, no index, no checkout, and it answers in about a second. So the
 	# drainer can know a branch cannot be rebased before it takes the lock,
-	# builds a worktree, or starts a thirty-five minute suite.
+	# builds a worktree, or starts the suite.
 	#
 	# MEASURED THREE TIMES ON 2026-08-18, by hand, by three different agents
 	# within twenty minutes - and two of the three found a conflict. flowy-claude
@@ -641,7 +641,7 @@ fi
 # run that mattered with the log of the run that repeated it - so the evidence
 # of the first red was destroyed by the second identical red.
 log=$STATE/drain-$row-$tip.log
-say "gating $tip - about 35 minutes, log at $log"
+say "gating $tip - about five minutes, log at $log"
 # FLOWY_AGENT IS UNSET FOR THE SUITE, and this is the drainer changing the
 # meaning of the thing it measures.
 #
