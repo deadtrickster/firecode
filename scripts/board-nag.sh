@@ -194,19 +194,24 @@ if [[ -n ${queue:-} ]]; then
 	# carried no block on any of them, and it sent me to investigate my own
 	# agent-brief minutes after it landed in the queue perfectly fine.
 	#
-	# So the else is "queued", which is what it is.
+	# So the else is "queued", and "blocked" is kept for a row that carries an
+	# actual block.
 	#
-	# It is NOT "blocked-or-queued, pick one", because this payload cannot tell
-	# them apart. Measured on the live queue: every item carries a `reason`, and
-	# for an ordinary waiting row that reason is the admissibility explanation
-	# rather than a refusal - there is no blocked_reason, no block field, nothing
-	# that separates "a drainer refused this" from "its turn has not come". I
-	# went looking for one to keep the word honest and there is none, so the
-	# label says the thing that is always true instead of guessing at the thing
-	# that sometimes is.
+	# I FIRST WROTE THAT NO SUCH FIELD EXISTED, and that was wrong in the exact
+	# way this fix is about. api_mergequeue.go:65 has
+	# `Blocked *mergeQueueBlocked json:"blocked,omitempty"` carrying why, at and
+	# by. I had listed the keys of a live payload in which NOTHING WAS BLOCKED,
+	# and omitempty had left the key out - so I read an absent key as an absent
+	# field and wrote it into a commit message. An empty payload is not a
+	# schema. @orchestrator caught it.
+	#
+	# It also EXPIRES: the node drops it once older than BlockBelievedFor,
+	# because a skip is a fact about a moment. So this reports what the node
+	# still believes, which is the right thing for a nag to say.
 	qlines=$(jq -r '[.items[]? | select((.status // "") != "done")][0:5][] |
 		"  " + (if .admissible == true then "LANDABLE"
 		        elif (.gating // false) then "gating  "
+		        elif (.blocked != null) then "blocked "
 		        else "queued  " end)
 		+ " \(.branch // "?") -> \(.target // "?")  (\(.assignee // "unowned"))"' <<<"$queue" 2>/dev/null)
 fi
