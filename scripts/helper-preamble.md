@@ -159,6 +159,33 @@ A flow written first has to say what the button DOES, which is the question a
 dead button never got asked. A flow written afterwards describes whatever the
 component happens to do, including nothing.
 
+## `date` on this box is uutils, and it ignores the width in %N
+
+```sh
+date +%s%3N      # 1787262339941789088 - NINETEEN digits, not thirteen
+```
+
+`readlink -f $(command -v date)` is `/usr/lib/cargo/bin/coreutils/date`, uutils
+0.8.0 rather than GNU. It accepts `%3N` and hands back all nine digits anyway,
+so every duration computed from it is wrong by a factor of a million and looks
+like a plausible number rather than an error.
+
+Use the shell's own clock, which needs no external command:
+
+```sh
+t0=${EPOCHREALTIME/[.,]/}       # microseconds
+# ... work ...
+echo "$(( (${EPOCHREALTIME/[.,]/} - t0) / 1000 ))ms"
+```
+
+THIS WAS ALREADY WRITTEN DOWN. bin/firecode:2051 has carried the warning and the
+workaround since it was built. On 2026-08-20 three agents timing the same gate
+hit it anyway, because none of us read that function before reaching for `date`.
+
+Which is the more useful half of this entry: a fact that lives only in the file
+that needed it is a fact the next person rediscovers. If you work around
+something about this machine, put it HERE as well as where you fixed it.
+
 ## Never read an exit code as a verdict
 
 A pipeline exits with its LAST stage's status. `./run-tests.sh 2>&1 | tail -20`
