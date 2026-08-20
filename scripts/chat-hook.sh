@@ -305,14 +305,32 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	# only ever guess at it, and every way of guessing was wrong: the checking
 	# shell matched its own pattern, one listener looked like three, and
 	# another agent's listener looked like this one.
-	flowy_listeners=0
+	# COULD NOT ASK IS NOT NOBODY IS LISTENING, and this hook got that wrong.
+	#
+	# Measured 2026-08-20: the node was redeploying, this 5s curl came back
+	# empty, flowy_listeners stayed 0, and the stop nag said "Nothing is
+	# listening to the FLOWY room" while /api/presence reported claude-host
+	# attached=true, waiter_kind=tracked, waiter_pid 459799 - the exact process
+	# that was polling at that moment.
+	#
+	# The consequence is not a wasted sentence. The remedy this nag prints is
+	# "start a loop", and arming a tracked waiter over the forked successor a
+	# delivery left behind SIGTERMs that successor - which the message itself
+	# says two lines further down. So a node restart produced a nag whose advice
+	# kills the listener it wrongly reported missing.
+	#
+	# -1 means unknown. Every caller must tell it from 0.
+	flowy_listeners=-1
 	flowy_presence=$(curl -s -m 5 -H "Authorization: Bearer $flowy_token" \
 		"$FLOWY_ADDR/api/presence" 2>/dev/null) || flowy_presence=""
 	if [[ -n $flowy_presence ]]; then
 		flowy_listeners=$(jq --arg me "$FLOWY_NAME" \
 			'[(.listeners // [])[] | select(.reader == $me and .attached)] | length' \
-			<<<"$flowy_presence" 2>/dev/null) || flowy_listeners=0
-		[[ $flowy_listeners =~ ^[0-9]+$ ]] || flowy_listeners=0
+			<<<"$flowy_presence" 2>/dev/null) || flowy_listeners=-1
+		# A body that is not the JSON we expect is also "could not ask" - an SPA
+		# fallback or a proxy error page parses as nothing and must not read as
+		# an empty room.
+		[[ $flowy_listeners =~ ^[0-9]+$ ]] || flowy_listeners=-1
 		((flowy_listeners > 0)) && FLOWY_ATTACHED=1
 	fi
 
@@ -418,7 +436,16 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	fi
 
 	if [[ $MODE == stop && $CHAT_QUIET == 0 ]]; then
-		if ((flowy_listeners == 0)); then
+		if ((flowy_listeners < 0)); then
+			# THE THIRD ARM. Saying nothing here would trade a false alarm for a
+			# silent gap - an agent going idle with no listener, and no hint,
+			# because the node happened to be restarting when we asked. So it
+			# says what it does not know, and deliberately does NOT print the
+			# arming command: the whole reason this branch exists is that
+			# arming on a bad reading kills a live successor.
+			FLOWY_REASON=$(printf 'Could not ask %s whether anything is listening for %s - the node did not answer. This is NOT the same as nobody listening, and it is not a reason to arm a waiter: if one is already running, arming a second SIGTERMs it.\nCheck first, and only arm if this comes back empty:\n  pgrep -af "flowy inbox --as %s"' \
+				"$FLOWY_ADDR" "$FLOWY_NAME" "$FLOWY_NAME")
+		elif ((flowy_listeners == 0)); then
 			# shellcheck disable=SC2016  # the $(cat ...) is a command for the
 			# reader to run, printed verbatim. Expanding it here would put the
 			# token into the message and into the transcript.
