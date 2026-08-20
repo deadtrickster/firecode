@@ -187,8 +187,27 @@ fi
 # a second gate on the same tip is the waste this queue exists to prevent.
 qlines=""
 if [[ -n ${queue:-} ]]; then
+	# "BLOCKED" IS THE NODE'S WORD FOR A REFUSAL, and this line was using it as
+	# an else. Every row that was neither landable nor gating - which is most of
+	# a healthy queue, since only one row gates at a time - was drawn as
+	# blocked. It said five of orchestrator's rows were blocked when the queue
+	# carried no block on any of them, and it sent me to investigate my own
+	# agent-brief minutes after it landed in the queue perfectly fine.
+	#
+	# So the else is "queued", which is what it is.
+	#
+	# It is NOT "blocked-or-queued, pick one", because this payload cannot tell
+	# them apart. Measured on the live queue: every item carries a `reason`, and
+	# for an ordinary waiting row that reason is the admissibility explanation
+	# rather than a refusal - there is no blocked_reason, no block field, nothing
+	# that separates "a drainer refused this" from "its turn has not come". I
+	# went looking for one to keep the word honest and there is none, so the
+	# label says the thing that is always true instead of guessing at the thing
+	# that sometimes is.
 	qlines=$(jq -r '[.items[]? | select((.status // "") != "done")][0:5][] |
-		"  " + (if .admissible == true then "LANDABLE" elif (.gating // false) then "gating  " else "blocked " end)
+		"  " + (if .admissible == true then "LANDABLE"
+		        elif (.gating // false) then "gating  "
+		        else "queued  " end)
 		+ " \(.branch // "?") -> \(.target // "?")  (\(.assignee // "unowned"))"' <<<"$queue" 2>/dev/null)
 fi
 [[ -n $board ]] || exit 0
