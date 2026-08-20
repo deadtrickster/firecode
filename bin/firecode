@@ -5430,6 +5430,59 @@ live_runs() {
 	done
 }
 
+# The same roster as `ps`, for something that is not a person.
+#
+# Deliberately NOT the same data. `ps` asks every guest over vsock with a 25s
+# timeout each, which is right for someone reading one screen and wrong for a
+# dashboard polling every few seconds: ten VMs would be four minutes of probes
+# for one page. So this reports only what the HOST already knows - the run
+# directory and a file mtime - and says `"probed": false` rather than implying
+# it asked.
+#
+# That field is not decoration. fctop drew a libvirt domain as ERROR for days
+# because "we did not ask" and "it did not answer" arrived as the same empty
+# value, and the fix there was exactly this distinction. A consumer that cannot
+# tell them apart will eventually paint one as the other.
+#
+# `last_output_s` is null when the VM has printed nothing yet, which is a
+# different fact from 0 seconds ago, and the JSON keeps them different.
+cmd_ps_json() {
+	local want=$1 id proj parent vmname backend quiet rows=()
+	while IFS=$'\t' read -r id proj parent vmname; do
+		[[ -n $want && $proj != "$want" && $vmname != "$want" ]] && continue
+		backend="firecracker"
+		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
+		quiet=""
+		[[ -f $RUNS/$id/console.log ]] &&
+			quiet=$(($(date +%s) - $(stat -c %Y "$RUNS/$id/console.log")))
+		rows+=("$id"$'\t'"$proj"$'\t'"$parent"$'\t'"$vmname"$'\t'"$backend"$'\t'"$quiet")
+	done < <(live_runs)
+
+	# Emitted by python rather than printf because a project path may contain a
+	# quote or a backslash, and hand-rolled JSON escaping is how a list door
+	# starts returning something the caller cannot parse.
+	printf '%s\n' ${rows[@]+"${rows[@]}"} | python3 -c '
+import json, sys
+vms = []
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    vid, proj, parent, name, backend, quiet = line.split("\t")
+    vms.append({
+        "id": vid,
+        "name": name or vid,
+        "project": proj,
+        "parent": None if parent in ("-", "") else parent,
+        "backend": backend,
+        "last_output_s": int(quiet) if quiet else None,
+        "probed": False,
+    })
+json.dump({"vms": vms}, sys.stdout)
+sys.stdout.write("\n")
+'
+}
+
 # What every VM is actually doing, in one place.
 #
 # `list` says which VMs exist, which is not the question anyone has while a VM
@@ -5437,8 +5490,25 @@ live_runs() {
 # running, what is it listening on, and is it busy or wedged - the things you
 # would otherwise get by opening a shell in each one in turn.
 cmd_ps() {
-	local want="" id proj parent addr any=0
-	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
+	local want="" id proj parent addr any=0 json=0
+	while (($#)); do
+		case $1 in
+		--project)
+			want=$(cd "$2" && pwd)
+			shift 2
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		*) die "usage: firecode ps [--project DIR] [--json]" ;;
+		esac
+	done
+
+	((json)) && {
+		cmd_ps_json "$want"
+		return
+	}
 
 	local vmname
 	while IFS=$'\t' read -r id proj parent vmname; do
@@ -6338,7 +6408,9 @@ firecode - run a coding agent in a Firecracker microVM
   firecode up                    start a VM and leave it running
   firecode in CMD [args...]      run a command in it, with its exit status
                                  --project DIR picks which VM, --cwd DIR where
-  firecode ps                    what every VM is doing right now
+  firecode ps [--json]           what every VM is doing right now
+                                 --json is the host's roster only, no guest
+                                 probe, for a dashboard rather than a person
   firecode logs [-f]             what it has printed, agent output included
   firecode say [VM] <text>       another turn for a run that is still going
   firecode watch [VM] [--every SEC] [-n LINES]

@@ -1013,11 +1013,56 @@ test_proc_mounted() {
 	(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
 }
 
+# A DROPPED FLAG IS WHAT THIS ASSERTS AGAINST, not JSON syntax.
+#
+# On a host with no VMs, `firecode ps` and `firecode ps --json` both exit 0 and
+# both print something, so a test that checked only the status - or only that
+# the output parsed - would pass on a build where --json was never read at all.
+# That is not hypothetical: flowy's `get` stopped at the first positional and
+# silently ignored --jq, and a className handed to clsx as a function was
+# dropped without a word. An ignored argument returns a wrong answer shaped
+# like a right one.
+#
+# So the two arms are the point. Same command, one flag different, and the
+# answers must DIFFER. One reading could never tell "honoured it" from "never
+# looked at it".
+test_ps_json_is_not_the_prose() {
+	local prose json parsed
+	prose=$("$FIRECODE" ps 2>&1)
+	json=$("$FIRECODE" ps --json 2>&1)
+
+	if [[ $prose == "$json" ]]; then
+		no "--json changes the answer" "both arms printed [$prose]"
+	else
+		ok "--json changes the answer"
+	fi
+
+	# It has to be JSON, and it has to carry an empty LIST rather than a
+	# sentence about emptiness - a dashboard cannot tell "no VMs" from "the
+	# door is broken" if the empty case is prose.
+	parsed=$(printf '%s' "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(type(d["vms"]).__name__, len(d["vms"]))
+' 2>&1) || parsed="unparseable: $parsed"
+	check "the empty roster is an empty list" "list 0" "$parsed"
+
+	# An unknown flag must refuse rather than be swallowed, for the same
+	# reason: silently accepting one is how a caller believes it asked for
+	# something it did not get.
+	if "$FIRECODE" ps --nonsense >/dev/null 2>&1; then
+		no "an unknown ps flag is refused" "exited 0"
+	else
+		ok "an unknown ps flag is refused"
+	fi
+}
+
 # -------------------------------------------------------------------- main
 
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
 
 run_test shellcheck
+run_test ps_json_is_not_the_prose
 run_test denylist
 run_test arg_massaging
 run_test terminal_escapes
