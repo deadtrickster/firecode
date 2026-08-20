@@ -1057,12 +1057,51 @@ print(type(d["vms"]).__name__, len(d["vms"]))
 	fi
 }
 
+# The registry a spawn door reads, and the same two-arm rule as ps --json.
+#
+# `projects` exists so that nothing outside firecode has to parse spawn.json.
+# Two programs reading one config file disagree the day its shape changes, and
+# the second one finds out in production - so the contract asserted here is the
+# VERB, and it has to keep answering even when the caller is a machine.
+test_projects_is_a_registry_not_a_config_file() {
+	local prose json shape
+	prose=$("$FIRECODE" projects 2>&1)
+	json=$("$FIRECODE" projects --json 2>&1)
+
+	if [[ $prose == "$json" ]]; then
+		no "projects --json changes the answer" "both arms printed the same"
+	else
+		ok "projects --json changes the answer"
+	fi
+
+	# Every row carries where it is and whether that is still true. `exists`
+	# is reported rather than filtered, because a registered name whose
+	# directory has gone reads as a name nobody registered once it is dropped
+	# from the list.
+	shape=$(printf '%s' "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rows = d["projects"]
+keys = sorted(rows[0]) if rows else []
+print(",".join(keys))
+' 2>&1) || shape="unparseable: $shape"
+	check "each project says its name, its path and whether it is there" \
+		"exists,name,path" "$shape"
+
+	if "$FIRECODE" projects --nope >/dev/null 2>&1; then
+		no "an unknown projects flag is refused" "exited 0"
+	else
+		ok "an unknown projects flag is refused"
+	fi
+}
+
 # -------------------------------------------------------------------- main
 
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
 
 run_test shellcheck
 run_test ps_json_is_not_the_prose
+run_test projects_is_a_registry_not_a_config_file
 run_test denylist
 run_test arg_massaging
 run_test terminal_escapes

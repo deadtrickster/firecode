@@ -5430,6 +5430,73 @@ live_runs() {
 	done
 }
 
+# The names a caller may spawn over, and where each one actually is.
+#
+# spawn.json is already the registry: mcp/firecode-spawn.py reads it, and the
+# reason it exists is the reason this verb exists rather than a --workdir on the
+# door - "Projects are named keys from a config file, never paths from the
+# caller", because an agent that can pass an arbitrary path can pack any
+# directory into a VM that has the network.
+#
+# It is a verb rather than a file anything else reads. Two programs parsing one
+# config is two programs that disagree the day its shape changes, and the second
+# one usually finds out in production. Whoever wants the list asks firecode.
+#
+# The scratch root is included the same way the spawn server includes it: what
+# is on disk is the truth, because a name registered only in memory disappears
+# on a restart while the directory it made stays.
+cmd_projects() {
+	local json=0
+	while (($#)); do
+		case $1 in
+		--json)
+			json=1
+			shift
+			;;
+		*) die "usage: firecode projects [--json]" ;;
+		esac
+	done
+
+	local conf="$ROOT/spawn.json"
+	[[ -f $conf ]] || die "no spawn.json at $conf - there is no project registry on this host"
+
+	FIRECODE_PROJECTS_JSON=$json python3 - "$conf" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1]) as fh:
+    raw = json.load(fh)
+
+projects = {}
+for name, p in (raw.get("projects") or {}).items():
+    projects[name] = os.path.abspath(os.path.expanduser(p))
+
+scratch = raw.get("scratch_root") or ""
+if scratch:
+    scratch = os.path.abspath(os.path.expanduser(scratch))
+    if os.path.isdir(scratch):
+        for entry in sorted(os.listdir(scratch)):
+            path = os.path.join(scratch, entry)
+            if os.path.isdir(path) and entry not in projects:
+                projects[entry] = path
+
+# `exists` is reported rather than filtered out. A registered name whose
+# directory has gone is a fact somebody has to fix, and a list that silently
+# omits it looks like a name nobody ever registered.
+rows = [{"name": n, "path": p, "exists": os.path.isdir(p)}
+        for n, p in sorted(projects.items())]
+
+if os.environ.get("FIRECODE_PROJECTS_JSON") == "1":
+    json.dump({"projects": rows, "scratch_root": scratch}, sys.stdout)
+    sys.stdout.write("\n")
+else:
+    if not rows:
+        print("no projects registered in spawn.json")
+    for r in rows:
+        print("%-14s %s%s" % (r["name"], r["path"],
+                              "" if r["exists"] else "   (MISSING)"))
+PY
+}
+
 # The same roster as `ps`, for something that is not a person.
 #
 # Deliberately NOT the same data. `ps` asks every guest over vsock with a 25s
@@ -6408,6 +6475,9 @@ firecode - run a coding agent in a Firecracker microVM
   firecode up                    start a VM and leave it running
   firecode in CMD [args...]      run a command in it, with its exit status
                                  --project DIR picks which VM, --cwd DIR where
+  firecode projects [--json]     the names a caller may spawn over, and where
+                                 each one is. Registered in spawn.json, so
+                                 nothing has to parse that file to find out
   firecode ps [--json]           what every VM is doing right now
                                  --json is the host's roster only, no guest
                                  probe, for a dashboard rather than a person
@@ -6521,6 +6591,10 @@ list | ls)
 ps)
 	shift
 	cmd_ps "$@"
+	;;
+projects)
+	shift
+	cmd_projects "$@"
 	;;
 logs)
 	shift
