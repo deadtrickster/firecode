@@ -640,7 +640,19 @@ fi
 # run that mattered with the log of the run that repeated it - so the evidence
 # of the first red was destroyed by the second identical red.
 log=$STATE/drain-$row-$tip.log
-say "gating $tip - about five minutes, log at $log"
+# NAMING THE COMMAND, because nothing else can tell you which one ran.
+#
+# .flowy-gate execs the project's suite, so the process that ends up in `ps` is
+# the suite with the drainer as its parent - which is exactly what the old
+# hardcoded `./run-tests.sh` produced too. Measured 2026-08-20 while trying to
+# confirm the first pass through the project's own gate: the process tree, the
+# environment and the log were all identical either way, and the only evidence
+# available was that the pass had started three seconds after the file changed.
+#
+# A mechanism whose use cannot be observed is one nobody can verify, so the
+# drainer says which command it is about to run, in the line that already goes
+# to the row's log.
+say "gating $tip with ./.flowy-gate - about five minutes, log at $log"
 # FLOWY_AGENT IS UNSET FOR THE SUITE, and this is the drainer changing the
 # meaning of the thing it measures.
 #
