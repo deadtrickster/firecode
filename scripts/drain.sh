@@ -640,6 +640,18 @@ fi
 # run that mattered with the log of the run that repeated it - so the evidence
 # of the first red was destroyed by the second identical red.
 log=$STATE/drain-$row-$tip.log
+# TRUNCATED HERE, SO THE DRAINER'S OWN NARRATION SURVIVES IT.
+#
+# say() appends to $log, and the gate used to write it with `>` - so every line
+# the drainer said about a pass was destroyed by the first byte the suite wrote.
+# Measured 2026-08-20 while trying to confirm which gate command had run: the
+# line naming it had been said, and the log it was said into began with the
+# suite's own first heading.
+#
+# Truncating here and appending below keeps one log per (row, tip) - a retry of
+# the same tip still starts clean, which is what the keying is for - and leaves
+# the pass's own account of itself at the top of the file where a reader starts.
+: >"$log"
 # NAMING THE COMMAND, because nothing else can tell you which one ran.
 #
 # .flowy-gate execs the project's suite, so the process that ends up in `ps` is
@@ -681,7 +693,7 @@ say "gating $tip with ./.flowy-gate - about five minutes, log at $log"
 # branch.
 [ -x "$WORK/.flowy-gate" ] ||
 	die "$WORK has no executable .flowy-gate - this project has not said what running its tests means, and the drainer will not guess"
-if (cd "$WORK" && env -u FLOWY_AGENT ./.flowy-gate >"$log" 2>&1); then
+if (cd "$WORK" && env -u FLOWY_AGENT ./.flowy-gate >>"$log" 2>&1); then
 	outcome=green
 	note=$(grep -E "^passed:" "$log" | tail -1)
 	say "green: $(grep -E '^passed:' "$log" | tail -1)"
