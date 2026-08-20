@@ -693,11 +693,67 @@ say "gating $tip with ./.flowy-gate - about five minutes, log at $log"
 # branch.
 [ -x "$WORK/.flowy-gate" ] ||
 	die "$WORK has no executable .flowy-gate - this project has not said what running its tests means, and the drainer will not guess"
-if (cd "$WORK" && env -u FLOWY_AGENT ./.flowy-gate >>"$log" 2>&1); then
+# THE RUN SAYS IT IS STILL ALIVE WHILE IT MEASURES.
+#
+# 01M0EBXHQ3: the landing lock is believed for fifteen minutes, a gate takes
+# about five, and nothing renewed it in between - the only renew was at verdict
+# time, after the measurement rather than during it. Five minutes fits; a retry
+# or a slow box does not, and crossing the window now loses the VERDICT rather
+# than just the land, because recording one refuses when there is nothing to
+# renew.
+#
+# TIED TO THE GATE'S PID, NOT TO A TIMER. A heartbeat that outlives its pass
+# would hold a target for a run that is no longer measuring anything, which is
+# worse than the gap it closes. `kill -0` on the gate is the liveness signal,
+# checked before every beat as well as after the sleep.
+#
+# IT RENEWS, IT NEVER DECLARES. Declaring again rewrites gate_run and clears
+# gated_tip - it would destroy the verdict it is renewing for. The door is a
+# renew for exactly that reason.
+#
+# A 409 STOPS IT AND SAYS SO. That is the node reporting the window has already
+# gone, and beating harder cannot bring it back; the pass will hear the same
+# thing at the verdict, and this makes it visible five minutes earlier instead
+# of at the end of a run that is now worthless.
+#
+# A 404 STOPS IT QUIETLY, ONCE. The door lands separately from this - a drainer
+# that logged a failure every five minutes against a node without it would be
+# noise the first reader learns to skip.
+heartbeat() {
+	local watch=$1 every=${FLOWY_DRAIN_RENEW_EVERY:-300} answer code
+	while kill -0 "$watch" 2>/dev/null; do
+		sleep "$every"
+		kill -0 "$watch" 2>/dev/null || return 0
+		answer=$(api POST "/api/merge/$row/renew" '{}' 2>/dev/null) || return 0
+		code=$(code_of "$answer")
+		case "$code" in
+		200) ;;
+		404)
+			say "this node has no renew door - the lock will not be held past its window"
+			return 0
+			;;
+		*)
+			say "RENEW REFUSED ($code): the window on $rowtarget has gone while the gate was running - the verdict will be refused too"
+			return 0
+			;;
+		esac
+	done
+}
+
+(cd "$WORK" && env -u FLOWY_AGENT ./.flowy-gate >>"$log" 2>&1) &
+gate_pid=$!
+heartbeat "$gate_pid" &
+heart_pid=$!
+if wait "$gate_pid"; then
+	kill "$heart_pid" 2>/dev/null || true
 	outcome=green
 	note=$(grep -E "^passed:" "$log" | tail -1)
 	say "green: $(grep -E '^passed:' "$log" | tail -1)"
 else
+	# THE SAME STOP ON BOTH ARMS. A heartbeat left running past a red would hold
+	# the target for a run that has finished and failed - the exact thing the
+	# pid check exists to prevent, defeated by forgetting one branch.
+	kill "$heart_pid" 2>/dev/null || true
 	# RECORDED, NOT RETRIED, and not diagnosed either.
 	outcome=red
 	note="$(grep -E "^passed:" "$log" | tail -1) - log at $log"
