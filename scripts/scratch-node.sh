@@ -119,6 +119,24 @@ up() {
 	done
 	psql "$dsn" -q -f "$REPO/schema.sql" >/dev/null 2>&1 || die "schema.sql would not load"
 
+	# THE CONSOLE IS EMBEDDED, so a checkout whose web/dist holds only .gitkeep
+	# produces a node that answers {"error":"console not built"} to every page.
+	# Nothing about that is loud: a browser check against it finds no rooms and
+	# no panels, and reports whatever ITS OWN assertion was about - which is
+	# never "the console is not there". Measured 2026-08-20, twice in one
+	# morning, and it cost two probe scripts to notice while chasing an
+	# unrelated gate red.
+	#
+	# BUILT WHEN THERE IS NOTHING TO SERVE, skipped when there is - so this
+	# costs a first run and nothing after it. A warning was the other option and
+	# is not enough: a line that scrolls past does not stop a check measuring an
+	# empty embed, and the check will explain the emptiness as its own failure.
+	if ! ls "$REPO"/web/dist/assets/*.js >/dev/null 2>&1; then
+		say "no console in web/dist - building it once"
+		(cd "$REPO/web" && npm ci && npm run build) >"$STATE/web-build.log" 2>&1 ||
+			die "the console does not build, and a node with no console answers every page with an error: $(tail -3 "$STATE/web-build.log")"
+	fi
+
 	(cd "$REPO" && go build -o "$STATE/flowy" . && go build -o "$STATE/smoke" ./cmd/smoke) ||
 		die "the checkout does not build"
 
