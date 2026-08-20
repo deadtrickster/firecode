@@ -788,7 +788,21 @@ if [ "$on" != "$rowtarget" ]; then
 fi
 before=$(git -C "$REPO" rev-parse --short HEAD)
 
-FLOWY_TOKEN="$TOKEN" git -C "$REPO" merge --ff-only "$branch" >/dev/null ||
+# THE HATCH GOES ON THE LAND AND NOWHERE ELSE.
+#
+# FLOWY_LAND_GUARD=off belongs to this one git command. Setting it for the whole
+# pass puts it in the environment the SUITE runs in, and the suite tests the
+# guard: measured 2026-08-20, a bypass pass came back 683/2 with "git itself
+# will not move master without the lock" and "the escape hatch never refuses and
+# writes a trace with no node" - two failures about the guard being off, on a
+# branch that had nothing to do with either.
+#
+# So the drainer takes it as its own variable and applies it here. A pass that
+# needs the hatch still gates with the guard armed, which is the only way the
+# verdict means anything.
+FLOWY_TOKEN="$TOKEN" ${FLOWY_DRAIN_LAND_GUARD:+FLOWY_LAND_GUARD="$FLOWY_DRAIN_LAND_GUARD"} \
+	${FLOWY_DRAIN_LAND_GUARD_REASON:+FLOWY_LAND_GUARD_REASON="$FLOWY_DRAIN_LAND_GUARD_REASON"} \
+	git -C "$REPO" merge --ff-only "$branch" >/dev/null ||
 	die "the fast-forward refused - the land guard or a moved target"
 landed=$(git -C "$REPO" rev-parse --short HEAD)
 [ "$landed" != "$before" ] ||
