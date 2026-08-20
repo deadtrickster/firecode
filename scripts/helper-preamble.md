@@ -253,6 +253,36 @@ commit. What you must not do is attach to the operator's.
 Record what each run actually connected to, in the row, so it is on the record
 rather than in your memory of it.
 
+## Run the WHOLE suite before you file, not the tests you thought of
+
+The tests you run before filing are the ones you already had in mind, which is
+the same set your change was written against. The test that catches you is by
+definition the one you did not think of - and in a repo with source-walking
+tests, it is usually one that was added while you were not looking.
+
+Both of these happened on 2026-08-20, an hour apart, to two different agents:
+
+- vm-door added three POST routes and went red 712/1 on
+  `TestEveryRouteSaysWhatItNeeds`, a walk over every guarded POST that fails on
+  one absent from `routeNeeds`. Before filing I ran my own tests plus the
+  advertised-routes and paramguard walks - the two walks I already knew about -
+  and not `go test ./...`. The walk that caught me had landed as `c17cd18` that
+  same afternoon, hours before I branched.
+- the upstream door made the identical miss on the identical walk, and only
+  found it because the first red was named in the room.
+
+This family of test grows. paramguard, the advertised routes and the role walk
+are three of them and there will be a fourth. You cannot keep a list of them in
+your head, and you do not need to:
+
+```
+go test ./...          # or `bash -c ./run-tests.sh`, bare - see the exit-code rule
+```
+
+Five minutes of gate time is worth more than the thirty seconds you save, and a
+red costs the whole queue a pass. If the full suite is genuinely too slow to run
+before filing, say so in the room rather than filing on a subset quietly.
+
 ## Assert a difference, not an absolute
 
 A check that takes ONE reading cannot tell a rule being enforced from the rule
