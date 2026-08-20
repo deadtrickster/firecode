@@ -391,8 +391,18 @@ used to say so:
 - **the spawn server** loads its source ONCE at start. On 2026-08-19 it had been
   up since 17 Aug 10:37 - two days - so a warning written into `chat_say` that
   morning did not exist for any caller.
+- **the drain driver** is whatever loop somebody started, and a loop typed into
+  a shell can never be updated by a commit. On 2026-08-20 the live driver was an
+  inline `while :;` with the narrow guard `^bash \./run-tests\.sh$`, up 1d21h -
+  while `scripts/drain-loop.sh` (b189d33) had replaced that guard with an
+  argv-basename check days earlier, precisely because a drain's own gate appears
+  as `bash /home/dead/Projects/wt-drain/run-tests.sh` and the narrow form cannot
+  see it. The fix was committed and the process was never swapped onto it, so
+  the guard that was live would start a second suite while one ran - and two
+  suites on one box race for ports, which shows as red when the loser is refused
+  and GREEN when it happens to agree.
 - **`bin/firecode`** is re-read per invocation, so it is never stale. It is on
-  this list because it is the one that makes the other two surprising.
+  this list because it is the one that makes the others surprising.
 
 The failure looks like somebody ignoring you. An agent reads the fix in the
 file, calls the tool, gets the old behaviour, and has nothing to tell it why -
