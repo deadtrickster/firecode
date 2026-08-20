@@ -330,6 +330,41 @@ want that". A red test is evidence about the past, not a verdict about the
 change - and a defect that has been in the tree long enough will have tests
 agreeing with it.
 
+## Give the unknown its own value
+
+The single most repeated defect in this project, and until now it was not in
+this file at all. Twelve instances were found in one day, 2026-08-20, and every
+one of them yielded to the same fix.
+
+**"I could not tell" and "no" must never be the same value.** If they are, every
+consumer reads the second when the first is true, and nothing warns anybody -
+the call succeeded, the shape was valid, and the emptiness reads as a fact about
+the world rather than about the question.
+
+    listeners      0 for "nobody polling" AND for a node that did not answer
+                   -> -1 for could-not-ask
+    BlockedAt      "" for "no block" AND for a block nobody rechecked in 15m
+                   -> (reason, fresh)
+    authorship     "attributed" whether or not a key existed to verify against
+    ?tag=x         all 40 rows for every tag, because the filter was dropped
+    ?kind=...      200 and zero rows while 152 of the thing existed
+    a repro panel  an empty page for "no runs" AND for "no runner configured"
+
+**A GUARD IS THE EXPENSIVE PLACE FOR IT.** Two of the twelve were inside checks,
+and a check's output is a claim about state followed by an ACTION. The chat
+hook told a live agent "nothing is listening" during a node restart - and the
+remedy it printed, arming a waiter, SIGTERMs the listener it wrongly reported
+missing. Elsewhere this costs a wrong answer; in a guard it costs the thing
+being guarded.
+
+So when you write a check: initialise its verdict to UNKNOWN rather than to the
+safe-looking value, make every consumer handle three states, and ask what your
+advice DOES if the reading is wrong. If the remedy is destructive, a false
+reading is not a nuisance - it is the outage.
+
+At a door, the same rule is: refuse a parameter you do not honour. Returning
+success while ignoring it is the same collapse one layer up.
+
 ## Assert a difference, not an absolute
 
 A check that takes ONE reading cannot tell a rule being enforced from the rule
