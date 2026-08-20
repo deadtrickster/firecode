@@ -235,6 +235,32 @@ if [[ -r $drain_file ]]; then
 	' "$drain_file" 2>/dev/null || true)
 fi
 [[ -n $drain_status ]] || drain_status="drainer: no status file at $drain_file - it has not run, or nothing is running it"
+
+# THE WORKTREES NOBODY REMOVES, pushed rather than pulled - and only when there
+# are enough of them to be worth a line.
+#
+# 01M0E7A4XK asked for the drainer to name landed worktrees in its LANDING
+# ANNOUNCEMENT. That puts a list in the room on every land, which is the room
+# paying for a fact almost nobody needs at that moment. The nag already runs on
+# a schedule and nobody reads it in the middle of something else, so it is the
+# right home for a fact that is true all day and urgent on no particular day.
+#
+# COUNTED, NOT LISTED. The names are one command away, and 61 of them would bury
+# everything else this prints. What belongs here is the number and where to look.
+#
+# THE THRESHOLD IS NOT ZERO. A worktree per branch in flight is how everybody
+# here works, so a handful is the system working rather than a leak. This says
+# something when the handful has become a habit.
+worktree_status=""
+if [[ -x $ROOT/scripts/worktrees.sh ]]; then
+	wt_landed=$("$ROOT/scripts/worktrees.sh" 2>/dev/null |
+		sed -n 's/^LANDED AND CLEAN - \([0-9]*\)\..*/\1/p' | head -1)
+	if [[ $wt_landed =~ ^[0-9]+$ ]] && ((wt_landed >= 20)); then
+		worktree_status="worktrees: $wt_landed hold a branch already in master with nothing uncommitted."
+		worktree_status+=$'\n''            Each is a full checkout and the cost that bites is inodes, not bytes.'
+		worktree_status+=$'\n''            Yours are yours to remove: scripts/worktrees.sh names them.'
+	fi
+fi
 [[ $stale =~ ^[0-9]+$ ]] || stale=0
 [[ $mine =~ ^[0-9]+$ && $free =~ ^[0-9]+$ ]] || exit 0
 [[ ${ready:-0} =~ ^[0-9]+$ ]] || ready=0
@@ -391,6 +417,7 @@ fi
 	fi
 	printf '%s\n' "$workload"
 	printf '%s\n' "$drain_status"
+	[[ -n $worktree_status ]] && printf '%s\n' "$worktree_status"
 	printf 'Take one, hand one back, or say why not. An idle agent beside an unowned row is the same silence as an unanswered message.\n'
 	printf 'Stop this with: touch %s/runs/board-quiet\n' "$ROOT"
 } >&2
