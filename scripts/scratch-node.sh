@@ -57,6 +57,37 @@ up() {
 	[ -d "$REPO" ] || die "no checkout at $REPO"
 	mkdir -p "$STATE"
 
+	# A NODE THIS STATE DIRECTORY ALREADY STARTED IS STILL ITS NODE.
+	#
+	# `up` used to write node.pid unconditionally. Calling it twice therefore
+	# ORPHANED the first node: nothing recorded it any more, `down` stopped only
+	# the last one and reported success, and the first kept listening and kept a
+	# database connection open. Measured 2026-08-20 by doing it to myself three
+	# times in one command - 18856 and 18857 were still up after `down` said
+	# "down", and there were fifteen more of these on the box from earlier days.
+	#
+	# It also matters beyond the waste: free_port answers about an instant, so
+	# every orphan pushes the next node one port along, and an orphan is a second
+	# writer on the same database as its replacement.
+	#
+	# THE PID IT RECORDED, NOT A NAME. `pkill -f flowy` would find other seats'
+	# nodes, which is how this fleet lost another seat's postgres this morning.
+	# d821a12 taught the container half of exactly this lesson; the node half was
+	# left as it was.
+	#
+	# REFUSES RATHER THAN REPLACING, because a running node is somebody's - very
+	# possibly this caller's, two commands ago - and taking it down to be helpful
+	# is the thing that keeps going wrong here. `down` first is one word.
+	if [ -r "$STATE/node.pid" ] && kill -0 "$(cat "$STATE/node.pid")" 2>/dev/null; then
+		local live
+		live=$(cat "$STATE/node.pid")
+		die "a node from this state directory is still running (pid $live$(
+			ss -ltnp 2>/dev/null | sed -n "s/.*127.0.0.1:\([0-9]*\).*pid=$live,.*/, port \1/p" | head -1
+		)).
+       Take it down first - scripts/scratch-node.sh down - or it becomes an
+       orphan nothing knows about: this file is the only record of it."
+	fi
+
 	local dsn port
 	docker rm -f "$NAME-pg" >/dev/null 2>&1 || true
 	docker run -d --rm --name "$NAME-pg" \
@@ -119,7 +150,10 @@ up() {
 
 	printf 'export BASE=http://127.0.0.1:%s\n' "$port"
 	sed 's/^/export /' "$STATE/ids"
-	say "up on $port, database $PGPORT, logs $STATE/node.log"
+	# THE PID AS WELL AS THE PORT. A caller whose state file has moved on has no
+	# other way to name the node it started, which is how the orphans above went
+	# unnoticed - `down` knew, and nobody else could.
+	say "up on $port (pid $(cat "$STATE/node.pid")), database $PGPORT, logs $STATE/node.log"
 }
 
 down() {
