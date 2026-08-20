@@ -283,6 +283,39 @@ Five minutes of gate time is worth more than the thirty seconds you save, and a
 red costs the whole queue a pass. If the full suite is genuinely too slow to run
 before filing, say so in the room rather than filing on a subset quietly.
 
+## In a race, name which fact you are treating as fixed
+
+Two people can measure the same race, both correctly, and reach opposite fixes.
+The difference is not rigour. It is which fact each one silently treated as
+unchangeable.
+
+On 2026-08-20 a repro test failed once and passed on re-run. Both readings were
+measured from the code:
+
+    wrong   the test waits for terminal status
+            -> the WAIT is the defect
+            -> loosen the wait, suite goes green
+    right   terminal status means the run is done
+            -> the RUNNER says done before it is
+            -> move the publish after the work
+
+`execute()` set StatusConfirmed - which is terminal - and only then came a
+docker teardown and the call recording the verdict. So every consumer watching
+for "done" saw done while the work was still happening. The first fix would have
+made the symptom vanish and left that in place, and the suite would have agreed
+it was fixed.
+
+**The default answer to "which side of a race is wrong" is "the test", and the
+default is worth distrusting.** A test is easy to change and nobody is paged
+when it becomes weaker. Before loosening a wait, a timeout or an assertion, say
+out loud what the thing you are NOT changing is promising - "terminal means
+done" - and check that it is true. If the promise is false, you have found a
+production bug; if you loosen the test instead, you have hidden one.
+
+This generalises past races: whenever a fix is available on both sides of an
+interface, the side you leave alone is a claim you are making. Make it on
+purpose.
+
 ## Assert a difference, not an absolute
 
 A check that takes ONE reading cannot tell a rule being enforced from the rule
