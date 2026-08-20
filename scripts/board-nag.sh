@@ -278,12 +278,16 @@ workload=$(jq -r '
 # rather than passing over in silence.
 drain_status=""
 drain_file=${FLOWY_DRAIN_STATUS:-$HOME/.cache/flowy-drain/status.json}
+
 if [[ -r $drain_file ]]; then
 	drain_status=$(jq -r '
 		def ago($s): if $s < 90 then "\($s)s ago"
 			elif $s < 5400 then "\(($s/60)|floor)m ago"
 			else "\(($s/3600)|floor)h ago" end;
 		((now - ((.at // "1970-01-01T00:00:00Z") | fromdateiso8601? // 0)) | floor) as $age
+		# Spent when the row it names is no longer a row anybody can work. The
+		# empty case is deliberately NOT spent: no queue read means we could not
+		# ask, and could-not-ask is not an answer - see every other guard here.
 		| "drainer: \(.outcome // "?") \(ago($age))"
 		+ (if (.row // "") != "" then " on \(.row[0:10])" else "" end)
 		+ (if (.branch // "") != "" then " (\(.branch))" else "" end)
@@ -292,7 +296,45 @@ if [[ -r $drain_file ]]; then
 		+ (if (.outcome // "") == "deploy-refused" then "  LANDED BUT NOT SERVING: master has moved and the node has not" else "" end)
 	' "$drain_file" 2>/dev/null || true)
 fi
-[[ -n $drain_status ]] || drain_status="drainer: no status file at $drain_file - it has not run, or nothing is running it"
+# THREE STATES, NOT TWO. This line used to say "no status file" whenever
+# drain_status came back empty, which conflates a file that is not there with a
+# file that could not be PARSED - and the second one happens routinely, because
+# the drainer rewrites this file and a read landing mid-write gets a truncated
+# object. I hit it tonight: jq read the file fine one second later while the nag
+# was telling me it did not exist.
+if [[ -z $drain_status ]]; then
+	if [[ ! -e $drain_file ]]; then
+		drain_status="drainer: no status file at $drain_file - it has not run, or nothing is running it"
+	else
+		drain_status="drainer: status file at $drain_file could not be read as json - it is probably being rewritten right now, ask again"
+	fi
+fi
+
+# A RED ABOUT A ROW THAT IS GONE IS NOT NEWS, IT IS FURNITURE.
+#
+# status.json is the drainer's LAST EXIT - a fact about the last pass, not about
+# a row that still exists. On 2026-08-21 it announced "red 9m ago on
+# 01M0GCGA1D" to all four seats every thirty seconds for ten minutes, while that
+# row was done, fixed at 31edb20 and folded into a batch. The nag was correct
+# about the drainer and wrong about the world, which is the worse of the two.
+#
+# So the red is checked against the QUEUE before it is repeated: if the row it
+# names is no longer queued, the verdict has been overtaken and the line says
+# that instead of crying about it. Only the red - a "landed" or a "deploy
+# refused" is about the pass itself and stays true whatever happened to the row.
+if [[ $drain_status == *"drainer: red"* && -n ${queue:-} ]]; then
+	drain_row=$(jq -r '.row // ""' "$drain_file" 2>/dev/null || echo "")
+	if [[ -n $drain_row ]]; then
+		still=$(jq -r --arg r "$drain_row" \
+			'[.items[]? | select(.id == $r and (.status // "") != "done")] | length' \
+			<<<"$queue" 2>/dev/null || echo 1)
+		# Not a number means the question could not be asked, and an unanswered
+		# question must not silence a real red - so anything but a clean 0 keeps
+		# the line.
+		[[ $still =~ ^[0-9]+$ ]] || still=1
+		((still == 0)) && drain_status="${drain_status% - *} - that row has since left the queue, so this verdict is spent"
+	fi
+fi
 
 # THE WORKTREES NOBODY REMOVES, pushed rather than pulled - and only when there
 # are enough of them to be worth a line.
