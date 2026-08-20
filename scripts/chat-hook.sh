@@ -346,11 +346,27 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 		[[ $flowy_mine =~ ^[0-9]+$ ]] || flowy_mine=0
 	fi
 
+	# THE THREAD ID TRAVELS WITH THE MESSAGE, or nobody can reply into one.
+	#
+	# The operator, 2026-08-20: "why didnt you reply to my plans proposal in a
+	# thread. impossible to track things here." The mechanism was never
+	# missing - `flowy say --thread ID` has worked all along, say.sh passes
+	# --thread through, the events carry a thread column and the console has a
+	# thread list. What was missing is HERE: this line handed an agent the
+	# message and not its id, so the only reply it could compose was a flat
+	# one. Measured the same hour: 40 messages in #general, 40 distinct
+	# threads, none with more than one message.
+	#
+	# So the id is rendered as the argument that uses it rather than as a bare
+	# ULID. An agent that reads `--thread 01M0...` can paste it; an agent that
+	# reads `thread: 01M0...` has to know the flag exists.
 	flowy_render() {
 		jq -r '.[] | "  [" + ((.created // "")[11:16]) + "] " +
 			(.actor_name // .meta.actor_name // (.actor // "?")[-8:]) +
 			(if (.room // "") != "" then " in #" + .room else "" end) + ": " +
-			((.body // "") | gsub("\n"; " ") | .[0:160])' <<<"$flowy_events" 2>/dev/null
+			((.body // "") | gsub("\n"; " ") | .[0:160]) +
+			(if (.thread // "") != "" then "\n      reply into it: --thread " + .thread else "" end)' \
+			<<<"$flowy_events" 2>/dev/null
 	}
 
 	if ((flowy_total > 0)); then
