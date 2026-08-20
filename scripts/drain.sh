@@ -796,6 +796,26 @@ else
 	count=$(grep -aE '^passed:' "$log" 2>/dev/null | tail -1)
 	note=$count
 	[ -n "$first" ] && note="$count - $first"
+
+	# AND WHICH TEST, because the check's NAME is not the failure.
+	#
+	# run-tests.sh:12190 registers its Go check as `check "go test ./..."`, so
+	# the FAIL line above reads "FAIL go test ./..." - true, and useless. Three
+	# reds today were reported that way and every one of them cost somebody a
+	# trip to the gate log to run the same grep by hand. I did it for vm-door
+	# and orchestrator did it for the switcher within the hour.
+	#
+	# APPENDED, NEVER SUBSTITUTED, which is orchestrator's rule and the right
+	# one: the check name says WHERE the suite broke and the test name says
+	# WHAT broke, and a note carrying only the second would lose the harness
+	# that produced it. Both, or the reader has to guess which they were given.
+	#
+	# Up to three, because a red with fifteen failing tests is usually one
+	# cause and the first few are enough to recognise it - and a note long
+	# enough to be truncated by the queue display is a note nobody reads.
+	tests=$(grep -aoE '^ *--- FAIL: [A-Za-z0-9_/]+' "$log" 2>/dev/null |
+		sed 's/^ *--- FAIL: //' | head -3 | paste -sd, -)
+	[ -n "$tests" ] && note="$note - $tests"
 	reported=$(api POST "/api/merge/$row/gate" \
 		"$(jq -nc --arg run "$run" --arg tip "$tip" --arg note "$note" \
 			'{run: $run, gated_tip: $tip, result: "red", note: $note}')")
