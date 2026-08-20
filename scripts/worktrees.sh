@@ -64,15 +64,57 @@ main=$(git -C "$REPO" rev-parse --path-format=absolute --show-toplevel)
 #
 # A worktree is in use when a live process has its cwd inside it - the drainer
 # between passes, a shell somebody left open, an agent mid-edit. `git worktree
-# remove` does not check this: it checks the tree is clean, and a clean tree
-# with somebody's shell in it is exactly the case that looks safe and is not.
+# WHO IS STANDING IN A TREE RIGHT NOW.
 #
-# Read once, into one string, rather than per-entry: /proc has 126 x N reads in
-# it otherwise, and the answer would drift between the first entry and the last.
-# readlink rather than `ls -l | sed`: parsing ls output is a shellcheck finding
-# for good reasons, and a worktree path with a space in it would land in the
-# wrong list silently rather than loudly.
-cwds=$(for d in /proc/[0-9]*; do readlink "$d/cwd" || true; done 2>/dev/null | sort -u)
+# A worktree is in use when a live process is anywhere inside it. `git worktree
+# remove` does not ask this: it checks the tree is CLEAN, and a clean tree with
+# a build or a gate running in it is exactly the case that looks safe and is
+# not.
+#
+# TWO CORRECTIONS TO THE FIRST CUT, both raised in the room within minutes of it
+# being announced, and both real - measured before this was rewritten:
+#
+#   - A CWD IS NOT ONLY THE ROOT. It compared cwd for equality with the
+#     worktree path, so a process sitting in $tree/web - which is where a
+#     console build spends its whole run - did not count. Measured: parking a
+#     shell in /tmp/flowy-batch1/web left that tree in LANDED AND CLEAN.
+#
+#   - A CWD IS NOT THE ONLY HOLD. A process can have chdir'd elsewhere and still
+#     have a file open under the tree: a log being tailed, an output being
+#     written, a binary being executed. Those are read from /proc/*/fd.
+#
+# The general shape is one this fleet keeps meeting: an exact match against one
+# proxy, where the real question is "anything under this path, by any means".
+#
+# Read once into one list rather than per-entry - /proc would otherwise be
+# walked 126 times and the answer would drift between the first entry and the
+# last. readlink rather than parsing `ls -l`, so a path with a space in it lands
+# in the wrong list loudly rather than silently.
+held=$(
+	{
+		for d in /proc/[0-9]*; do readlink "$d/cwd" || true; done
+		for l in /proc/[0-9]*/fd/*; do readlink "$l" || true; done
+	} 2>/dev/null | sort -u
+)
+
+# ANYTHING UNDER THE PATH, not the path itself. A deleted file still reads as
+# "/path/to/thing (deleted)" and still means somebody is holding it, which the
+# prefix catches and an equality test would not.
+# A HERE-STRING, NOT A PIPE, and the reason is worth the line it costs.
+#
+# This was `printf '%s\n' "$held" | awk ...` with an early `exit` on the first
+# match. awk exiting closes the pipe, printf dies of SIGPIPE, and `set -o
+# pipefail` reports the pipeline as FAILED - so finding a match returned
+# non-zero, which is the answer for finding none.
+#
+# It did not fail uniformly, which is what made it worth chasing rather than
+# guessing. The list is sorted, so a match under /home came early enough to kill
+# printf mid-write and read as free, while a match under /tmp came after printf
+# had already finished and read correctly. A worktree in /home/dead/Projects was
+# never reported in use; one in /tmp always was. Measured both ways.
+inUse() {
+	awk -v p="$1" 'index($0, p "/") == 1 || $0 == p { hit = 1; exit } END { exit !hit }' <<<"$held"
+}
 
 landed=() unlanded=() inuse=()
 path="" branch="" locked=""
@@ -82,7 +124,7 @@ classify() {
 	[ "$path" != "$main" ] || return 0
 
 	local name=${path##*/}
-	if [ -n "$locked" ] || printf '%s\n' "$cwds" | grep -qxF "$path"; then
+	if [ -n "$locked" ] || inUse "$path"; then
 		inuse+=("$name	${branch:-(detached)}")
 		return 0
 	fi
