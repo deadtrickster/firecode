@@ -45,7 +45,41 @@ session=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <
 [[ -z $session && -n ${BOARD_NAG_NAME:-} ]] && session=""
 memo="${FIRECODE_CHAT_MARKS:-$HOME/.cache/firecode}/session-name-$(printf '%s' "${session:-none}" | tr -c 'A-Za-z0-9._-' '-')"
 name=${BOARD_NAG_NAME:-$(cat "$memo" 2>/dev/null || echo "")}
-[[ -n $name && -r "$AGENTS/$name" ]] || exit 0
+
+# SILENT IS FINE FOR A HOOK AND WRONG FOR A PERSON, and the difference cost a
+# night. Run by hand this printed NOTHING and exited 0 - because a terminal
+# gives it no session_id, so it resolved no name and gave up. I read that
+# silence as "the board has nothing" while 31 rows sat unowned, and said
+# "nothing to do, holding" for an hour on the strength of it.
+#
+# As a Stop hook, staying quiet is correct: stdout goes to the transcript and
+# exit 0 lets the stop through. But a human or an agent running it FROM A
+# TERMINAL has asked a question, and "I cannot tell who you are" is an answer
+# where saying nothing is not. Same three arms as the chat hook: could-not-ask
+# is neither yes nor no.
+if [[ -z $name || ! -r "$AGENTS/$name" ]]; then
+	# WHAT DISTINGUISHES A HOOK IS ITS STDIN, not a tty.
+	#
+	# The first cut of this guarded on [[ -t 1 ]] and was therefore silent in
+	# the exact case that caused the problem: an agent runs commands with
+	# stdout captured, never a terminal, so it would have stayed quiet for me
+	# while fixing the bug that bit me. Tested before believing it.
+	#
+	# A Stop hook always passes a JSON payload carrying session_id. Anything
+	# else - a person, an agent's tool call, a timer - did not, and has asked a
+	# question that deserves an answer.
+	if [[ $input != *'"session_id"'* ]]; then
+		if [[ -z $name ]]; then
+			echo "board-nag: no name for this session, so nothing was asked of the board." >&2
+			echo "  A Stop hook passes {\"session_id\":...} on stdin and the name comes from" >&2
+			echo "  the memo the chat hook writes. From a terminal there is neither." >&2
+			echo "  Ask as somebody:  BOARD_NAG_NAME=<you> $0" >&2
+		else
+			echo "board-nag: no token for '$name' at $AGENTS/$name - cannot ask the board." >&2
+		fi
+	fi
+	exit 0
+fi
 
 token=$(cat "$AGENTS/$name" 2>/dev/null) || exit 0
 
