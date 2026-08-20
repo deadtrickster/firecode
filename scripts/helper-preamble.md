@@ -316,6 +316,20 @@ This generalises past races: whenever a fix is available on both sides of an
 interface, the side you leave alone is a claim you are making. Make it on
 purpose.
 
+**And a test can PIN A DEFECT AS THE CONTRACT.** The same day, the operator
+asked for selecting text to stop citing it - selecting and copying had become
+one gesture. Three existing checks asserted that dragging over a message ARMS a
+citation. They were not wrong when they were written; they had simply written
+the behaviour down, and once written down it was the specification. Removing the
+defect turned all three red, and the comfortable reading of three red checks is
+"my change broke something".
+
+So when a check goes red on a change you believe is right, the question is not
+only "what did I break" but "what was this check promising, and did anybody ever
+want that". A red test is evidence about the past, not a verdict about the
+change - and a defect that has been in the tree long enough will have tests
+agreeing with it.
+
 ## Assert a difference, not an absolute
 
 A check that takes ONE reading cannot tell a rule being enforced from the rule
