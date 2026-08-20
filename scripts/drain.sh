@@ -453,7 +453,7 @@ if [ -z "$row" ]; then
 				note="$head (catch-up)"
 				exit 0
 			fi
-			outcome=deploy-refused
+			outcome="deploy-refused"
 			note="node still on $serving, master is $head"
 			exit 1
 		fi
@@ -951,7 +951,7 @@ fi
 # tee rather than redirect: the operator watching a foreground pass should still
 # see it, and the log is for whoever reads it tomorrow.
 if ! "$REPO/scripts/deploy.sh" 2>&1 | tee -a "$log"; then
-	outcome=deploy-refused
+	outcome="deploy-refused"
 	note="landed $landed and the deploy refused - master has moved and the node has not"
 	printf '[drain] the branch LANDED and the deploy did not: %s is on master, the node is serving something older\n' "$landed" >&2
 	exit 1
