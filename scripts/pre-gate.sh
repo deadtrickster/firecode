@@ -194,48 +194,58 @@ print(lock.get("holder_name", "") if lock.get("held") else "")
 	fi
 fi
 
-# 3. CAN THIS HOST EVEN RUN THE SUITE, AND WILL THE SUITE FIND IT.
+# 3. CAN THIS MACHINE RUN THIS PROJECT'S GATE - ASKED OF THE PROJECT.
 #
-# Those are two questions and this used to ask only the first. It ran initdb by
-# its absolute path, with LD_LIBRARY_PATH set here, and reported ok. The gate
-# then died in two seconds with "no initdb/pg_ctl found; install postgresql",
-# because run-tests.sh searches PATH - and PATH belongs to whoever invoked it,
-# not to this script. Measured on 2026-08-18: pre-gate green, gate dead, nothing
-# wrong with the branch.
+# This used to ask about initdb, pg_ctl and llvmjit, and about run-tests.sh's
+# mode bit. Every one of those is flowy's requirement rather than a universal
+# definition of a machine that can run tests, and a second project inherited
+# them: a repository that has never needed Postgres was refused a run over a
+# missing initdb, and one whose suite is called something else was told its
+# suite was not executable. 01M0DZPFQD.
 #
-# An instrument that arranges the conditions it is testing reports on itself.
-# So the first check is `command -v`, in the caller's own environment, and the
-# absolute-path check stays underneath it to tell "not installed" from
-# "installed and not on your PATH" - which have different fixes.
-if command -v initdb >/dev/null 2>&1 && command -v pg_ctl >/dev/null 2>&1; then
-	say ok "initdb and pg_ctl are on PATH, which is where the suite looks"
-elif [ -x "$HOME/.local/pg17-bin/initdb" ]; then
-	bad "postgres is installed and NOT on your PATH, so the suite exits in two seconds:
-    PATH=\$HOME/.local/pg17-bin:\$PATH LD_LIBRARY_PATH=\$HOME/.local/pg17-libs ./run-tests.sh"
+# So the project answers it, in .flowy-pregate beside its checkout. The contract
+# is one finding per line - `ok <what is true>`, `bad <what is wrong and the
+# fix>` - and a non-zero exit if any of them is bad. The lines are relayed
+# through say/bad here so a refusal reads the same whichever half produced it.
+#
+# ASKED OF $PWD, which is the worktree that will be gated, not of $REPO. The
+# checks are about the tree that is about to be compiled, and the mode bit
+# question in particular is only honest about a fresh checkout.
+#
+# NO DEFAULT. A project that declares no .flowy-pregate is refused, and named -
+# it is not asked flowy's questions instead. A fallback reached by a question
+# the caller did not ask answers confidently and wrongly, which is the shape
+# that broke landing fleet-wide tonight.
+if [ ! -x "$PWD/.flowy-pregate" ]; then
+	bad "$PWD has no executable .flowy-pregate - the drainer will not guess what this project needs.
+    Declare one beside the checkout: ok/bad lines on stdout, exit 1 if any bad"
 else
-	say '--' "no pg17-bin here, host-local runs are not available"
-fi
-if [ -x "$HOME/.local/pg17-bin/initdb" ]; then
-	if LD_LIBRARY_PATH="$HOME/.local/pg17-libs" "$HOME/.local/pg17-bin/initdb" --version >/dev/null 2>&1; then
-		say ok "and it starts with pg17-libs on the library path"
-	else
-		bad "initdb will not start - check LD_LIBRARY_PATH=$HOME/.local/pg17-libs"
+	# THE EXIT CODE IS THE ANSWER, not a count of bad lines here. A pregate that
+	# dies before printing anything - a missing interpreter, a set -e trip - has
+	# said nothing, and reading its silence as "no findings" would turn a broken
+	# check into a green one.
+	pregate_out=$("$PWD/.flowy-pregate" 2>&1) && pregate_rc=0 || pregate_rc=$?
+	pregate_bad=0
+	while IFS= read -r line; do
+		case "$line" in
+		"ok "*) say ok "${line#ok }" ;;
+		"bad "*)
+			bad "${line#bad }"
+			pregate_bad=1
+			;;
+		*) [ -n "$line" ] && printf '       %s\n' "$line" ;;
+		esac
+	done <<<"$pregate_out"
+	# WHETHER THIS BLOCK SAID SO, not whether anything has failed yet.
+	#
+	# The first cut asked `[ "$fail" = 0 ]`, which is the global set by every
+	# check above. Measured with a pregate that exits 7 in silence: the queue
+	# half had already failed in the fixture repo, so $fail was 1, the condition
+	# was false, and the silent death went unreported - the exact case this line
+	# exists for, hidden by an unrelated failure elsewhere in the file.
+	if [ "$pregate_rc" != 0 ] && [ "$pregate_bad" = 0 ]; then
+		bad ".flowy-pregate exited $pregate_rc without printing a bad line - it failed before it could say why"
 	fi
-fi
-# 4. CAN THE SUITE BE RUN AT ALL. On 2026-08-18 a commit dropped run-tests.sh
-# from 100755 to 100644 and every gate that day passed, because every existing
-# worktree keeps the mode it was checked out with and `bash file.sh` ignores the
-# bit entirely. Only a FRESH worktree exec'ing ./run-tests.sh sees it, and what
-# it sees is "Permission denied", which reads as a broken sandbox rather than as
-# a file mode.
-#
-# The suite cannot catch this - it is the thing that would not start. So it is
-# checked here, where a fresh tree is being prepared anyway.
-suite="$REPO/run-tests.sh"
-if [ -f "$suite" ] && [ ! -x "$suite" ]; then
-	bad "run-tests.sh is not executable ($(stat -c %a "$suite")) - a fresh worktree cannot ./run it"
-else
-	say ok "the suite is executable"
 fi
 
 # THE GATE COMPILES THE WORKING TREE, NOT THE COMMIT.
@@ -259,15 +269,6 @@ if [ -n "$dirty" ]; then
 $(printf '%s\n' "$dirty" | head -5)"
 else
 	say ok "the working tree is clean, so the commit is what gets compiled"
-fi
-
-jit=$(find /usr/lib/postgresql -name llvmjit.so -type f 2>/dev/null | head -1)
-if [ -n "$jit" ]; then
-	if ldd "$jit" 2>/dev/null | grep -q 'not found'; then
-		bad "$(basename "$jit") has an unresolved library - expensive queries will fail, not the diff"
-	else
-		say ok "the postgres jit module resolves its libraries"
-	fi
 fi
 
 # 4. REMEMBER WHAT WE ARE ABOUT TO MEASURE. Every guard here assumes the threat

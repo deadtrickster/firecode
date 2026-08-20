@@ -13,7 +13,7 @@
 #   POST /api/merge/{id}/gate        declare - THIS TAKES THE LOCK
 #   git rebase master                the tree that lands is the tree measured
 #   pre-gate.sh <branch>             is this run worth its five minutes
-#   ./run-tests.sh                   the gate
+#   ./.flowy-gate                    the gate, as the PROJECT declares it
 #   POST /api/merge/{id}/gate        record the verdict, with gated_tip
 #   git merge --ff-only + POST land  land, through the door that writes the chain
 #   scripts/deploy.sh                deploy, only on a signal
@@ -619,20 +619,19 @@ if [ -f "$STATE/red-$row-$tip" ]; then
 fi
 
 # ------------------------------------------------------------ worth gating
-
-# THE SAME ENVIRONMENT THE GATE GETS, or pre-gate answers about a different one.
+# THE PROJECT'S OWN QUESTIONS, IN THE PROJECT'S OWN ENVIRONMENT.
 #
-# pre-gate checks that postgres is on PATH, because the suite exits in two
-# seconds without it - and it exports pg17-bin for its OWN initdb probe, which
-# the suite does not inherit. So calling it without that PATH gets a refusal
-# that is true of the caller and false of the run. Measured by hand twenty
-# minutes before this script was first used: "postgres is installed and NOT on
-# your PATH", from a shell whose gate would have worked.
+# This used to export flowy's Postgres paths here, because pre-gate asked about
+# initdb and the suite would exit in two seconds without them - so the caller
+# had to arrange the conditions before asking whether they held. Measured by
+# hand twenty minutes before this script was first used: "postgres is installed
+# and NOT on your PATH", from a shell whose gate would have worked.
 #
-# FLOWY_AGENT for the other half of the same lesson: without it, pre-gate cannot
-# tell this seat's lock from another's, and it says so rather than guessing.
-(cd "$WORK" && PATH=$HOME/.local/pg17-bin:$PATH LD_LIBRARY_PATH=$HOME/.local/pg17-libs \
-	FLOWY_AGENT="$AGENT" bash "$HERE/pre-gate.sh" "$branch" --row "$row") ||
+# The machine half is now .flowy-pregate in the project, and it knows its own
+# paths, so there is nothing for the drainer to splice in. What is left here is
+# the drainer's half of the same lesson: FLOWY_AGENT, without which pre-gate
+# cannot tell this seat's lock from another's, and says so rather than guessing.
+(cd "$WORK" && FLOWY_AGENT="$AGENT" bash "$HERE/pre-gate.sh" "$branch" --row "$row") ||
 	die "pre-gate says this run is not worth starting"
 
 # ------------------------------------------------------------ the gate
@@ -657,8 +656,20 @@ say "gating $tip - about five minutes, log at $log"
 # both times I read the failures as belonging to the diff.
 #
 # pre-gate keeps the variable, the suite does not get it.
-if (cd "$WORK" && env -u FLOWY_AGENT "PATH=$HOME/.local/pg17-bin:$PATH" \
-	"LD_LIBRARY_PATH=$HOME/.local/pg17-libs" ./run-tests.sh >"$log" 2>&1); then
+# WHAT THIS PROJECT CALLS RUNNING ITS TESTS, which the drainer does not know.
+#
+# It used to be `./run-tests.sh` with flowy's Postgres paths spliced in. For a
+# second project that is wrong twice over and quiet both times - a suite by
+# another name reads as a red on the branch, and a project with no database is
+# handed a requirement it does not have. 01M0DZPFQD.
+#
+# .flowy-gate is the project's answer, exit 0 for green, with `passed: N failed:
+# M` on stdout for the note. A project that declares none is REFUSED and named:
+# guessing a suite is how a misconfigured drainer writes a red onto somebody's
+# branch.
+[ -x "$WORK/.flowy-gate" ] ||
+	die "$WORK has no executable .flowy-gate - this project has not said what running its tests means, and the drainer will not guess"
+if (cd "$WORK" && env -u FLOWY_AGENT ./.flowy-gate >"$log" 2>&1); then
 	outcome=green
 	note=$(grep -E "^passed:" "$log" | tail -1)
 	say "green: $(grep -E '^passed:' "$log" | tail -1)"
