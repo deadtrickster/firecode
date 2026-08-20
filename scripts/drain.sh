@@ -58,14 +58,29 @@ TARGET=${FLOWY_DRAIN_TARGET:-master}
 # "./scripts/pre-gate.sh: No such file or directory".
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-once=no deploy=${FLOWY_DRAIN_DEPLOY:-no} dry=no
+once=no deploy=${FLOWY_DRAIN_DEPLOY:-no} dry=no only=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--once) once=yes ;;
 	--deploy) deploy=yes ;;
 	--dry-run) dry=yes ;;
+	# ONE NAMED ROW, WHICH IS FOR ONE SITUATION AND SAYS SO.
+	#
+	# The queue is a queue: the drainer takes the first row it can work, and
+	# that ordering IS the fairness. This exists for the case the ordering
+	# cannot solve - a defect that stops every row landing, whose FIX is in the
+	# queue behind the rows it is blocking. Measured 2026-08-20: nine rows, none
+	# landable, and the fix ninth.
+	#
+	# It does not skip any check. The row still has to be takeable, declarable,
+	# rebasable, gated and admissible; this only decides WHICH row a pass
+	# considers, and the pass refuses if that row is not workable.
+	--row)
+		only=${2:-}
+		shift
+		;;
 	*)
-		printf 'usage: %s --once [--deploy] [--dry-run]\n' "$0" >&2
+		printf 'usage: %s --once [--deploy] [--dry-run] [--row ID]\n' "$0" >&2
 		exit 2
 		;;
 	esac
@@ -331,6 +346,8 @@ blocked() { # id why
 }
 while read -r kind id b t proj; do
 	[ "$kind" = ROW ] || continue
+	# A named row means this pass is about that row and nothing else.
+	[ -z "$only" ] || [ "$id" = "$only" ] || continue
 	[ "$t" = "$TARGET" ] || {
 		say "skipping $id - it targets $t and this drainer runs $TARGET"
 		blocked "$id" "targets $t, and this drainer runs $TARGET"
