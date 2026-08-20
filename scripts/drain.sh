@@ -389,10 +389,63 @@ while read -r kind id b t proj; do
 	# The answer is computed against the target AS IT IS NOW, never stored: master
 	# moves with every landing, so a conflict answer from three landings ago is an
 	# answer to a different question.
+	# MERGE-TREE IS THE FILTER, A REAL REBASE IS THE VERDICT - and until
+	# 2026-08-21 this blocked on the filter alone, which asks a different
+	# question than the one that lands.
+	#
+	# merge-tree flattens the branch to ONE three-way merge. This drainer
+	# REBASES (line 14: the tree that lands is the tree measured), replaying
+	# every commit against the new base, so a branch whose later commit
+	# supersedes an earlier resolution merges clean and rebases dirty. Both
+	# directions fired on one row tonight: orchestrator's batch was admitted on a
+	# clean merge-tree and died in the gate's rebase at 23:23, and was blocked
+	# "conflicts with master" two minutes after they had fixed it.
+	#
+	# A FALSE BLOCK IS THE EXPENSIVE DIRECTION. It stalls a good row for the
+	# fifteen minutes the reading lives, and five people lost time to exactly
+	# that tonight. A false admit costs one gate pass, which the gate itself
+	# then catches. So the cheap check may SKIP straight through, and may not
+	# refuse on its own: a conflict it reports is confirmed by doing the real
+	# thing before anybody is told.
 	if ! git -C "$rowrepo" merge-tree --write-tree "$t" "$b" >/dev/null 2>&1; then
-		say "skipping $id - $b does not merge onto $t cleanly"
-		blocked "$id" "$b conflicts with $t as it is now - a person resolves this, the drainer cannot"
-		continue
+		# Confirm in a throwaway checkout, never in $rowrepo or $WORK: a rebase
+		# that dies leaves the tree mid-rebase with the branch checked out,
+		# which is the pin this whole section exists to avoid.
+		probe="${FLOWY_DRAIN_PROBE:-$HOME/.cache/flowy-drain/probe}"
+		rm -rf "$probe" 2>/dev/null
+		git -C "$rowrepo" worktree prune 2>/dev/null || true
+		rebase_says=unknown
+		if git -C "$rowrepo" worktree add -q --detach "$probe" "$b" 2>/dev/null; then
+			if git -C "$probe" rebase "$t" >/dev/null 2>&1; then
+				rebase_says=clean
+			else
+				rebase_says=conflict
+				git -C "$probe" rebase --abort >/dev/null 2>&1 || true
+			fi
+			git -C "$rowrepo" worktree remove --force "$probe" 2>/dev/null || true
+		fi
+		rm -rf "$probe" 2>/dev/null
+
+		case "$rebase_says" in
+		conflict)
+			say "skipping $id - $b does not rebase onto $t, confirmed by rebasing it"
+			blocked "$id" "$b conflicts with $t as it is now - confirmed by a real rebase, not just a merge preview. A person resolves this, the drainer cannot"
+			continue
+			;;
+		clean)
+			# The filter was wrong and the row is fine. Saying so out loud
+			# because a silent disagreement between two checks is how nobody
+			# learns the cheap one cannot be trusted alone.
+			say "$id - merge-tree said conflict and a real rebase is clean, so proceeding"
+			;;
+		*)
+			# COULD NOT ASK. Not clean, not conflicted - the probe checkout
+			# failed. Proceeding costs at most one gate; blocking on a question
+			# nobody answered is how a row stalls for a reason that was never
+			# true.
+			say "$id - could not probe the rebase (no throwaway checkout); proceeding on the gate's verdict instead"
+			;;
+		esac
 	fi
 	# A RED THIS DRAINER HAS ALREADY SEEN IS SKIPPED, NOT EXITED ON.
 	#
