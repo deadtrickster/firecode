@@ -145,9 +145,27 @@ record() {
 STATE=${FLOWY_DRAIN_STATE:-$HOME/.cache/flowy-drain}
 mkdir -p "$STATE" 2>/dev/null || true
 
-say() { printf '[drain] %s\n' "$*"; }
+# THE DRAINER'S OWN NARRATION GOES BESIDE THE SUITE'S OUTPUT, once there is a
+# log to put it in.
+#
+# It used to go only to stdout, and the loop that runs a pass pipes stdout to
+# `tail -6` - so the reason a pass refused survived for six lines and then did
+# not exist. Measured 2026-08-20: a row refused at the land TWICE, an hour
+# apart, each time after a full suite, and the only record was the status file's
+# one-line note - "the fast-forward refused - the land guard or a moved target",
+# which names two causes and distinguishes neither. Another seat asked what my
+# log said and there was nothing to answer with.
+#
+# $log is empty until the gate names it, so early lines still only reach stdout;
+# everything from the rebase onward lands in the file the verdict points at.
+say() {
+	printf '[drain] %s\n' "$*"
+	[ -n "${log:-}" ] && printf '[drain] %s\n' "$*" >>"$log" 2>/dev/null
+	return 0
+}
 die() {
 	printf '[drain] REFUSED: %s\n' "$*" >&2
+	[ -n "${log:-}" ] && printf '[drain] REFUSED: %s\n' "$*" >>"$log" 2>/dev/null
 	outcome=refused
 	note=$*
 	exit 1
