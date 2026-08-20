@@ -800,8 +800,19 @@ before=$(git -C "$REPO" rev-parse --short HEAD)
 # So the drainer takes it as its own variable and applies it here. A pass that
 # needs the hatch still gates with the guard armed, which is the only way the
 # verdict means anything.
-FLOWY_TOKEN="$TOKEN" ${FLOWY_DRAIN_LAND_GUARD:+FLOWY_LAND_GUARD="$FLOWY_DRAIN_LAND_GUARD"} \
-	${FLOWY_DRAIN_LAND_GUARD_REASON:+FLOWY_LAND_GUARD_REASON="$FLOWY_DRAIN_LAND_GUARD_REASON"} \
+# A word that only BECOMES an assignment after expansion is not an assignment.
+# `${VAR:+NAME=value} git ...` looks right and is not: bash decides what is an
+# assignment prefix while parsing, before any expansion, so the expanded word is
+# taken as the COMMAND NAME. Measured 2026-08-20 - the land step died with
+# "FLOWY_LAND_GUARD=off: command not found" after a green 685/0 gate.
+# `env` is what applies a computed assignment, and an array is what keeps the
+# reason's spaces from splitting it into words.
+landenv=()
+[ -n "${FLOWY_DRAIN_LAND_GUARD:-}" ] &&
+	landenv+=("FLOWY_LAND_GUARD=$FLOWY_DRAIN_LAND_GUARD")
+[ -n "${FLOWY_DRAIN_LAND_GUARD_REASON:-}" ] &&
+	landenv+=("FLOWY_LAND_GUARD_REASON=$FLOWY_DRAIN_LAND_GUARD_REASON")
+env FLOWY_TOKEN="$TOKEN" "${landenv[@]}" \
 	git -C "$REPO" merge --ff-only "$branch" >/dev/null ||
 	die "the fast-forward refused - the land guard or a moved target"
 landed=$(git -C "$REPO" rev-parse --short HEAD)
