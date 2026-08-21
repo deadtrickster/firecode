@@ -105,9 +105,30 @@ mkdir -p "$nag_state" 2>/dev/null || true
 pile_file=$nag_state/pile.$name
 stale_file=$nag_state/stale.$name
 remind_file=$nag_state/reminded.$name
+# HOW MANY ROWS THIS ASKS THE BOARD FOR.
+#
+# It asked for 200, which is the door's own default, and the rows it feeds are
+# the examples this nag SUGGESTS. @flowy-claude measured the window today:
+#
+#   kind=todo total          407
+#   the window               200
+#   open rows inside it      all of them
+#
+# So the numbers are right TODAY and the bound is latent rather than harmless.
+# The window holds because open rows happen to be recent, which is a property of
+# how this fleet works rather than of the query. The first row that stays open
+# long enough to age past the window drops out of every agent's suggestions and
+# NOTHING SAYS SO - the nag keeps printing a list that looks the same.
+#
+# 1000 is the door's ceiling (store/artifacts.go maxLimit), not a guess. Asking
+# for more is accepted and silently clamped, so a later reader "raising the
+# limit" would change nothing and believe they had. Paired with the notice
+# below, which is what makes this a performance choice rather than a
+# correctness one.
+BOARD_ROW_LIMIT=${BOARD_ROW_LIMIT:-1000}
 board_read() {
 	curl -sS -m 8 -H "Authorization: Bearer $token" \
-		"$FLOWY_ADDR/api/artifacts?kind=todo&limit=200" 2>/dev/null
+		"$FLOWY_ADDR/api/artifacts?kind=todo&limit=$BOARD_ROW_LIMIT" 2>/dev/null
 }
 
 # THE MERGE QUEUE IS WORK TOO, and it is the kind that rots: a branch measured
@@ -488,6 +509,17 @@ fi
 # to land is not a quiet night - it is a gate run about to be thrown away.
 ((mine + free + ready > 0)) || exit 0
 
+# AND SAY SO IF THE WINDOW WAS FULL, because a truncated list of suggestions
+# reads exactly like the whole board. The door answers with a page and no total,
+# so a page that came back at the limit is the only evidence a caller has that
+# there may be more behind it - and the rows most likely to be behind it are the
+# OLDEST OPEN ONES, which is precisely the set an agent should be nagged about.
+board_rows=$(jq -r '.artifacts | length' <<<"$board" 2>/dev/null || echo 0)
+if [[ $board_rows =~ ^[0-9]+$ ]] && ((board_rows >= BOARD_ROW_LIMIT)); then
+	printf 'THE BOARD READ CAME BACK FULL at %d rows, so this list is a window and not\n' "$board_rows"
+	printf 'the board. The rows it cannot see are the oldest open ones. Raise\n'
+	printf 'BOARD_ROW_LIMIT past the door ceiling and it will be clamped, not raised.\n\n'
+fi
 lines=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
 	select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)][0:5][] |
 	"  [\(.status // "-")] \(if ((.fields.assignee // "") | length) == 0 then "unowned" else .fields.assignee end): \(.title[0:64])"' <<<"$board" 2>/dev/null)
