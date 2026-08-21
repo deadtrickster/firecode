@@ -59,10 +59,38 @@ suite_running() {
 # name on disk: an orphaned one-liner cannot be read, linted, corrected or found
 # by anybody but its author, and the four that are running were started by
 # sessions that have ended.
+# WAITING IS SAID OUT LOUD, ONCE PER SPELL. A driver that skips silently is
+# indistinguishable from a driver that has stopped, and on 2026-08-21 that cost
+# @orchestrator ten minutes of diagnosis: six rows ungated, nothing in
+# driver.log since a red, and no way from outside to tell "held by a suite"
+# from "dead". The whole night was that shape - a silence read as absence.
+#
+# ONCE, not every tick: a line every 90 seconds for an hour is a log nobody
+# reads, which is the same failure wearing the other coat. So it speaks when
+# the wait STARTS and again when it ENDS, with how long it lasted, and says
+# nothing in between.
+# A FLAG AND A CLOCK, NOT ONE VALUE DOING BOTH. The first cut used
+# waiting_since=0 to mean "not waiting" - and $SECONDS IS 0 for the first second
+# of the process, so a wait that began immediately looked like no wait at all
+# and announced itself on every tick. Caught by running it: it printed twice in
+# four seconds. 0 is a legitimate reading of the clock; "not waiting" needs its
+# own value.
+waiting=no
+waiting_since=0
 while :; do
 	if suite_running; then
+		if [ "$waiting" = no ]; then
+			waiting=yes
+			waiting_since=$SECONDS
+			printf '[drain-loop] a suite is running - not polling the queue. This is a WAIT, not a stop.\n'
+		fi
 		sleep "$EVERY"
 		continue
+	fi
+	if [ "$waiting" = yes ]; then
+		printf '[drain-loop] the box is free after %ss - polling again\n' \
+			"$((SECONDS - waiting_since))"
+		waiting=no
 	fi
 	# drain.sh takes the flock itself and exits 3 when another drainer holds it,
 	# so nothing here needs to know about other passes - only about suites.
