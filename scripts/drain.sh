@@ -731,7 +731,35 @@ if [ -n "$held" ]; then
 fi
 
 if [ -d "$WORK" ]; then
-	git -C "$WORK" checkout -q "$branch" || die "cannot check out $branch in $WORK"
+	# A CHECKOUT REFUSED BY THE DRAINER'S OWN RESIDUE IS NOT A REASON TO STOP.
+	#
+	# This was `|| die`, and die runs AFTER the declare - so the pass gave the
+	# lock back, the next pass picked the same row by queue order, and died in
+	# exactly the same place. Not a row skipped: a row that stops every pass
+	# until somebody clears a directory by hand. Found by @orchestrator on
+	# 2026-08-21 while it was happening.
+	#
+	# WHAT COLLIDES IS ALWAYS OURS. $WORK exists only to gate in; nothing else
+	# writes there, and its untracked non-ignored files are what a previous gate
+	# left. On the day: a branch that did not track web/dist/.gitkeep was gated,
+	# the build wrote the file, and the next branch that DOES track it could not
+	# be checked out over the top.
+	#
+	# `clean -fd` AND NOT `-x`, which is the whole care in this. Without -x it
+	# removes untracked files that are not ignored - the residue - and leaves
+	# ignored ones alone: web/dist/assets, the built binary, and web/node_modules,
+	# which is minutes of npm ci. Measured here: -x would have taken all three.
+	#
+	# One retry, then refuse loudly. If a clean tree still cannot take the
+	# branch, the cause is not residue and guessing again would just be slower.
+	if ! git -C "$WORK" checkout -q "$branch" 2>/dev/null; then
+		say "$WORK will not take $branch - clearing what the last gate left and trying once more"
+		git -C "$WORK" clean -fdq 2>/dev/null || true
+		if ! git -C "$WORK" checkout -q "$branch"; then
+			blocked "$row" "the drain worktree $WORK will not check out $branch, and clearing what the last gate left did not help. This stops every pass on this row until somebody looks: git -C $WORK status"
+			die "cannot check out $branch in $WORK, even after clearing untracked residue"
+		fi
+	fi
 else
 	git -C "$REPO" worktree add --checkout "$WORK" "$branch" ||
 		die "cannot create the drain worktree at $WORK"
