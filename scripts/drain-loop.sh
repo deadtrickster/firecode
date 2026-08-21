@@ -39,20 +39,33 @@ AGENT=${FLOWY_AGENT:-}
 # path form varies: relative when a shell runs it, absolute when .flowy-gate
 # execs it. The basename of argv[1] is the same either way and cannot match this
 # script.
-suite_running() {
-	local d cmd
-	for d in /proc/[0-9]*; do
-		[ "$d" = "/proc/$$" ] && continue
-		# The redirect is inside the group so a process that exits between the
-		# glob and the read is silent, rather than a line of noise per tick: a
-		# loop that prints an error every 90 seconds is a loop people stop
-		# reading.
-		cmd=$({ tr '\0' '\n' <"$d/cmdline" | sed -n 2p; } 2>/dev/null)
-		[ -n "$cmd" ] || continue
-		[ "${cmd##*/}" = "run-tests.sh" ] || continue
-		return 0
-	done
-	return 1
+# IS THE SUITE LOCK HELD - the fact itself, not a count of processes that might
+# be holding it.
+#
+# This walked /proc for anything whose argv[1] basenamed to run-tests.sh, which
+# counted A SUITE WAITING FOR THE LOCK exactly like one running. run-tests.sh
+# takes ${TMPDIR:-/tmp}/flowy-gate.lock and blocks up to 1800s for it, so a
+# queue of seats waiting their turn looked like N separate reasons to skip, and
+# every new waiter extended the skip. Measured 2026-08-21: my own suite sat
+# waiting on that flock for seven minutes, doing no work, blocking every poll -
+# and @orchestrator lost twenty minutes of drainer time to the same thing.
+#
+# THE GUARD STAYS, and that is not the same as the guard being right. Dropping
+# it would have drain.sh DECLARE a row and then block inside run-tests.sh
+# waiting for the flock: target frozen, row reading `gating`, for as long as the
+# queue in front of it. The point of skipping is to not take a row this box
+# cannot start on.
+#
+# So: ask the lock. `flock -n` succeeds only when nobody holds it, and it
+# releases immediately - a waiter is invisible to it, which is the whole
+# correction. Two suites still cannot run at once, because run-tests.sh's own
+# flock is what prevents that; this only decides whether to POLL.
+suite_lock_held() {
+	local lock=${FLOWY_GATE_LOCK:-${TMPDIR:-/tmp}/flowy-gate.lock}
+	# Held by somebody -> flock fails -> true here. Cannot open it at all is
+	# treated as held: a guard that cannot measure must not answer "clear".
+	flock -n "$lock" true 2>/dev/null && return 1
+	return 0
 }
 
 # NOT `while true; do ... done &` FROM A PROMPT. This exists so the loop has a
@@ -78,7 +91,7 @@ suite_running() {
 waiting=no
 waiting_since=0
 while :; do
-	if suite_running; then
+	if suite_lock_held; then
 		if [ "$waiting" = no ]; then
 			waiting=yes
 			waiting_since=$SECONDS
