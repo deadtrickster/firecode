@@ -1,0 +1,36 @@
+[Unit]
+Description=Flowy drain driver - takes merge rows off the queue, one pass at a time
+Documentation=file:/home/dead/Projects/firecode/scripts/drain-loop.sh
+# NOTHING SUPERVISES THE DRIVER TODAY. The loop that has been draining this
+# queue since 2026-08-18 is a shell one-liner started from an agent session:
+# its own session leader, so it survives the terminal, but nothing restarts it
+# if it dies. It would die silently at 4am and the first sign would be a queue
+# that stopped moving - measured as a real cost twice, since a stalled queue
+# reads exactly like a quiet night.
+#
+# It does not depend on the node unit: a drainer whose node is briefly
+# unreachable retries, and ordering against flowy-dogfood.service would make a
+# node restart take the drainer down with it.
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dead/Projects/firecode
+# FLOWY_AGENT is not optional - drain-loop.sh refuses without it, because a
+# pass with no name files its rows as the operator.
+Environment=FLOWY_AGENT=claude-host
+ExecStart=/home/dead/Projects/firecode/scripts/drain-loop.sh
+# on-failure rather than always: the loop is `while :`, so a clean exit means
+# somebody stopped it deliberately and restarting would fight them.
+Restart=on-failure
+RestartSec=10
+# A pass runs a full suite. KillMode=mixed sends TERM to the loop and gives the
+# gate time to tear its throwaway Postgres down before the group is killed -
+# without it a stop leaves a cluster and a worktree behind.
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target
