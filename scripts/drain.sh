@@ -1030,6 +1030,32 @@ outcome=landed
 note="$landed"
 say "landed $landed"
 
+# AND THEN IT GOES OUT, because a landing nobody can see is not a landing.
+#
+# @deadtrickster, 2026-08-21 07:45, having checked github before leaving: "last
+# push was 8 hours ago wtf" - and it was worse than eight hours. Nothing in this
+# script or in run-tests.sh has ever contained `git push`. The drainer landed on
+# the LOCAL master by fast-forward and stopped, so origin moved only when a
+# person remembered, and 27 gated commits sat unpublished from 01:29 to 07:45.
+# Their instruction, in full: "it is easy - each merge pushes".
+#
+# THE SCAN IS ALREADY THERE AND IS NOT SKIPPED. scripts/pre-push.sh is installed
+# as this checkout's pre-push hook, so this push runs the same credential gate a
+# person's would - old..new, or every reachable commit on a first push. That is
+# deliberate: an unattended drainer and a tired person at 19:00 get the same
+# answer, which is the whole argument of that hook's own header.
+#
+# A FAILED PUSH DOES NOT FAIL THE PASS. The branch is merged, the queue has been
+# told, and master is correct locally - undoing any of that because github was
+# unreachable would trade a real landing for a network hiccup. So it is said
+# loudly and the pass continues: the next landing pushes this one too, since a
+# push sends every commit the remote lacks rather than only the newest.
+if git -C "$REPO" push --quiet origin "$rowtarget" 2>/dev/null; then
+	say "pushed $rowtarget to origin - github has $landed"
+else
+	say "WARNING: could not push $rowtarget to origin. master is $landed locally and github is behind; the next landing will carry both, or push by hand"
+fi
+
 # ------------------------------------------------------------ and only then
 
 if [ "$deploy" != yes ]; then
