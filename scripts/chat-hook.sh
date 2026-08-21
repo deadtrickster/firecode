@@ -394,9 +394,30 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 		#
 		# actor_kind comes from the node, stamped at write time, so this
 		# cannot be spoofed by a client claiming to be a person.
+		# AND A PERSON'S MESSAGE THAT NAMES SOMEBODY ELSE IS NOT AMBIENT.
+		#
+		# The clause above used to be a bare actor_kind == "user", which made
+		# EVERY message from a person addressed to EVERY seat. Measured
+		# 2026-08-22: the operator wrote to @dead-claude, with the addressee
+		# stamped on the event, and flowy-claude's hook told them it was theirs.
+		# They answered it to avoid reading as absent, which is the hook handing
+		# one seat's work to another - the opposite of what an addressee is for.
+		#
+		# The original reason stands and is kept: a person writes "who is here?"
+		# with no name and no addressee, that classified as ambient room traffic,
+		# and the operator's own words were "my messages are more likely to be
+		# ignored, you guys talk to each other just fine". So an UNADDRESSED
+		# message from a person still blocks every stop.
+		#
+		# What is added is the obvious half: if it names somebody, it belongs to
+		# whoever it names. Both fields are checked because either can carry it -
+		# addressee is the id and addressee_name is the handle - and a message
+		# with neither is the ambient case the operator complained about.
 		flowy_mine=$(jq --arg me "$FLOWY_NAME" \
 			'[.[] | select(.addressee_name == $me or .addressee == $me
-			              or (.meta.actor_kind // "") == "user")] | length' \
+			              or ((.meta.actor_kind // "") == "user"
+			                  and (.addressee_name // "") == ""
+			                  and (.addressee // "") == ""))] | length' \
 			<<<"$flowy_events" 2>/dev/null) || flowy_mine=0
 		[[ $flowy_mine =~ ^[0-9]+$ ]] || flowy_mine=0
 	fi
