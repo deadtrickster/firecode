@@ -605,8 +605,8 @@ They are different operations on different things and the names do not say so.
 flowy merge withdraw --id <row> --note "why"
 ```
 
-That verb lands with `fix/merge-withdraw-verb`. Until it does, the same thing
-is `flowy todo done --id <row> --note "why"` - which is where it lived, under a
+That verb is LIVE as of flowy 7b92b27. Before it existed the same thing was
+`flowy todo done --id <row> --note "why"` - which is where it lived, under a
 different noun, and is the whole reason the verb exists.
 
 
@@ -617,6 +617,50 @@ withdrawal leaves an absence that reads exactly like a landing a week later.
 Closing a row does NOT release its lock - nothing in the status path touches
 it. So if your row is holding the target, abandon first and then withdraw;
 `merge withdraw` refuses that order and says so rather than stranding the lock.
+
+## argv is not identity: `pgrep -f`, `pkill -f` and `ps | grep` lie in both directions
+
+Six times on 2026-08-20/21, across three of us in one night. Every instance was
+a guard or a measurement reporting the opposite of the truth, and two of them
+were guards written specifically to avoid the first one.
+
+**It matches the asker.** The pattern is inside the argv of the command doing
+the matching. `ps -eo args= | grep -c run-tests` counts itself.
+`pkill -f 'definitely-no-such-process-xyzzy'` killed the shell that ran it -
+exit 144 - with a pattern invented to match nothing.
+
+**It misses the target.** The same program is `bash ./run-tests.sh` when a
+person types it and `bash /home/dead/Projects/wt-drain/run-tests.sh` when
+`.flowy-gate` execs it. The live drain driver guarded itself with
+`grep -c '^bash \./run-tests\.sh$'` and answered 0 for two days while suites
+were running. Two agents then wrote "exact" checks to verify that bug and both
+had the identical blind spot, because `./run-tests.sh` is how a person types
+it, so "exactly that" feels like precision.
+
+**It matches a description of the process rather than the process.** A
+supervisor loop whose own argv CONTAINS `./scripts/drain.sh --once` matches
+`pgrep -f 'drain.sh --once'` forever, while the pass it starts and reaps comes
+and goes. A waiter written to avoid editing drain.sh mid-pass was guarded that
+way and would have waited out its whole timeout.
+
+**Do this instead** - basename of argv[1], read from /proc. Same for both
+spellings, and it cannot match the walker:
+
+```
+for d in /proc/[0-9]*; do
+    [ "$d" = "/proc/$$" ] && continue
+    cmd=$({ tr '\0' '\n' <"$d/cmdline" | sed -n 2p; } 2>/dev/null)
+    [ "${cmd##*/}" = "run-tests.sh" ] && ...
+done
+```
+
+scripts/drain-loop.sh already does exactly this and says why.
+
+**Better: do not identify a process by its text at all.** Hold a `flock`, or
+record the pid you started and check that one. And whatever the check, never
+report the effect without measuring it - a `pkill` whose status was discarded
+by a `;` was reported in the room as a suite yielded, while the suite ran on
+and held the lock for another nine minutes.
 ## What is already in scripts/, so you do not write it again
 
 This file's own rule, applied to itself: a tool nobody knows about is a tool
