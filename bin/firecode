@@ -1409,7 +1409,7 @@ cmd_info() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		--json)
@@ -1520,7 +1520,7 @@ cmd_mirror() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		--pid)
@@ -2219,7 +2219,7 @@ cmd_grow() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		--drive)
@@ -2293,7 +2293,7 @@ for d in cfg.get("drives", []):
 # wrecks it in between.
 cmd_checkpoint() {
 	local want=""
-	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
+	[[ ${1:-} == --project ]] && want=$(realpath -m "$2")
 	local sock jail
 	sock=$(require_vm_socket "$want")
 	jail=$(dirname "$sock")
@@ -2335,7 +2335,7 @@ cmd_in() {
 			shift 2
 			;;
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		*) break ;;
@@ -2990,7 +2990,7 @@ cmd_watch() {
 			shift 2
 			;;
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		-*) die "usage: firecode watch [VM] [--every SEC] [-n LINES]" ;;
@@ -3027,7 +3027,7 @@ cmd_say() {
 	while [[ ${1:-} == --* ]]; do
 		case "$1" in
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		*) break ;;
@@ -3100,7 +3100,7 @@ fi
 
 cmd_down() {
 	local want=""
-	[[ ${1:-} == --project ]] && want=$(cd "$2" && pwd)
+	[[ ${1:-} == --project ]] && want=$(realpath -m "$2")
 	local sock
 	sock=$(require_vm_socket "$want")
 	log "stopping the VM"
@@ -5561,7 +5561,7 @@ cmd_ps() {
 	while (($#)); do
 		case $1 in
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		--json)
@@ -5662,7 +5662,7 @@ cmd_logs() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--project)
-			want=$(cd "$2" && pwd)
+			want=$(realpath -m "$2")
 			shift 2
 			;;
 		-f | --follow)
