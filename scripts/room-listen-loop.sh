@@ -33,6 +33,11 @@ NAME=${FLOWY_AGENT:-}
 	printf 'room-listen-loop: set FLOWY_AGENT - a listener with no name cannot ask for its own mail\n' >&2
 	exit 2
 }
+# Where this repo is, so the waiter pid file lands where the chat hook looks.
+# Resolved from THIS script rather than a caller's cwd: the loop is started by a
+# Monitor whose working directory is not guaranteed to be the checkout.
+FIRECODE_ROOT=${FIRECODE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
+
 ADDR=${FLOWY_ADDR:-http://192.168.1.55:8787}
 BIN=${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy}
 TOKFILE=${FLOWY_TOKFILE:-$HOME/.config/flowy/agents/$NAME}
@@ -45,6 +50,36 @@ BODY=${FLOWY_LISTEN_BODY:-400}
 }
 FLOWY_TOKEN=$(cat "$TOKFILE")
 export FLOWY_TOKEN
+
+# SAY THAT THIS SEAT IS LISTENING, in the file the chat hook reads as proof.
+#
+# runs/chat-waiter-<name>.pid, "<pid> <kind>", which is what waiter_pid_for in
+# chat-hook.sh opens and kill -0's. The other two seats' waiters write it; this
+# loop did not, and that silence had a cost the moment the hook started
+# INSISTING on proof: d6d1a77 stopped an unproved name being polled, and this
+# listener - running the whole time - could not prove it was mine. The hook then
+# correctly refused to read my inbox and told me so.
+#
+# THE GUARD WAS RIGHT AND THE LISTENER WAS RUDE. A waiter that does not announce
+# itself is indistinguishable from one that is not there, and every part of this
+# fleet that asks "is anybody hearing this room" - the nag, the hook, the
+# listening pane - is asking a question this file can answer for free.
+#
+# The LOOP's pid rather than the poll's: `flowy inbox` exits and is replaced
+# every deadline, so its pid is a fact with a 240-second life. The loop is what
+# is actually listening, for as long as this seat is up.
+#
+# "tracked" because that is what this is - a supervised loop, not a fork a
+# delivery left behind. See WaiterTracked in internal/store/inbox.go.
+WAITER_PID_FILE=${FLOWY_WAITER_PID_FILE:-$FIRECODE_ROOT/runs/chat-waiter-$NAME.pid}
+mkdir -p "$(dirname "$WAITER_PID_FILE")" 2>/dev/null || true
+printf '%s tracked\n' "$$" >"$WAITER_PID_FILE.tmp" 2>/dev/null &&
+	mv -f "$WAITER_PID_FILE.tmp" "$WAITER_PID_FILE" 2>/dev/null || true
+# AND TAKE IT BACK ON THE WAY OUT, so a stopped listener does not keep vouching
+# for itself. kill -0 on a dead pid already fails, so this is tidiness rather
+# than correctness - but a stale file that happens to name a REUSED pid would
+# vouch for a stranger.
+trap 'rm -f "$WAITER_PID_FILE" 2>/dev/null' EXIT
 
 # ONE INVOCATION PER MESSAGE, and the loop is what re-arms it. `flowy inbox`
 # delivers one and exits, so something has to ask again - and when that
