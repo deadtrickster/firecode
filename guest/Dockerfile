@@ -65,6 +65,33 @@ RUN curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 2
 	https://bun.sh/install | bash \
 	&& ln -sf /root/.bun/bin/bun /usr/local/bin/bun
 
+# GO, IN EVERY IMAGE INCLUDING LEAN, AND MATCHING WHAT THE PROJECTS BUILD WITH.
+#
+# Ubuntu 24.04 ships go1.22.2 and apt puts it at /usr/bin/go. That was the only
+# Go in a lean guest, and it silently produced a DIFFERENT BINARY from the host:
+# flowy tags a field `json:"process,omitzero"`, omitzero arrived in Go 1.24, and
+# a 1.22 compiler does not know the tag - so it emits the field. A listener with
+# no process serialised as {} in a VM and was omitted on the box, and every
+# branch gated in a VM carried the same red for a reason that had nothing to do
+# with the branch. Measured 2026-08-21 across three unrelated ones; see
+# 01M0HP135P.
+#
+# The full branch below already fetched go1.23.4, which would not have helped:
+# still below 1.24. And it is the branch nobody builds.
+#
+# So the toolchain a VM gate needs is not "heavy", it is CORRECT - a gate that
+# compiles with a different toolchain from the one that lands is not a gate. It
+# goes ahead of /usr/bin/go via /usr/local/bin, which is earlier in the guest's
+# PATH.
+ARG GO_VERSION=1.26.0
+RUN set -eux; \
+	arch="$(dpkg --print-architecture)"; \
+	case "$arch" in amd64) goarch=amd64 ;; arm64) goarch=arm64 ;; *) goarch="$arch" ;; esac; \
+	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${goarch}.tar.gz" | tar -C /usr/local -xz; \
+	ln -sf /usr/local/go/bin/go /usr/local/bin/go; \
+	ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
+	/usr/local/bin/go version
+
 # Optional heavy toolchains. Skipped by default: they roughly quadruple both
 # the build time and the image size.
 RUN if [ "$FIRECODE_TOOLCHAINS" = "full" ]; then \
@@ -72,10 +99,9 @@ RUN if [ "$FIRECODE_TOOLCHAINS" = "full" ]; then \
 	apt-get update; \
 	apt-get install -y --no-install-recommends clang clang-tools lld llvm sbcl; \
 	rm -rf /var/lib/apt/lists/*; \
-	GO_VERSION=1.23.4; \
-	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz; \
-	ln -sf /usr/local/go/bin/go /usr/local/bin/go; \
-	ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
+	# Go is installed above, for EVERY image and at a version that matches what
+	# the projects build with. It used to be fetched here at 1.23.4 - below the
+	# 1.24 that flowy needs, and in the branch nobody builds.
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 	| sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path; \
 	ln -sf /root/.cargo/bin/rustc /usr/local/bin/rustc; \
