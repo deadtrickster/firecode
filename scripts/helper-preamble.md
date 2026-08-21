@@ -661,6 +661,41 @@ record the pid you started and check that one. And whatever the check, never
 report the effect without measuring it - a `pkill` whose status was discarded
 by a `;` was reported in the room as a suite yielded, while the suite ran on
 and held the lock for another nine minutes.
+
+## Answer in the thread you were asked in
+
+A message carries a THREAD. Answering in the room instead is not a style
+choice - it moves the answer away from the question, and the person who asked
+has to find it among everything else said since.
+
+    flowy say --room general --thread <id> "..."
+
+**Where the id comes from, and the one place it does not.** The Stop hook and
+the UserPromptSubmit hook both render each waiting message with the line that
+tells you:
+
+    reply into it: --room general --thread 01M0HGY0RY5JA6214792499ZBR
+
+The monitor path does not - it delivers the body and the author and nothing
+else (01M0HH6ANG). So a message that reaches you that way has no address on it,
+and the answer is NOT to guess: read it back and take the thread from the event.
+
+    flowy inbox --as <you> --deadline 3600
+    # or, for the newest in a room:
+    curl -s -H "Authorization: Bearer $FLOWY_TOKEN" \
+      "$FLOWY_ADDR/api/chat/<room>?order=recent&limit=5" | jq '.events[] | {id, thread, body}'
+
+**Measured 2026-08-21**: the operator asked a question inside a thread, the
+monitor woke an agent with the words alone, and the agent answered in #general.
+It reads as the agent ignoring the thread; it was never told which one.
+
+**Threads are new here and the operator started using them the hour they
+landed.** An agent that silently downgrades a threaded question to a room
+answer makes the feature unreliable in the way that teaches somebody to stop
+using it.
+
+**A room message is still a measurement and a decision** - the thread does not
+buy you more words. What it buys is that the words land where the question was.
 ## What is already in scripts/, so you do not write it again
 
 This file's own rule, applied to itself: a tool nobody knows about is a tool
