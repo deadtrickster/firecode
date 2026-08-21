@@ -161,15 +161,47 @@ CID=$(docker create "$IMAGE_TAG" /bin/true)
 docker export "$CID" -o "$TAR"
 docker rm -f "$CID" >/dev/null
 
+# BUILT BESIDE THE LIVE IMAGE AND RENAMED OVER IT, never written in place.
+#
+# mkfs.ext4 writing straight to $OUT truncates and refills the very file every
+# running VM is booted from: bin/firecode:4770 attaches $ROOTFS as a lower drive
+# BY PATH, with no copy. So a rebuild while anything is up is a torn read of a
+# six-gigabyte file, and the damage would surface as a corrupt guest filesystem
+# in some later run with nothing to connect it back to here. Nothing stopped
+# that - there is no lock between this script and a booting VM, and `firecode
+# ps` says only what was true when it was asked.
+#
+# A rename is atomic and needs no lock at all: a VM that is already up keeps the
+# inode it opened and finishes on the image it started with, and the next boot
+# gets the new one. This is the same fix as install-then-mv for a live script,
+# at six gigabytes.
+#
+# The in-VM builder already does it this way (`agent-firecode.next.ext4` in
+# cmd_prepare_in_vm) - this path was the odd one out.
+NEXT="$OUT.next"
+rm -f "$NEXT"
 echo "[prepare] converting to ext4 ($SIZE)"
 docker run --rm \
 	-v "$IMAGES:/out" \
 	--entrypoint /usr/local/sbin/firecode-mkimage \
 	"$IMAGE_TAG" \
-	"/out/$(basename "$TAR")" "/out/$(basename "$OUT")" \
+	"/out/$(basename "$TAR")" "/out/$(basename "$NEXT")" \
 	"$SIZE" "$(id -u)" "$(id -g)"
 
 echo
+
+# THE RENAME IS THE INSTALL, and it happens only after mkfs said it was done.
+# A build that failed leaves the previous image exactly where it was, which is
+# the other half of what building beside it buys: a convert that dies halfway
+# through leaves a truncated image where the working one used to be, and the
+# next boot reads it. Not measured - the guard is here because the failure is
+# cheap to prevent and expensive to diagnose, which is the whole argument.
+[ -s "$NEXT" ] || {
+	rm -f "$NEXT"
+	echo "[prepare] the convert produced no image - the existing $OUT is untouched" >&2
+	exit 1
+}
+mv -f "$NEXT" "$OUT"
 echo "[prepare] rootfs ready:"
 ls -lh "$OUT"
 echo
