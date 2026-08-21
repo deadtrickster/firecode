@@ -93,15 +93,16 @@ check QUIET "the pile SHRANK - somebody took one" 0 0 8 9 0
 check WAKE "a row assigned to me and not started" 1 0 9 9 0
 check WAKE "two of them" 2 0 9 9 0
 
-# STALE IS EDGE-TRIGGERED TOO, and this is the half that was wrong when the
-# split first landed. A note does not move `Updated` (api_nag.go:156), so
-# writing on a stale row does not clear it - measured, 2 stale to 6 on this seat
-# in three hours of doing exactly what the board asks. Level-triggering it made
-# the nag fire every cycle about work that was in hand. 01M0HRZM3N.
-check QUIET "six stale rows, unchanged since the morning" 0 6 9 9 0
-check WAKE "a NEW row has gone quiet" 0 7 9 9 0 6
-check QUIET "one stale row was picked back up" 0 5 9 9 0 6
-check WAKE "first contact, and something is stale" 0 3 0 - - -
+# STALE IS CLEARABLE AGAIN, and this line has been both ways in one day. It was
+# edge-triggered while a note did not move `Updated`, because a seat could not
+# turn it off by doing what the board asks. 69086b9 made a note FROM THE HOLDER
+# move it, verified here before this test changed: a note on 01M0HGHQ2T moved
+# Updated from 06:36:18Z to 17:18:49Z. So working on a stale row turns the
+# signal off, and level-triggering is right again - which is the test that
+# decides the side, not a preference about loudness. 01M0HRZM3N.
+check WAKE "a stale claim of my own, which a note now clears" 0 6 9 9 0
+check WAKE "one stale row, nothing else" 0 1 0 0 0
+check QUIET "none stale, none of mine, steady pile" 0 0 9 9 0
 
 # The floor under both, so a full board that stopped changing is not forgotten.
 check WAKE "steady pile, but not reminded for an hour" 0 0 9 9 3600

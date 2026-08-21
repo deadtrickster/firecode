@@ -232,30 +232,28 @@ if [[ ${1:-} == --watch ]]; then
 		# sitting unowned, say so once. Rare enough to still be read, and it
 		# keeps "an idle agent beside an unowned row" from becoming true just
 		# because the pile stopped growing.
-		# STALE IS NOT CLEARABLE EITHER, AND THAT IS MEASURED. It was on the
-		# clearable side when this split was written, on the reasoning that a
-		# seat clears its own quiet claims by writing on them. It cannot:
-		# api_nag.go:156 counts `active` rows whose `Updated` is older than the
-		# threshold, and a NOTE DOES NOT MOVE `Updated`. Only a status change
-		# does. So the two things the board asks for - mark it active when you
-		# start, say where it has got to - are exactly what grows this number.
+		# STALE IS CLEARABLE AGAIN, AND THIS LINE HAS BEEN BOTH WAYS TODAY.
 		#
-		# Measured on this seat within three hours of the split landing: 2 stale
-		# before, 6 after, and every one of the four was a row I had marked
-		# active and then written notes on. Nothing I could write would bring it
-		# down, so the nag fired every cycle about work that was in hand. That is
-		# the unowned pile's defect, reproduced by me on the other side of my own
-		# fix. Filed as 01M0HRZM3N.
+		# It started level-triggered, on the reasoning that a seat clears its own
+		# quiet claims by writing on them. It could not: api_nag.go counts
+		# `active` rows whose `Updated` is old, and a NOTE DID NOT MOVE Updated -
+		# so the two things the board asks of a seat with work in hand, mark it
+		# active and say where it got to, were exactly what grew the number.
+		# Measured on this seat: 2 stale to 6 in three hours of doing that.
 		#
-		# So it moves to the EDGE side with the pile: a stale row that is NEW is
-		# news, six that have been stale since the morning are not, and the
-		# remind floor below still says so once an hour.
+		# fc31242 moved it to the edge side as a WORKAROUND and said in these
+		# words that it reverts the day a note counts as a write. @orchestrator
+		# landed that day at 69086b9: a note from the ROW'S HOLDER moves Updated,
+		# a note from anybody else does not - which is the right discriminator,
+		# because a stranger reading a row is not evidence that its holder is
+		# working it.
 		#
-		# IT MOVES BACK if 01M0HRZM3N is decided so that a note counts as a
-		# write. Then working on a stale row does clear it and level-triggering
-		# is right again - which is the test to apply, rather than a preference
-		# about how loud a nag should be.
-		clearable=$(jq -r '(.mine_todo // 0)' <<<"$nag" 2>/dev/null || echo 0)
+		# Verified here before reverting rather than taking the commit's word:
+		# a note on 01M0HGHQ2T moved its Updated from 06:36:18Z to 17:18:49Z.
+		#
+		# So working on a stale row turns the signal off again, which is the only
+		# test that decides which side of the split a count belongs on.
+		clearable=$(jq -r '((.mine_todo // 0) + (.stale // 0))' <<<"$nag" 2>/dev/null || echo 0)
 		pile=$(jq -r '(.unowned // 0)' <<<"$nag" 2>/dev/null || echo 0)
 		stalled=$(jq -r '(.stale // 0)' <<<"$nag" 2>/dev/null || echo 0)
 		[[ $clearable =~ ^[0-9]+$ ]] || clearable=0
