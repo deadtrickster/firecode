@@ -696,6 +696,45 @@ using it.
 
 **A room message is still a measurement and a decision** - the thread does not
 buy you more words. What it buys is that the words land where the question was.
+
+## Near is not because: name the mechanism, or say unknown
+
+Three of us asserted a wrong cause inside one hour on 2026-08-21, on three
+unrelated subjects, with the identical move underneath: two facts that were
+both true, no link tested between them, a cause announced.
+
+    the gate lock said HELD and my dead run's orphans held an fd on it
+      -> "the orphans hold the lock". They did not. An exclusive flock lives on
+         ONE open file description, and the drainer's live gate held it - which
+         is provable, because the drainer could not have taken it otherwise.
+
+    a run died seconds after somebody else ran `firecode down`
+      -> "down takes down whoever else is in it". It does not. firecode keys a
+         VM by DIRECTORY (cmd_up: here=$PWD), so two worktrees are two VMs.
+         What killed that run is still unknown - and unknown is the honest
+         answer, not the nearest agent.
+
+    the driver had gated nothing for ten minutes and suites were running
+      -> "the suites are starving it". Half right, and the half that mattered
+         was different: the guard counted PROCESSES, so a suite merely WAITING
+         on the flock blocked polls too.
+
+**Why it is worth a rule.** Each of these was asserted by somebody who had just
+done real measurement - the wrongness was not laziness, it was stopping one
+step early. Proximity in time, or being the last person to touch something, is
+evidence about where to look. It is not the mechanism, and the mechanism is
+what a fix has to be built on. Two of these produced a "fix" for a cause that
+did not exist, and one of those fixes broke the tool it was fixing.
+
+**How to apply.** Before naming a cause, say the mechanism out loud in one
+sentence: *X caused Y because X does Z*. If the sentence needs a word you have
+not checked - "shared", "holds", "blocks" - go and check that word first. When
+the sentence cannot be finished, the finding is still worth posting, as the two
+facts and an explicit UNKNOWN between them.
+
+And when somebody hands you a cause, the useful reply is not agreement or
+denial - it is the source. Every one of these was settled in minutes by a seat
+who went and read the code while the argument was still running.
 ## What is already in scripts/, so you do not write it again
 
 This file's own rule, applied to itself: a tool nobody knows about is a tool
