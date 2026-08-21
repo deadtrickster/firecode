@@ -271,6 +271,56 @@ else
 	say ok "the working tree is clean, so the commit is what gets compiled"
 fi
 
+# A FILE THE PROJECT DELIBERATELY KEPT INSIDE AN IGNORED TREE IS STILL THERE.
+#
+# A `!` line in .gitignore is a statement: everything here is build output
+# EXCEPT this one file, which is load-bearing. flowy's is
+#
+#   /web/dist/*
+#   !/web/dist/.gitkeep
+#
+# and go:embed all:web/dist matches nothing without it, so the binary builds
+# with no console in it. The suite catches that - twelve minutes in, at the end
+# of a full pass.
+#
+# IT HAS COST TWO PASSES IN ONE DAY, both the same way: `npx vite build` empties
+# the output directory and takes the tracked file with it, then `git add -A`
+# commits the deletion. The project HAS a guard - package.json postbuild puts it
+# back - and calling the tool directly instead of the project's script walks
+# around it. That is a habit, not a bug, and habits need a check rather than a
+# reminder.
+#
+# PROJECT-AGNOSTIC BECAUSE IT READS THE PROJECT'S OWN FILE. Nothing here knows
+# about web/dist; it knows that a `!` line names something the project said to
+# keep. A project with no such lines gets no check and no output.
+#
+# Literal paths only. A `!` pattern with a glob names a set rather than a file,
+# and "some of these are missing" is not a question this can answer cheaply.
+if [ -r "$PWD/.gitignore" ]; then
+	keep_missing=""
+	keep_checked=0
+	while read -r pat; do
+		pat=${pat#!}
+		pat=${pat#/}
+		[ -n "$pat" ] || continue
+		case "$pat" in
+		*'*'* | *'?'* | *'['*) continue ;;
+		esac
+		keep_checked=$((keep_checked + 1))
+		git -C "$PWD" cat-file -e "HEAD:$pat" 2>/dev/null ||
+			keep_missing="$keep_missing $pat"
+	done < <(grep '^!' "$PWD/.gitignore" 2>/dev/null || true)
+	if [ -n "$keep_missing" ]; then
+		bad "the commit is missing a file .gitignore says to KEEP:$keep_missing
+This is what \`npx vite build\` plus \`git add -A\` does - the build empties the
+directory, the tracked file goes with it, and the deletion gets committed. Call
+the project's script (npm run build) rather than the tool it wraps, restore the
+file and amend. The suite would find this too, twelve minutes from now."
+	elif ((keep_checked > 0)); then
+		say ok "$keep_checked file(s) .gitignore keeps are in the commit"
+	fi
+fi
+
 # 4. REMEMBER WHAT WE ARE ABOUT TO MEASURE. Every guard here assumes the threat
 # is somebody else moving the target; on 2026-08-18 the tree changed under a
 # running gate because the person who spawned it kept editing the branch. Nobody
