@@ -418,6 +418,21 @@ blocked() { # id why
 	api POST "/api/merge/$1/blocked" \
 		"$(printf '{"why":"%s"}' "$(printf '%s' "$2" | sed 's/"/\\"/g')")" >/dev/null 2>&1 || true
 }
+# stale_ref_note says when origin has something this box has not got, at the
+# moment a row is being skipped for being what it already was.
+#
+# Only ever a NOTE. Fetching here would change the tree mid-pass, and deciding
+# from origin would gate something other than what is on this disk - both are
+# larger changes than this problem needs. What it fixes is the invisibility: the
+# skip is correct, and correct-and-silent is what let a fixed branch sit for
+# twelve minutes with nobody able to see why.
+stale_ref_note() { # branch localsha originsha
+	[ -n "$3" ] || return 0
+	[ "$2" = "$3" ] && return 0
+	say "  NOTE: origin/$1 is at $3 and this box's $1 is at $2"
+	say "  somebody pushed without moving the local ref, so the fix is not here to gate:"
+	say "    git -C \$repo branch -f $1 $3"
+}
 # redtip and redbase are the verdict the NODE holds for this row, "-" when it
 # holds none. Read here rather than fetched later: the selector already has the
 # queue answer open, and a second read would be a second moment.
@@ -542,6 +557,25 @@ while read -r kind id b t proj redtip redbase; do
 	# refusing a tree nobody has measured.
 	bsha=$(git -C "$rowrepo" rev-parse --short "$b" 2>/dev/null || true)
 	tsha=$(git -C "$rowrepo" rev-parse --short "$t" 2>/dev/null || true)
+	# THE BRANCH THIS READS IS THE LOCAL ONE, AND NOTHING HERE FETCHES.
+	#
+	# That is deliberate - the drainer gates the tree on this box, and a fetch
+	# inside the pass would change what is being measured halfway through - but
+	# it has a silent failure mode that cost an hour tonight, on 01M0JZ52Y2.
+	#
+	# A pass rebases in its worktree and leaves the LOCAL ref at the rebased
+	# tip. So after a red, the local branch is exactly the tip the red names.
+	# Somebody who fixes the branch and pushes with `push origin HEAD:<branch>`
+	# - from a worktree on some other branch, which is the normal way to hand a
+	# branch to the drainer - updates origin and NOT the local ref. The pair
+	# still matches, the skip below is correct by its own rule, and the row sits
+	# there while its author waits for a re-gate that can never come.
+	#
+	# Nothing was wrong and nothing said so, which is the whole problem: a skip
+	# that is right is silent. So when origin disagrees with what is about to be
+	# skipped, say it. This does not change what is gated - the local ref is
+	# still the answer - it only stops the disagreement being invisible.
+	osha=$(git -C "$rowrepo" rev-parse --short "origin/$b" 2>/dev/null || true)
 	# TWO PLACES HOLD THIS FACT AND ONLY ONE OF THEM TRAVELS.
 	#
 	# $STATE/red-<row> is this box's own record, and it is a SET - every pair
@@ -559,11 +593,13 @@ while read -r kind id b t proj redtip redbase; do
 	if [ -n "$bsha" ] && [ -n "$tsha" ] &&
 		[ "$redtip" = "$bsha" ] && [ "$redbase" = "$tsha" ]; then
 		say "skipping $id - $b at $bsha onto $t at $tsha is red on the ROW, recorded by whoever gated it"
+		stale_ref_note "$b" "$bsha" "$osha"
 		continue
 	fi
 	if [ -n "$bsha" ] && [ -n "$tsha" ] &&
 		grep -qxF "$bsha $tsha" "$STATE/red-$id" 2>/dev/null; then
 		say "skipping $id - $b at $bsha onto $t at $tsha was already gated red by this drainer"
+		stale_ref_note "$b" "$bsha" "$osha"
 		continue
 	fi
 	# THE CHOSEN ROW DECIDES THE CHECKOUT for everything after this loop, which
