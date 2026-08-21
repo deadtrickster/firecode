@@ -559,6 +559,64 @@ And when the answer is "stale", `firecode spawn-server restart` - not
 `firecode spawn-server`, which is a refusal, and never `pkill -f`, which matches
 the shell running the server as well and leaves the old one holding the port.
 
+
+## Filing a merge row: set FLOWY_REPO, and detach the branch first
+
+Two things the door now checks for you, and one of them cannot run unless you
+say where the repository is.
+
+`flowy merge open` refuses a branch that is checked out in any worktree,
+because the drainer cannot rebase one and the row would sit looking stalled.
+To answer that question it asks a git repository - and the tree you are
+standing in is usually the wrong one. Every seat files from
+`~/Projects/flowy-dogfood`, which holds the built binary and is not a
+repository at all; filing from `~/Projects/firecode` is worse, because that IS
+a repository and it has never heard of a flowy branch.
+
+So say which tree owns the branch:
+
+```
+FLOWY_REPO=/home/dead/Projects/flowy flowy merge open --branch feat/x ...
+```
+
+Without it the door says it could not check and files anyway - which is the
+honest answer and still leaves the check unrun. Measured 2026-08-21 from
+`~/Projects/firecode`: unset, it filed with a note; set, it refused and named
+the worktree holding the branch and the command to detach it.
+
+And detach before you file, not after. If you built the branch in a worktree of
+your own, that worktree is holding it:
+
+```
+git -C <that worktree> checkout --detach
+```
+
+## Withdrawing a merge row: `merge withdraw`, not `abandon`
+
+They are different operations on different things and the names do not say so.
+
+  `abandon`   gives back the target LOCK. The row stays in the queue and can be
+              gated again. Called on a target nobody holds it refuses - a true
+              sentence about a question you were not asking.
+  `withdraw`  retires the ROW. The queue filters on status, so this is what
+              takes it out.
+
+```
+flowy merge withdraw --id <row> --note "why"
+```
+
+That verb lands with `fix/merge-withdraw-verb`. Until it does, the same thing
+is `flowy todo done --id <row> --note "why"` - which is where it lived, under a
+different noun, and is the whole reason the verb exists.
+
+
+The note is required. A withdrawal is the one queue event that leaves no
+artifact behind: a landing leaves a sha, a red leaves a verdict, and a
+withdrawal leaves an absence that reads exactly like a landing a week later.
+
+Closing a row does NOT release its lock - nothing in the status path touches
+it. So if your row is holding the target, abandon first and then withdraw;
+`merge withdraw` refuses that order and says so rather than stranding the lock.
 ## What is already in scripts/, so you do not write it again
 
 This file's own rule, applied to itself: a tool nobody knows about is a tool
