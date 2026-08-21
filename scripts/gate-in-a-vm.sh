@@ -82,12 +82,26 @@ if ! git rev-parse --verify --quiet "$branch" >/dev/null; then
 	exit 2
 fi
 
-vmargs=()
-[[ -n $VM ]] && vmargs=("$VM")
+# A VM OF THIS RUN'S OWN, NEVER THE PROJECT'S SHARED ONE.
+#
+# firecode keys a VM by PROJECT NAME, and every seat here works on "flowy". The
+# first cut of this ran `firecode down` before `up` so the image would carry the
+# new commit - and took down the VM @flowy-claude was gating in, killing their
+# run. Second one they lost to me in an hour. A script written to stop my gating
+# costing other people cost somebody else directly.
+#
+# So the name carries the BRANCH and the seat, and nothing this script does can
+# reach a VM anybody else is in. `down` is then safe because it is only ever
+# downing the one this invocation made.
+seat=${FLOWY_AGENT:-$(id -un)}
+safe_branch=${branch//[^A-Za-z0-9._-]/-}
+VM=${VM:-gate-$seat-$safe_branch}
+vmargs=("$VM")
 
-# down THEN up, so the image packs the commit that exists NOW. Skipping this is
-# how a VM gates yesterday's tree and says so in the present tense.
-printf '>> repacking the VM so it carries %s\n' "$(git rev-parse --short "$branch")" >&2
+# down THEN up, so the image packs the commit that exists NOW. Skipping it is
+# how a VM gates yesterday's tree and reports it in the present tense - and it
+# is safe here only because the name above cannot collide with another seat.
+printf '>> VM %s, packing %s\n' "$VM" "$(git rev-parse --short "$branch")" >&2
 "$FIRECODE" down "${vmargs[@]}" >/dev/null 2>&1 || true
 "$FIRECODE" up "${vmargs[@]}" >&2 || {
 	printf 'the VM would not start - NOT a suite failure, and not a pass\n' >&2
