@@ -53,11 +53,29 @@ branch=${1:-$(git rev-parse --abbrev-ref HEAD)}
 # COMMITTED, OR THE VM MEASURES SOMETHING ELSE. The image packs the repository,
 # not the working tree, so an uncommitted change is simply absent from the run -
 # and the run would pass, cheerfully, about a tree nobody has.
-if [[ -n $(git status --porcelain) ]]; then
-	printf 'the tree is dirty and the VM packs the REPOSITORY, not your worktree.\n' >&2
-	printf 'commit first, or this gates a tree that is not the one you are looking at:\n\n' >&2
-	git status --short >&2
+# TRACKED CHANGES ARE A REFUSAL, UNTRACKED ONES ARE A WARNING, and the
+# difference is what the VM will actually pack.
+#
+# A modified tracked file is the dangerous case: the branch has one version, the
+# disk has another, and the VM gates the branch's - silently, cheerfully, about
+# a tree nobody is looking at.
+#
+# An untracked file is not in the branch either way, so the run is honest about
+# it - and refusing on those made this unusable in the shared checkout, where
+# somebody else's scratch file is always present. Measured immediately: the
+# first real invocation refused because another seat had left
+# scripts/board-nag-monitor.sh untracked, which has nothing to do with my
+# branch.
+if [[ -n $(git diff --name-only) || -n $(git diff --cached --name-only) ]]; then
+	printf 'tracked files are modified, and the VM packs the REPOSITORY:\n' >&2
+	printf 'it would gate the committed version, not what you are looking at.\n\n' >&2
+	git status --short --untracked-files=no >&2
 	exit 2
+fi
+untracked=$(git ls-files --others --exclude-standard | head -5)
+if [[ -n $untracked ]]; then
+	printf 'note: untracked files are NOT in the branch and will not be in the run -\n' >&2
+	printf '%s\n' "$untracked" | sed 's/^/  /' >&2
 fi
 if ! git rev-parse --verify --quiet "$branch" >/dev/null; then
 	printf 'no such branch here: %s\n' "$branch" >&2
