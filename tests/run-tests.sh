@@ -718,6 +718,24 @@ test_arg_massaging() {
 # invisible for as long as the nag ran - a signal that fires every cycle looks
 # identical to a signal that is working, right up until somebody admits they
 # stopped reading it.
+# THE DRAINER REFUSES A PARKED TREE BEFORE SPENDING A GATE, not after. Host-side
+# and instant: a throwaway repo on the wrong branch, and the block cut out of
+# drain.sh run against it with its side effects stubbed.
+#
+# It is a test because the failure it covers is expensive and silent - a full
+# suite runs, goes green, and the landing is refused for a reason knowable in
+# two seconds. Nothing about that looks wrong in a log.
+test_drain_preflight() {
+	local out rc
+	out=$("$ROOT/scripts/drain-preflight-test.sh" 2>&1)
+	rc=$?
+	if ((rc == 0)); then
+		ok "the drainer refuses a parked tree before gating"
+	else
+		check "the drainer refuses a parked tree before gating" "" "$out"
+	fi
+}
+
 test_board_nag_wake() {
 	local out rc
 	out=$("$ROOT/scripts/board-nag-wake-test.sh" 2>&1)
@@ -1119,6 +1137,7 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 
 run_test shellcheck
 run_test board_nag_wake
+run_test drain_preflight
 run_test ps_json_is_not_the_prose
 run_test projects_is_a_registry_not_a_config_file
 run_test denylist

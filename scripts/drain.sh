@@ -554,6 +554,47 @@ if [ -z "$row" ]; then
 fi
 say "taking $row - $branch onto $rowtarget"
 
+# ------------------------------------------------------- the tree, before cost
+#
+# THE SAME REFUSAL AS THE ONE AT THE LAND, ASKED BEFORE ANYTHING IS SPENT.
+#
+# It is checked twice on purpose and the two are not redundant. Down there it
+# guarantees the fast-forward is real - the tree could be parked while the gate
+# runs, and that check has to happen next to the git command it protects. Here
+# it saves the gate.
+#
+# MEASURED 2026-08-21, and it cost the queue an hour. I left the shared checkout
+# detached after `merge open` told me to detach it (01M0HQKP0C). The drainer
+# then: declared 01M0HET1G2, rebased it, ran the whole suite green, recorded the
+# verdict, and THEN refused the land because $REPO was on HEAD. 746 seconds to
+# learn something knowable in two, and it did not stop there - the next pass
+# declared the same row again, and A DECLARATION DESTROYS THE VERDICT IT
+# SUPERSEDES (mergegate.go applyGate, supersededByADeclaration). So the green
+# from the first pass was thrown away, and the second pass paid for the same
+# measurement over again.
+#
+# That is the whole shape of the waste: an ENVIRONMENTAL refusal, discovered
+# after the expensive part, on a row that was never at fault. The row was fine
+# both times.
+#
+# NOT the general fix. A verdict is still destroyed by any re-declare, so a
+# drainer killed mid-land still pays twice, and using an already-admissible
+# verdict instead of re-gating is a bigger change to this script's shape than
+# belongs in the same commit. This removes the cause that has actually bitten.
+on=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+if [ "$on" != "$rowtarget" ]; then
+	blocked "$row" "the shared checkout $REPO is on $on, not $rowtarget - nothing can land until it is back, and the drainer is not spending a gate to find that out again. Whoever parked it: git -C $REPO checkout $rowtarget"
+	outcome=refused
+	note="$REPO is on $on, not $rowtarget - a fast-forward there lands nothing and reports success"
+	say "$REPO is on $on, not $rowtarget - refusing before the gate rather than after it"
+	# RECORDED BY HAND, because the EXIT trap is not installed yet - it goes on
+	# with the declare, since its first job is giving the lock back and there is
+	# no lock to give back here. Without this the stall is on the row and not in
+	# the status file the nag reads, which is half the audience.
+	record
+	exit 1
+fi
+
 if [ "$dry" = yes ]; then
 	outcome="dry-run"
 	say "dry run: would declare, rebase, pre-gate, gate, record, land"
