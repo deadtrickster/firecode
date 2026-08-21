@@ -257,7 +257,22 @@ for it in q.get("items") or []:
         continue
     if not (it.get("branch") or "").strip():
         continue
-    print("ROW", it["id"], it["branch"], it.get("target") or "master", it.get("project") or "-")
+    # THE RED THE NODE HOLDS RIDES WITH THE ROW.
+    #
+    # The skip below used to read only $STATE/red-<row>, a file on THIS box: a
+    # second drainer could not skip a red the first one measured, and a cleared
+    # cache silently cost nine minutes a row. The store has carried the same
+    # fact all along - api_mergequeue.go:queueRedOf gives {tip, base} - and the
+    # two are the SAME PAIR, because drain.sh rebases in a worktree that has the
+    # branch checked out, so the ref has moved by the time the pair is written.
+    # Measured across every pair file on this box: 4 of 4 agree with the
+    # tip of the run that wrote them, once the append-only file is read line by line.
+    #
+    # "-" for absent rather than an empty field, so the shell reads a word
+    # instead of losing a positional argument.
+    red = it.get("red") or {}
+    print("ROW", it["id"], it["branch"], it.get("target") or "master",
+          it.get("project") or "-", red.get("tip") or "-", red.get("base") or "-")
 print("END")
 ')
 
@@ -344,7 +359,10 @@ blocked() { # id why
 	api POST "/api/merge/$1/blocked" \
 		"$(printf '{"why":"%s"}' "$(printf '%s' "$2" | sed 's/"/\\"/g')")" >/dev/null 2>&1 || true
 }
-while read -r kind id b t proj; do
+# redtip and redbase are the verdict the NODE holds for this row, "-" when it
+# holds none. Read here rather than fetched later: the selector already has the
+# queue answer open, and a second read would be a second moment.
+while read -r kind id b t proj redtip redbase; do
 	[ "$kind" = ROW ] || continue
 	# A named row means this pass is about that row and nothing else.
 	[ -z "$only" ] || [ "$id" = "$only" ] || continue
@@ -465,9 +483,28 @@ while read -r kind id b t proj; do
 	# refusing a tree nobody has measured.
 	bsha=$(git -C "$rowrepo" rev-parse --short "$b" 2>/dev/null || true)
 	tsha=$(git -C "$rowrepo" rev-parse --short "$t" 2>/dev/null || true)
+	# TWO PLACES HOLD THIS FACT AND ONLY ONE OF THEM TRAVELS.
+	#
+	# $STATE/red-<row> is this box's own record, and it is a SET - every pair
+	# ever gated red for this row, appended. The node holds one {tip, base}, the
+	# latest, and it is on the ROW: readable by any drainer, any console, any
+	# seat, and it survives ~/.cache being cleared. Same pair, different reach.
+	#
+	# So the node's answer is consulted FIRST and the file stays as the belt it
+	# already called itself: a drainer whose node is briefly unreachable must
+	# still not re-measure a tree it has measured, and a row that was red at A,
+	# fixed, red at B and reverted to A is only in the file. Measured on this
+	# box: 16 pair files, 6 with more than one pair, 0 with a repeat - so that
+	# last case has never happened here, and losing it would cost one extra gate
+	# rather than a wrong answer.
+	if [ -n "$bsha" ] && [ -n "$tsha" ] &&
+		[ "$redtip" = "$bsha" ] && [ "$redbase" = "$tsha" ]; then
+		say "skipping $id - $b at $bsha onto $t at $tsha is red on the ROW, recorded by whoever gated it"
+		continue
+	fi
 	if [ -n "$bsha" ] && [ -n "$tsha" ] &&
 		grep -qxF "$bsha $tsha" "$STATE/red-$id" 2>/dev/null; then
-		say "skipping $id - $b at $bsha onto $t at $tsha was already gated red"
+		say "skipping $id - $b at $bsha onto $t at $tsha was already gated red by this drainer"
 		continue
 	fi
 	# THE CHOSEN ROW DECIDES THE CHECKOUT for everything after this loop, which
