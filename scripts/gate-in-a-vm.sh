@@ -22,7 +22,6 @@ set -uo pipefail
 FIRECODE=${FIRECODE:-/home/dead/Projects/firecode/bin/firecode}
 REPO=${GATE_REPO:-$PWD}
 SUITE=${GATE_SUITE:-./run-tests.sh}
-VM=${GATE_VM:-}
 
 usage() {
 	cat >&2 <<'EOF'
@@ -33,7 +32,7 @@ drainer is not blocked for the length of the run.
 
   GATE_REPO   the checkout to gate (default: $PWD)
   GATE_SUITE  what to run inside (default: ./run-tests.sh)
-  GATE_VM     which VM to use (default: firecode's own choice for this project)
+  (the VM is chosen by the checkout being gated - firecode keys it by directory)
 
 Exit status is the SUITE'S, not the transport's - a VM that cannot be reached
 is 2, so it can never be read as a pass.
@@ -82,26 +81,27 @@ if ! git rev-parse --verify --quiet "$branch" >/dev/null; then
 	exit 2
 fi
 
-# A VM OF THIS RUN'S OWN, NEVER THE PROJECT'S SHARED ONE.
+# THE VM IS KEYED BY DIRECTORY, WHICH IS WHY THIS IS SAFE.
 #
-# firecode keys a VM by PROJECT NAME, and every seat here works on "flowy". The
-# first cut of this ran `firecode down` before `up` so the image would carry the
-# new commit - and took down the VM @flowy-claude was gating in, killing their
-# run. Second one they lost to me in an hour. A script written to stop my gating
-# costing other people cost somebody else directly.
+# cmd_up takes `here=$PWD` (or --project DIR) and the VM belongs to that path.
+# Two seats gating two worktrees are therefore already in two VMs, and a `down`
+# here cannot reach one somebody else is using.
 #
-# So the name carries the BRANCH and the seat, and nothing this script does can
-# reach a VM anybody else is in. `down` is then safe because it is only ever
-# downing the one this invocation made.
-seat=${FLOWY_AGENT:-$(id -un)}
-safe_branch=${branch//[^A-Za-z0-9._-]/-}
-VM=${VM:-gate-$seat-$safe_branch}
-vmargs=("$VM")
+# I got this wrong twice in ten minutes and both are worth writing down. First I
+# assumed a shared VM and ran `down` believing it was mine - @flowy-claude lost
+# a run at the same moment and we both concluded I had taken their machine.
+# Then I "fixed" it by inventing a VM NAME, which firecode does not take as a
+# positional for `up` at all: `in <name> <cmd>` read the name as the command and
+# answered "gate-claude-host-...: command not found". A fix for a cause I had
+# not confirmed, which broke the tool for a defect it may not have had.
+#
+# So: no invented names. --project pins the VM to the checkout being gated,
+# which is what makes down/up honest.
+vmargs=(--project "$REPO")
 
 # down THEN up, so the image packs the commit that exists NOW. Skipping it is
-# how a VM gates yesterday's tree and reports it in the present tense - and it
-# is safe here only because the name above cannot collide with another seat.
-printf '>> VM %s, packing %s\n' "$VM" "$(git rev-parse --short "$branch")" >&2
+# how a VM gates yesterday's tree and reports it in the present tense.
+printf '>> VM for %s, packing %s\n' "$REPO" "$(git rev-parse --short "$branch")" >&2
 "$FIRECODE" down "${vmargs[@]}" >/dev/null 2>&1 || true
 "$FIRECODE" up "${vmargs[@]}" >&2 || {
 	printf 'the VM would not start - NOT a suite failure, and not a pass\n' >&2
