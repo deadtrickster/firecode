@@ -692,7 +692,7 @@ fi
 # KEYED BY ROW AND TIP, not by row. The retry below overwrote the log of the
 # run that mattered with the log of the run that repeated it - so the evidence
 # of the first red was destroyed by the second identical red.
-log=$STATE/drain-$row-$tip.log
+log=$STATE/drain-$row-$tip-${run#drain-}.log
 # TRUNCATED HERE, SO THE DRAINER'S OWN NARRATION SURVIVES IT.
 #
 # say() appends to $log, and the gate used to write it with `>` - so every line
@@ -867,7 +867,7 @@ else
 	# cause and the first few are enough to recognise it - and a note long
 	# enough to be truncated by the queue display is a note nobody reads.
 	tests=$(grep -aoE '^ *--- FAIL: [A-Za-z0-9_/]+' "$log" 2>/dev/null |
-		sed 's/^ *--- FAIL: //' | head -3 | paste -sd, -)
+		sed 's/^ *--- FAIL: //' | head -3 | paste -sd, - || true)
 	[ -n "$tests" ] && note="$note - $tests"
 	reported=$(api POST "/api/merge/$row/gate" \
 		"$(jq -nc --arg run "$run" --arg tip "$tip" --arg note "$note" \
