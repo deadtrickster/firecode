@@ -292,6 +292,43 @@ if [[ -n $FLOWY_NAME ]]; then
 	fi
 fi
 
+# AND AN UNPROVED NAME IS NOT READ FROM EITHER, which is the half this guard
+# was missing until 2026-08-21.
+#
+# FLOWY_NAME_PROVED already stopped an unproved name reaching the ARM
+# instruction, because a compliant agent would seize another seat's reader. The
+# DELIVERY path below did something the comment did not anticipate: it opens
+# $FLOWY_AGENTS/$FLOWY_NAME and polls /api/inbox/wait AS THAT NAME. So on a seat
+# where the guess was wrong, this hook read somebody else's inbox with somebody
+# else's token - measured on @orchestrator's seat, which was handed
+# "flowy room (flowy-claude) - 1 message(s) waiting".
+#
+# NO MESSAGE WAS CONSUMED and that is worth stating exactly, because the obvious
+# fear is the wrong one: read_cursor moves only in AckInbox (store/inbox.go:164)
+# and a wait never acks. What it DOES touch is presence - PollStart sets
+# last_poll_at and increments polls_in_flight - so one seat's hook can make
+# another seat's reader look attached and recently polled. That inverts this
+# guard's purpose: it was written so an unproved name could not SEIZE a reader,
+# and the delivery path was quietly MANUFACTURING THE EVIDENCE that one is
+# listening. Everything that asks "is anybody hearing this room" then believes
+# it - the nag, the listening pane, and this hook.
+#
+# So an unproved name is not printed AND not polled. The hook still runs, still
+# reports the room unheard if it is, and says plainly that it cannot tell whose
+# seat this is - which is the honest answer when there are several candidates
+# and no live waiter to settle it.
+if ((FLOWY_NAME_PROVED == 0)) && [[ -n $FLOWY_NAME ]]; then
+	FLOWY_UNPROVED=$FLOWY_NAME
+	FLOWY_NAME=""
+	# SAY WHY IT WENT QUIET. Silence here would mean the same as a quiet room,
+	# and they are different facts - one of them is this hook declining to read
+	# somebody else's mail.
+	# shellcheck disable=SC2016  # the $(cat ...) is advice for the reader to run, not for this shell to expand
+	FLOWY_REASON=$(printf 'This hook cannot tell which seat this session is, so it read NOBODY'"'"'s inbox.\nIt guessed %s from a memo, and %s tokens live in %s with no waiter of yours running to settle it.\nThe room may have messages for you and this says nothing about that.\nStart your own listener under YOUR OWN name - not the guess above:\n  while true; do FLOWY_TOKEN=$(cat %s/<you>) %s inbox --as <you> --url %s --deadline 240; sleep 3; done\nPolling under another agent name marks THEIR reader as attached on the node, which is how a seat that is not listening comes to look like one that is.' \
+		"$FLOWY_UNPROVED" "${#flowy_candidates[@]}" "$FLOWY_AGENTS" \
+		"$FLOWY_AGENTS" "$FLOWY_BIN" "$FLOWY_ADDR")
+fi
+
 if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 	flowy_token=$(cat "$FLOWY_AGENTS/$FLOWY_NAME" 2>/dev/null) || flowy_token=""
 	flowy_payload=""
