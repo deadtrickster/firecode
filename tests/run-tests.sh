@@ -711,6 +711,24 @@ test_arg_massaging() {
 	fi
 }
 
+# WHEN THE BOARD NAG MAY SPEAK. Host-side and instant, so it runs in --quick
+# too: the assertions are shell arithmetic over counts, with no node and no VM.
+#
+# It is here rather than only runnable by hand because the defect it covers was
+# invisible for as long as the nag ran - a signal that fires every cycle looks
+# identical to a signal that is working, right up until somebody admits they
+# stopped reading it.
+test_board_nag_wake() {
+	local out rc
+	out=$("$ROOT/scripts/board-nag-wake-test.sh" 2>&1)
+	rc=$?
+	if ((rc == 0)); then
+		ok "the board nag wakes only on what a seat can clear"
+	else
+		check "the board nag wakes only on what a seat can clear" "" "$out"
+	fi
+}
+
 test_shellcheck() {
 	local f out=""
 	for f in "$ROOT/bin/firecode" "$ROOT"/scripts/*.sh "$ROOT"/guest/*.sh \
@@ -1100,6 +1118,7 @@ print(",".join(keys))
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
 
 run_test shellcheck
+run_test board_nag_wake
 run_test ps_json_is_not_the_prose
 run_test projects_is_a_registry_not_a_config_file
 run_test denylist

@@ -90,6 +90,20 @@ token=$(cat "$AGENTS/$name" 2>/dev/null) || exit 0
 # an agent can treat both the same way.
 BOARD_EVERY=${BOARD_EVERY:-120}
 BOARD_DEADLINE=${BOARD_DEADLINE:-3600}
+
+# HOW OFTEN THE UNOWNED PILE MAY SPEAK WHEN IT IS NOT GROWING. The pile wakes a
+# seat when it GROWS (see the watch loop); this is the floor under that, so a
+# board that stopped growing while still full is not silently forgotten. An
+# hour, because the failure being fixed is a nag that spoke every two minutes
+# until it was tuned out.
+BOARD_REMIND=${BOARD_REMIND:-3600}
+# WHERE THE PREVIOUS COUNT LIVES. Each --watch is a fresh process, so "did the
+# pile grow" cannot be answered from a variable. Per seat, because two agents on
+# one box are told different things and would otherwise clear each other's mark.
+nag_state=${BOARD_NAG_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/flowy-nag}
+mkdir -p "$nag_state" 2>/dev/null || true
+pile_file=$nag_state/pile.$name
+remind_file=$nag_state/reminded.$name
 board_read() {
 	curl -sS -m 8 -H "Authorization: Bearer $token" \
 		"$FLOWY_ADDR/api/artifacts?kind=todo&limit=200" 2>/dev/null
@@ -164,13 +178,70 @@ if [[ ${1:-} == --watch ]]; then
 			continue
 		fi
 		cursor=$(jq -r '.cursor // ""' <<<"$nag" 2>/dev/null || echo "")
-		# WHAT COUNTS AS WORK WAITING FOR THIS SEAT, and every one of these
-		# three is the node's count rather than this file's reading of a row:
-		# a row nobody is on, a row this seat holds and has not started, and a
-		# claim of its own that has gone quiet.
-		work=$(jq -r '((.unowned // 0) + (.mine_todo // 0) + (.stale // 0))' \
-			<<<"$nag" 2>/dev/null || echo 0)
-		[[ $work =~ ^[0-9]+$ ]] && ((work > 0)) && break
+		# WHAT COUNTS AS WORK WAITING FOR THIS SEAT - and the answer is not
+		# "everything on the board", which is what it used to be:
+		#
+		#   work = unowned + mine_todo + stale
+		#
+		# THE SEAT CANNOT CLEAR `unowned` BY WORKING. Nine rows nobody owns stay
+		# nine when I take one, so that sum is above zero permanently, the wait
+		# breaks on its first poll every time, and the nag fires every
+		# BOARD_EVERY seconds forever. A signal that always fires carries no
+		# information, and the reader learns to skip it - which is exactly what
+		# it was accused of. The operator, after a night of it: "the fact that
+		# nagger was ignored deliberately worries me so much". It was ignored
+		# because it was noise, and it was noise because of this line.
+		#
+		# So the wake splits by WHO CAN CLEAR IT:
+		#
+		#   clearable  mine_todo + stale. Rows this seat holds and has not
+		#              started, and its own claims gone quiet. Level-triggered,
+		#              because working IS what turns them off - that is a nag
+		#              doing its job, and it stops when the job is done.
+		#
+		#   the pile   unowned. EDGE-triggered: a NEW row nobody owns is news,
+		#              the same nine for the fifth hour are not. Compared
+		#              against what this seat was last told, which is why there
+		#              is a file - each --watch is a fresh process and a count
+		#              in a variable dies with it.
+		#
+		# A FLOOR UNDER THE PILE so it cannot be forgotten either: if nothing
+		# else has woken this seat for BOARD_REMIND seconds and rows are still
+		# sitting unowned, say so once. Rare enough to still be read, and it
+		# keeps "an idle agent beside an unowned row" from becoming true just
+		# because the pile stopped growing.
+		clearable=$(jq -r '((.mine_todo // 0) + (.stale // 0))' <<<"$nag" 2>/dev/null || echo 0)
+		pile=$(jq -r '(.unowned // 0)' <<<"$nag" 2>/dev/null || echo 0)
+		[[ $clearable =~ ^[0-9]+$ ]] || clearable=0
+		[[ $pile =~ ^[0-9]+$ ]] || pile=0
+
+		# ABSENT IS NOT ZERO. A seat that has never run this has no previous
+		# count, and reading that as 0 would make the first poll "the pile grew
+		# from nothing to nine" and nag - which is the right answer for the
+		# first run and the wrong one for a wiped cache. It is treated as first
+		# contact deliberately: being told once about a pile you have not seen
+		# is the cheap error.
+		last_pile=""
+		[[ -r $pile_file ]] && last_pile=$(<"$pile_file")
+		[[ $last_pile =~ ^[0-9]+$ ]] || last_pile=-1
+
+		# Recorded on every observation, not only when it nags, so a pile that
+		# shrinks re-arms: 9 -> 8 is silent, and 8 -> 9 is news again.
+		printf '%s' "$pile" >"$pile_file.tmp" 2>/dev/null &&
+			mv -f "$pile_file.tmp" "$pile_file" 2>/dev/null || true
+
+		reminded=0
+		if [[ -r $remind_file ]]; then
+			reminded=$(($(date +%s) - $(stat -c %Y "$remind_file" 2>/dev/null || echo 0)))
+		else
+			reminded=$BOARD_REMIND # never reminded is due for one
+		fi
+
+		if ((clearable > 0)) || ((pile > 0 && pile > last_pile)) ||
+			((pile > 0 && reminded >= BOARD_REMIND)); then
+			((pile > 0)) && : >"$remind_file" 2>/dev/null || true
+			break
+		fi
 
 		waited=$((waited + SECONDS - before))
 		((waited >= BOARD_DEADLINE)) && exit 1 # quiet deadline, like the waiter's
