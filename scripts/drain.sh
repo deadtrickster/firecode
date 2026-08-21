@@ -152,9 +152,68 @@ record() {
 		--arg agent "$AGENT" \
 		--arg note "$note" \
 		--argjson pid "$$" \
+		--argjson busiest "${busiest:-0}" \
 		'{at: $at, outcome: $outcome, row: $row, branch: $branch, tip: $tip,
-		  agent: $agent, note: $note, pid: $pid}' >"$STATUS" 2>/dev/null || true
+		  agent: $agent, note: $note, pid: $pid,
+		  # The highest number of OTHER suites seen on this box during the pass.
+		  # A verdict from a busy box and one from a quiet box are different
+		  # facts, and this is the only place that difference survives.
+		  busiest_other_suites: $busiest}' >"$STATUS" 2>/dev/null || true
 }
+# HOW BUSY THE BOX WAS WHILE THIS PASS RAN, recorded rather than reconstructed.
+#
+# A flake that only fires under concurrent load is a flake whose verdicts cannot
+# be compared unless the load is known, and after the fact it is not: processes
+# are gone, and a gate log's span tells you when a pass ran but not what else was
+# on the box. Three of us spent an afternoon on 01M0HSJZ68 discovering that the
+# only honest answer to "was that a busy pass" was "nobody recorded it".
+#
+# OTHER SUITE ROOTS, not processes. run-tests.sh spawns a tree of itself, so a
+# process count reads one suite as three. A root is a run-tests.sh whose parent
+# is not also one - and this pass's own root is excluded by construction, since
+# it is a descendant of this shell.
+#
+# THE MAXIMUM ACROSS THE PASS, not a reading at the start. A suite that begins
+# and ends inside this one would be invisible to two samples, so the heartbeat
+# takes one every renew and keeps the highest. It is a lower bound either way and
+# is written as one: `0` means none were seen, not none existed.
+other_suites() {
+	local p ppid up hops n=0 mine=$$
+	for p in $(pgrep -x -f '.*run-tests\.sh.*' 2>/dev/null); do
+		[ "$p" = "$mine" ] && continue
+		ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null) || continue
+		# A ROOT HAS A PARENT THAT IS NOT ALSO A SUITE. -a IS LOAD-BEARING:
+		# /proc/PID/cmdline is NUL-separated, and grep without -a calls it
+		# binary and exits 1 even when the text is there. Measured - without it
+		# every suite counted as a root and this returned 2 for one suite, which
+		# is a plausible number and therefore the worst kind of wrong.
+		grep -qsa 'run-tests\.sh' "/proc/$ppid/cmdline" && continue
+		# AND OURS DOES NOT COUNT. Walking the parent chain rather than testing
+		# one ppid, because this pass's suite is a grandchild of this shell, not
+		# a child - .flowy-gate execs run-tests.sh in between. Bounded, so a
+		# reparented process cannot spin it.
+		up=$p
+		hops=0
+		while [ "$up" != 1 ] && [ -n "$up" ] && ((hops < 12)); do
+			[ "$up" = "$mine" ] && break
+			up=$(awk '{print $4}' "/proc/$up/stat" 2>/dev/null) || break
+			hops=$((hops + 1))
+		done
+		[ "$up" = "$mine" ] && continue
+		n=$((n + 1))
+	done
+	printf '%s' "$n"
+}
+# Seen so far. Sampled at the start, at every renew, and once at the end.
+busiest=0
+note_busiest() {
+	local now
+	now=$(other_suites)
+	[[ $now =~ ^[0-9]+$ ]] || return 0
+	((now > busiest)) && busiest=$now
+	return 0
+}
+
 # Where this drainer remembers what it has already done. Beside the status file
 # the nag reads, because they are the same kind of fact about the same passes.
 STATE=${FLOWY_DRAIN_STATE:-$HOME/.cache/flowy-drain}
@@ -795,7 +854,11 @@ log=$STATE/drain-$row-$tip-${run#drain-}.log
 # A mechanism whose use cannot be observed is one nobody can verify, so the
 # drainer says which command it is about to run, in the line that already goes
 # to the row's log.
+# The first reading, before the suite starts, so a box that was ALREADY busy
+# is on the record even if it quietens during the pass.
+note_busiest
 say "gating $tip with ./.flowy-gate - about five minutes, log at $log"
+((busiest > 0)) && say "NOT A QUIET BOX: $busiest other suite(s) running - a red from this pass is not comparable with one from an idle box"
 # FLOWY_AGENT IS UNSET FOR THE SUITE, and this is the drainer changing the
 # meaning of the thing it measures.
 #
@@ -855,6 +918,10 @@ heartbeat() {
 	while kill -0 "$watch" 2>/dev/null; do
 		sleep "$every"
 		kill -0 "$watch" 2>/dev/null || return 0
+		# Sampled here because the heartbeat is the only thing that runs
+		# DURING the gate - a suite that starts and ends inside this pass is
+		# invisible to a reading at each end.
+		note_busiest
 		answer=$(api POST "/api/merge/$row/renew" '{}' 2>/dev/null) || return 0
 		code=$(code_of "$answer")
 		case "$code" in
@@ -924,6 +991,7 @@ else
 	# quotes and apostrophes ("a person's own row"), and a note that stops
 	# parsing is a note nobody sees.
 	first=$(grep -aE '^FAIL ' "$log" 2>/dev/null | head -1 | sed 's/ (exit [0-9]*)$//')
+	note_busiest # the last reading, before the verdict is written
 	count=$(grep -aE '^passed:' "$log" 2>/dev/null | tail -1)
 	note=$count
 	[ -n "$first" ] && note="$count - $first"
@@ -988,6 +1056,7 @@ fi
 # A green with no count was the asymmetry: a red has carried its note since the
 # verdict became a row, so the outcome nobody has to explain is the one whose
 # evidence was thrown away - exactly when a landing is announced to the room.
+note_busiest # the last reading, before the verdict is written
 count=$(grep -aE '^passed:' "$log" 2>/dev/null | tail -1)
 verdict=$(api POST "/api/merge/$row/gate" \
 	"$(printf '{"run":"%s","gated_tip":"%s","note":"%s"}' "$run" "$tip" "$count")")
