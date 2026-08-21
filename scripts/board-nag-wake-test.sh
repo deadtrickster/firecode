@@ -40,13 +40,19 @@ export BOARD_REMIND
 # run reports WAKE if the predicate would break out of the wait, QUIET if not.
 # The loop is how `break` is caught: the predicate is real shell and breaks a
 # real loop, so nothing about it is stubbed.
-run() { # mine_todo stale unowned last_pile(- = none) remind_age(- = never)
+run() { # mine_todo stale unowned last_pile(-=none) remind_age(-=never) last_stale(-=none)
 	# shellcheck disable=SC2034  # read by the predicate sourced from board-nag.sh
 	nag=$(printf '{"mine_todo":%s,"stale":%s,"unowned":%s}' "$1" "$2" "$3")
 	pile_file=$d/pile
+	stale_file=$d/stale
 	remind_file=$d/remind
-	rm -f "$pile_file" "$remind_file"
+	rm -f "$pile_file" "$stale_file" "$remind_file"
 	[ "$4" = "-" ] || printf '%s' "$4" >"$pile_file"
+	# Defaults to the stale count itself, so a case that says nothing about
+	# staleness describes a board where it has not just changed - which is what
+	# every case written before stale was edge-triggered meant.
+	last_stale=${6:-$2}
+	[ "$last_stale" = "-" ] || printf '%s' "$last_stale" >"$stale_file"
 	if [ "$5" != "-" ]; then
 		: >"$remind_file"
 		touch -d "@$(($(date +%s) - $5))" "$remind_file"
@@ -62,7 +68,7 @@ run() { # mine_todo stale unowned last_pile(- = none) remind_age(- = never)
 }
 
 fail=0
-check() { # want desc mine_todo stale unowned last_pile remind_age
+check() { # want desc mine_todo stale unowned last_pile remind_age [last_stale]
 	local want=$1 desc=$2
 	shift 2
 	local got
@@ -80,18 +86,28 @@ check QUIET "steady pile, nothing of mine - the bug being fixed" 0 0 9 9 0
 check WAKE "the pile GREW - a new unowned row is news" 0 0 10 9 0
 check QUIET "the pile SHRANK - somebody took one" 0 0 8 9 0
 
-# What a seat CAN clear still wakes it every time, because working turns it off.
-# This half must keep working: a nag that went quiet about a seat's own unstarted
-# rows would be the opposite failure, and the operator asked for the todo list to
-# empty.
+# WHAT A SEAT CAN CLEAR still wakes it every time, because working turns it off.
+# This must keep working: a nag that went quiet about a seat's own unstarted
+# rows would be the opposite failure, and the operator asked for the todo list
+# to empty.
 check WAKE "a row assigned to me and not started" 1 0 9 9 0
-check WAKE "my own claim has gone quiet" 0 1 9 9 0
-check WAKE "both, on a steady pile" 2 3 9 9 0
+check WAKE "two of them" 2 0 9 9 0
 
-# The floor under the pile, so a full board that stopped growing is not forgotten.
+# STALE IS EDGE-TRIGGERED TOO, and this is the half that was wrong when the
+# split first landed. A note does not move `Updated` (api_nag.go:156), so
+# writing on a stale row does not clear it - measured, 2 stale to 6 on this seat
+# in three hours of doing exactly what the board asks. Level-triggering it made
+# the nag fire every cycle about work that was in hand. 01M0HRZM3N.
+check QUIET "six stale rows, unchanged since the morning" 0 6 9 9 0
+check WAKE "a NEW row has gone quiet" 0 7 9 9 0 6
+check QUIET "one stale row was picked back up" 0 5 9 9 0 6
+check WAKE "first contact, and something is stale" 0 3 0 - - -
+
+# The floor under both, so a full board that stopped changing is not forgotten.
 check WAKE "steady pile, but not reminded for an hour" 0 0 9 9 3600
 check QUIET "steady pile, reminded ten minutes ago" 0 0 9 9 600
-check QUIET "no pile at all and nothing of mine - truly quiet" 0 0 0 0 99999
+check WAKE "no pile, stale rows, and an hour of silence" 0 4 0 0 3600
+check QUIET "nothing at all and nothing of mine - truly quiet" 0 0 0 0 99999
 
 # FIRST CONTACT is not an empty board. A seat with no file has never been told
 # anything, which is why the absent count is -1 and not 0 - but 0 unowned rows

@@ -103,6 +103,7 @@ BOARD_REMIND=${BOARD_REMIND:-3600}
 nag_state=${BOARD_NAG_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/flowy-nag}
 mkdir -p "$nag_state" 2>/dev/null || true
 pile_file=$nag_state/pile.$name
+stale_file=$nag_state/stale.$name
 remind_file=$nag_state/reminded.$name
 board_read() {
 	curl -sS -m 8 -H "Authorization: Bearer $token" \
@@ -210,31 +211,79 @@ if [[ ${1:-} == --watch ]]; then
 		# sitting unowned, say so once. Rare enough to still be read, and it
 		# keeps "an idle agent beside an unowned row" from becoming true just
 		# because the pile stopped growing.
-		clearable=$(jq -r '((.mine_todo // 0) + (.stale // 0))' <<<"$nag" 2>/dev/null || echo 0)
+		# STALE IS NOT CLEARABLE EITHER, AND THAT IS MEASURED. It was on the
+		# clearable side when this split was written, on the reasoning that a
+		# seat clears its own quiet claims by writing on them. It cannot:
+		# api_nag.go:156 counts `active` rows whose `Updated` is older than the
+		# threshold, and a NOTE DOES NOT MOVE `Updated`. Only a status change
+		# does. So the two things the board asks for - mark it active when you
+		# start, say where it has got to - are exactly what grows this number.
+		#
+		# Measured on this seat within three hours of the split landing: 2 stale
+		# before, 6 after, and every one of the four was a row I had marked
+		# active and then written notes on. Nothing I could write would bring it
+		# down, so the nag fired every cycle about work that was in hand. That is
+		# the unowned pile's defect, reproduced by me on the other side of my own
+		# fix. Filed as 01M0HRZM3N.
+		#
+		# So it moves to the EDGE side with the pile: a stale row that is NEW is
+		# news, six that have been stale since the morning are not, and the
+		# remind floor below still says so once an hour.
+		#
+		# IT MOVES BACK if 01M0HRZM3N is decided so that a note counts as a
+		# write. Then working on a stale row does clear it and level-triggering
+		# is right again - which is the test to apply, rather than a preference
+		# about how loud a nag should be.
+		clearable=$(jq -r '(.mine_todo // 0)' <<<"$nag" 2>/dev/null || echo 0)
 		pile=$(jq -r '(.unowned // 0)' <<<"$nag" 2>/dev/null || echo 0)
+		stalled=$(jq -r '(.stale // 0)' <<<"$nag" 2>/dev/null || echo 0)
 		[[ $clearable =~ ^[0-9]+$ ]] || clearable=0
 		[[ $pile =~ ^[0-9]+$ ]] || pile=0
-
+		[[ $stalled =~ ^[0-9]+$ ]] || stalled=0
 		# ABSENT IS NOT ZERO. A seat that has never run this has no previous
 		# count, and reading that as 0 would make the first poll "the pile grew
 		# from nothing to nine" and nag - which is the right answer for the
 		# first run and the wrong one for a wiped cache. It is treated as first
 		# contact deliberately: being told once about a pile you have not seen
 		# is the cheap error.
+		#
+		# TWO COUNTS, TRACKED APART, because a pile that shrinks by one while a
+		# stale row appears is news and a single sum would call it quiet. They
+		# are different facts about different rows and only their trigger is
+		# shared.
 		last_pile=""
 		[[ -r $pile_file ]] && last_pile=$(<"$pile_file")
 		[[ $last_pile =~ ^[0-9]+$ ]] || last_pile=-1
+		last_stalled=""
+		[[ -r $stale_file ]] && last_stalled=$(<"$stale_file")
+		[[ $last_stalled =~ ^[0-9]+$ ]] || last_stalled=-1
 
-		# Recorded on every observation, not only when it nags, so a pile that
+		# Recorded on every observation, not only when it nags, so a count that
 		# shrinks re-arms: 9 -> 8 is silent, and 8 -> 9 is news again.
-		printf '%s' "$pile" >"$pile_file.tmp" 2>/dev/null &&
-			mv -f "$pile_file.tmp" "$pile_file" 2>/dev/null || true
+		remember() { # file, value
+			printf '%s' "$2" >"$1.tmp" 2>/dev/null && mv -f "$1.tmp" "$1" 2>/dev/null || true
+		}
+		remember "$pile_file" "$pile"
+		remember "$stale_file" "$stalled"
 
 		reminded=0
 		if [[ -r $remind_file ]]; then
 			reminded=$(($(date +%s) - $(stat -c %Y "$remind_file" 2>/dev/null || echo 0)))
 		else
 			reminded=$BOARD_REMIND # never reminded is due for one
+		fi
+
+		# The floor covers BOTH edge-triggered counts, so an hour of silence with
+		# either of them standing gets one line. One timer rather than two: the
+		# reader is one agent and two independent hourly reminders is two
+		# interruptions to say the board has not changed.
+		watched=$((pile + stalled))
+		if ((clearable > 0)) ||
+			((pile > 0 && pile > last_pile)) ||
+			((stalled > 0 && stalled > last_stalled)) ||
+			((watched > 0 && reminded >= BOARD_REMIND)); then
+			((watched > 0)) && : >"$remind_file" 2>/dev/null || true
+			break
 		fi
 
 		if ((clearable > 0)) || ((pile > 0 && pile > last_pile)) ||
