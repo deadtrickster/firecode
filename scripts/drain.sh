@@ -1018,7 +1018,36 @@ else
 	# Quoted with %s through jq's own escaping below - a check name carries
 	# quotes and apostrophes ("a person's own row"), and a note that stops
 	# parsing is a note nobody sees.
-	first=$(grep -aE '^FAIL ' "$log" 2>/dev/null | head -1 | sed 's/ (exit [0-9]*)$//')
+	# UP TO THREE, AND SAY HOW MANY WERE LEFT. 01M0HT4ZM7.
+	#
+	# It was head -1, and the argument above for that still holds - 31 failures
+	# with one cause read as 31 problems until somebody read the first. What it
+	# missed is the case where the failures are UNRELATED, and then the count
+	# names one and hides the rest on a box the reader may not have.
+	#
+	# Measured 2026-08-21, twice in one afternoon. A red said "passed: 740
+	# failed: 2 - FAIL biome check web/" and the second failure was an unrelated
+	# flake already filed; a reader spent a VM run rediscovering a line that was
+	# in a log on this box. And a VM gate of mine came back 752/2 where the two
+	# were a stale go and a stale shfmt - different causes, and first-only would
+	# have named one and buried the discovery.
+	#
+	# Three matches what the test names below already do, for the same reason:
+	# enough to recognise a shared cause, short enough that the queue display
+	# does not truncate it. AND THE REMAINDER IS COUNTED rather than dropped,
+	# because a note that silently shows three of nine reads as a complete list -
+	# which is the defect this fixes, one layer in.
+	fails=$(grep -aE '^FAIL ' "$log" 2>/dev/null | sed 's/ (exit [0-9]*)$//')
+	nfail=$(printf '%s\n' "$fails" | grep -c . || true)
+	# JOINED WITH awk AND NOT `paste -sd'; '`. Measured against a synthetic
+	# five-failure log before this went near the live drainer: paste treats -d
+	# as a LIST of delimiters used CYCLICALLY, so it produced "a;b c" - a
+	# semicolon, then a space, then a semicolon. Two separators for one job,
+	# and the second one is invisible in a note. awk also cannot be confused by
+	# a check name containing the delimiter, which any of ours may.
+	first=$(printf '%s\n' "$fails" | head -3 |
+		awk 'NR > 1 { printf "; " } { printf "%s", $0 } END { if (NR) print "" }')
+	[ "$nfail" -gt 3 ] && first="$first; and $((nfail - 3)) more"
 	note_busiest # the last reading, before the verdict is written
 	count=$(grep -aE '^passed:' "$log" 2>/dev/null | tail -1)
 	note=$count
