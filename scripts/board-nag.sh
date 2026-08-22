@@ -378,6 +378,25 @@ if [[ -z $nag ]] || ! jq -e . >/dev/null 2>&1 <<<"$nag"; then
 	exit 0
 fi
 mine=$(jq -r '.mine // 0' <<<"$nag")
+# A ROW BLOCKED ON SOMEBODY ELSE IS NOT WORK WAITING FOR YOU.
+#
+# 01M0K4MENH, built by @flowy-claude and live in 088bef0: /api/nag now reports
+# mine_waiting beside mine_todo, and answers_owed for questions this seat owes
+# somebody. The WAKE above has always split correctly - it counts mine_todo, so
+# a blocked row does not wake anybody. The SENTENCE did not: it printed `mine`,
+# which includes the blocked ones, so a seat with nothing it could act on was
+# told it had rows assigned. Measured on my own board at 02:15, one row, waiting
+# on the operator for a decision, announced as work.
+#
+# ABSENT AND ZERO ARE DIFFERENT ANSWERS HERE TOO. An older node sends neither
+# field; jq's // 0 would turn that into a confident "0 blocked", which is the
+# collapse this fleet has spent the night taking apart. So -1 means the node did
+# not say, and the sentence stays as it was rather than claiming a split nobody
+# reported.
+mine_waiting=$(jq -r 'if has("mine_waiting") then .mine_waiting else -1 end' <<<"$nag" 2>/dev/null || echo -1)
+[[ $mine_waiting =~ ^-?[0-9]+$ ]] || mine_waiting=-1
+owed=$(jq -r 'if has("answers_owed") then .answers_owed else -1 end' <<<"$nag" 2>/dev/null || echo -1)
+[[ $owed =~ ^-?[0-9]+$ ]] || owed=-1
 free=$(jq -r '.unowned // 0' <<<"$nag")
 stale=$(jq -r '.stale // 0' <<<"$nag")
 stale_mins=$(jq -r '((.stale_after_seconds // 1200) / 60) | floor' <<<"$nag")
@@ -654,8 +673,21 @@ if [[ ${1:-} == --watch ]]; then
 fi
 
 {
-	printf 'The room is quiet and the board is not: %d row(s) assigned to %s, %d unowned, all open. %d free VM slot(s).\n' \
-		"$mine" "$name" "$free" "$slots"
+	# The blocked half is said only when the node reported it and it is not
+	# zero: "0 blocked" on every line is noise on the ordinary case, and the
+	# ordinary case is what a reader has to keep reading past.
+	if ((mine_waiting > 0)); then
+		printf 'The room is quiet and the board is not: %d row(s) assigned to %s - %d of them blocked on somebody else - %d unowned, all open. %d free VM slot(s).\n' \
+			"$mine" "$name" "$mine_waiting" "$free" "$slots"
+	else
+		printf 'The room is quiet and the board is not: %d row(s) assigned to %s, %d unowned, all open. %d free VM slot(s).\n' \
+			"$mine" "$name" "$free" "$slots"
+	fi
+	# QUESTIONS THIS SEAT OWES SOMEBODY ELSE, which is a different thing from
+	# work and is why the field has a different name. It clears by ANSWERING,
+	# not by working, so a seat that reads this and goes to its branch has
+	# misread it.
+	((owed > 0)) && printf '%d question(s) are waiting on YOUR answer - they clear when you reply, not when you work.\n' "$owed"
 	printf '%s\n' "$lines"
 	[[ -n $qlines ]] && printf 'merge queue (%d landable):\n%s\n' "$ready" "$qlines"
 	# The stale line reports WHAT WAS SEEN, never what it means. A session forty
