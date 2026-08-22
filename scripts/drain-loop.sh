@@ -80,8 +80,27 @@ suite_lock_held() {
 #
 # ONCE, not every tick: a line every 90 seconds for an hour is a log nobody
 # reads, which is the same failure wearing the other coat. So it speaks when
-# the wait STARTS and again when it ENDS, with how long it lasted, and says
-# nothing in between.
+# the wait STARTS and again when it ENDS, with how long it lasted.
+#
+# AND EVERY WAIT_SAY_EVERY IN BETWEEN, which is the half that was missing and
+# cost three agents twenty-five minutes on 2026-08-22.
+#
+# Both branches above are right and neither covers the reader who ARRIVES AFTER
+# THE EDGE. @flowy-claude saw a row queued 25 minutes with the lock free and no
+# gate declared; @orchestrator measured four facts and found no cause; I went
+# looking for an orphaned lock holder. The loop was correct the whole time -
+# waiting on somebody else's suite, exactly as designed - and had said so once,
+# before any of us looked.
+#
+# An edge-triggered announcement is invisible to whoever arrives after the edge.
+# The state it describes is one the READER cannot clear - another agent's suite
+# is not theirs to end - so by the rule this fleet keeps relearning it wants
+# level, not edge. A heartbeat is the middle: never a line every tick, and never
+# more than WAIT_SAY_EVERY of unexplained silence.
+#
+# Ten minutes by default: a gate pass here is about twelve, so a reader who
+# looks at any moment during a normal wait sees a line no older than that, and
+# a wait long enough to matter announces itself several times.
 # A FLAG AND A CLOCK, NOT ONE VALUE DOING BOTH. The first cut used
 # waiting_since=0 to mean "not waiting" - and $SECONDS IS 0 for the first second
 # of the process, so a wait that began immediately looked like no wait at all
@@ -90,12 +109,33 @@ suite_lock_held() {
 # own value.
 waiting=no
 waiting_since=0
+# When the current spell last said anything. Its own variable rather than
+# arithmetic on waiting_since, for the reason waiting_since is not reused as a
+# flag above: one value doing two jobs is how the first cut of this got it
+# wrong.
+waiting_said=0
+WAIT_SAY_EVERY=${FLOWY_DRAIN_WAIT_SAY_EVERY:-600}
 while :; do
 	if suite_lock_held; then
+		# The heartbeat, before the start-of-spell branch so that a spell which
+		# outlives WAIT_SAY_EVERY restates itself with how long it has been.
+		if [ "$waiting" = yes ] && ((SECONDS - waiting_said >= WAIT_SAY_EVERY)); then
+			waiting_said=$SECONDS
+			printf '[drain-loop] still waiting - a suite has held the gate lock for %ss. Nothing is stuck; this loop polls again when it is free.\n' \
+				"$((SECONDS - waiting_since))"
+		fi
 		if [ "$waiting" = no ]; then
 			waiting=yes
 			waiting_since=$SECONDS
+			waiting_said=$SECONDS
+			# NAMES WHERE TO LOOK, because @orchestrator found the fact was
+			# already on disk and unreadable only because nobody knew: the pass
+			# log is created at PICK time, before the lock is taken, so
+			# `ls -t ~/.cache/flowy-drain/` answers "is a pass running" even
+			# while the merge lock still reads free. It answered it for the
+			# whole twenty-five minutes none of us could see.
 			printf '[drain-loop] a suite is running - not polling the queue. This is a WAIT, not a stop.\n'
+			printf '[drain-loop]   what is running: ls -t ~/.cache/flowy-drain/ | head -2 (a pass log exists from PICK time, before the lock)\n'
 		fi
 		sleep "$EVERY"
 		continue
