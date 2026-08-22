@@ -644,7 +644,22 @@ if [ -z "$row" ]; then
 		fi
 	fi
 	outcome=idle
+	# AND WHERE TO LOOK INSTEAD, because this sentence is the one a seat reads
+	# while wondering why its row has not moved - and it cannot tell "there is
+	# nothing to do" from "a pass is already running on somebody else's row".
+	#
+	# The answer was already on disk and nobody knew the path. A pass log is
+	# created AT PICK TIME, before the landing lock is taken, so it says which
+	# row is being gated for the whole window in which /api/merge-queue still
+	# reports the lock free. Measured 2026-08-22: a row sat 25 minutes looking
+	# stalled while two seats walked /proc, read the lock, read this log and
+	# asked the node - and one `ls` of that directory would have answered it.
+	#
+	# So the state directory is NAMED here rather than left to be discovered. A
+	# fact reachable only through a path nobody knows about is invisible, and
+	# the fix for that is a sentence rather than a feature.
 	say "nothing takeable in the queue - every row is landed, aimed elsewhere, or open in a worktree"
+	say "if a row of yours is waiting, ls -t $STATE/drain-*.log says which row a pass is on"
 	exit 0
 fi
 say "taking $row - $branch onto $rowtarget"
