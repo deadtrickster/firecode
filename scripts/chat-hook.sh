@@ -292,6 +292,37 @@ if [[ -n $FLOWY_NAME ]]; then
 	fi
 fi
 
+# AND WHETHER THE NAME CAN BE PUT IN AN INSTRUCTION, which is a stricter
+# question than the one above and was being answered with the same flag.
+#
+# 01M0K9YBV5. @orchestrator was told four times in one evening to start a
+# listener as flowy-claude. They are orchestrator, and their own listener was
+# attached and polling the whole time.
+#
+# THE PROOF ABOVE PROVES THE WRONG PROPOSITION. waiter_pid_for reads
+# $FIRECODE_ROOT/runs/chat-waiter-<name>.pid, which is BOX-WIDE - it answers
+# "is somebody listening as this name", not "is this session that name". With a
+# memo saying flowy-claude and flowy-claude's waiter up all evening, every
+# session inheriting that memo was told it had proved itself. If anything a
+# live waiter for a name is evidence AGAINST: this session is not the one
+# running it.
+#
+# There is no session-scoped evidence available here at all. The pid file does
+# not record who started it, and the memo can have been written from the sole
+# candidate rule, which is a guess with a file behind it. So the only case where
+# a name cannot belong to somebody else is when there is exactly ONE seat on the
+# box - and then it is not really a claim about the session either, it is that
+# there is nobody else it could be.
+#
+# Delivery is deliberately NOT changed. It still uses FLOWY_NAME_PROVED, so the
+# hook goes on reading the room exactly as it did - this narrows what it is
+# willing to SAY, not what it does. Those are separable and only the first is
+# urgent, because d6d1a77 already stopped an unproved name being polled under.
+FLOWY_NAME_OURS=0
+if [[ -n $FLOWY_NAME && ${#flowy_candidates[@]} -eq 1 ]]; then
+	FLOWY_NAME_OURS=1
+fi
+
 # AND AN UNPROVED NAME IS NOT READ FROM EITHER, which is the half this guard
 # was missing until 2026-08-21.
 #
@@ -522,7 +553,11 @@ if [[ -n $FLOWY_NAME ]] && command -v jq >/dev/null 2>&1; then
 			#
 			# A loop has no re-arm step to get wrong, and it is what the fleet
 			# converged on: one process, every delivery a notification.
-			if ((FLOWY_NAME_PROVED)); then
+			# FLOWY_NAME_OURS, not FLOWY_NAME_PROVED: this line hands somebody
+			# a command with a seat name in it, and a name that merely has a
+			# waiter somewhere on the box is not theirs to use. See the note at
+			# FLOWY_NAME_OURS for the four times that went wrong in one evening.
+			if ((FLOWY_NAME_OURS)); then
 				FLOWY_REASON=$(printf 'Nothing is listening to the FLOWY room while you are idle. Start ONE PERSISTENT LOOP as a background command and never arm a second:\n  while true; do FLOWY_TOKEN=$(cat %s/%s) %s inbox --as %s --url %s --deadline 240; sleep 3; done\nEach delivery arrives as a notification and the loop keeps listening - there is no re-arm step to forget. ONE WAITER PER NAME: arming a tracked waiter over the forked successor a delivery left behind KILLS that successor, so an arm-every-time habit shoots its own listener.' \
 					"$FLOWY_AGENTS" "$FLOWY_NAME" "$FLOWY_BIN" "$FLOWY_NAME" "$FLOWY_ADDR")
 			else
