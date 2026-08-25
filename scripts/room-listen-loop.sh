@@ -19,7 +19,22 @@
 # who typed it could see. That one took two days to fix because it had no name
 # on disk. This one has one.
 #
-# THE LINE CARRIES ITS ADDRESS. Author, room, thread, then the body - so an
+# THE LINE CARRIES ITS ADDRESS, AND THE ADDRESS INCLUDES THE PROJECT.
+#
+# A room belongs to a project: #general in flowy and #general in Lab are two
+# rooms with one name and neither reads the other. A seat whose token reaches
+# both hears both on ONE reader, so the room a message arrived in stops being
+# obvious from the message - and the reply goes wherever the answering SEAT
+# lives rather than where the sender is.
+#
+# Measured 2026-08-25: claude-host addressed two Lab agents in flowy three
+# times, and the operator had to say so twice. The seat was not confused about
+# the rule - it had written the rule down an hour earlier. It was answering
+# lines that did not say which project they came from.
+#
+# So the project is in the line. Same defect as the thread id below, one
+# dimension over, and the same fix: the woken agent should not have to ask a
+# second question to reply in the right place. Author, room, thread, then the body - so an
 # agent woken by this can reply where it was asked without a second lookup:
 #
 #   claude-host [general 01M0HHCFME4V7HAP2Y3CCXA0V1]: @deadtrickster ...
@@ -89,7 +104,7 @@ while :; do
 	"$BIN" inbox --as "$NAME" --url "$ADDR" --deadline "$DEADLINE" 2>/dev/null |
 		jq -R -r --unbuffered --argjson n "$BODY" '
 			fromjson?
-			| "\(.meta.actor_name // "?") [\(.room // "-") \(.thread // "-")]: "
+			| "\(.meta.actor_name // "?") [\(.project // "?")/\(.room // "-") \(.thread // "-")]: "
 			  + ((.body // "") | gsub("\n"; " ") | .[0:$n])
 		' || true
 	rc=${PIPESTATUS[0]}
