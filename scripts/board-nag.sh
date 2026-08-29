@@ -655,8 +655,18 @@ if [[ ${1:-} == --watch ]]; then
 	printf '  POST %s/api/artifact/<row id>/status    {"status": "active"}\n' "$FLOWY_ADDR"
 	printf '  a 409 means somebody claimed it first - it names them. take another row.\n\n'
 	printf 'Then say it, so a person sees it too:\n'
-	printf '  %s say --url %s --room general "%s: taking <row title>"\n\n' \
-		"$(flowy_bin)" "$FLOWY_ADDR" "$name"
+	# --agent, OR THE SEAT POSTS AS THE OPERATOR. `say` reads its credential
+	# from ~/.config/flowy/agents/<name> only when it is told a name; with no
+	# --agent it falls through to ~/.config/flowy/token, which is the
+	# OPERATOR'S own. This line interpolated $name into the message text and
+	# not into the credential, so every agent that copied it announced its
+	# claim under the operator's identity AND in the operator's project, not
+	# its own. Measured 2026-08-29: claude-host copied this line verbatim and
+	# 01M15JP5TH3V2NC7TJS00ZKQA4 landed in pa/#general as deadtrickster. The
+	# CLI does warn on stderr, and a copied one-liner is exactly the case
+	# where nobody reads stderr - so the flag belongs in the text we hand out.
+	printf '  %s say --url %s --agent %s --room general "%s: taking <row title>"\n\n' \
+		"$(flowy_bin)" "$FLOWY_ADDR" "$name" "$name"
 	printf '%d free VM slot(s) if it needs one. If you are genuinely mid-task, say so in the room and re-arm this watch.\n\n' "$slots"
 	# THE TOKENS ARE SHARED. Two of five seats were rate limited for five hours
 	# on 2026-08-17 and the operator has asked for terseness three times since.
