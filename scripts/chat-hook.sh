@@ -355,7 +355,7 @@ if ((FLOWY_NAME_PROVED == 0)) && [[ -n $FLOWY_NAME ]]; then
 	# and they are different facts - one of them is this hook declining to read
 	# somebody else's mail.
 	# shellcheck disable=SC2016  # the $(cat ...) is advice for the reader to run, not for this shell to expand
-	FLOWY_REASON=$(printf 'This hook cannot tell which seat this session is, so it read NOBODY'"'"'s inbox.\nIt guessed %s from a memo, and %s tokens live in %s with no waiter of yours running to settle it.\nThe room may have messages for you and this says nothing about that.\nStart your own listener under YOUR OWN name - not the guess above:\n  while true; do FLOWY_TOKEN=$(cat %s/<you>) %s inbox --as <you> --url %s --deadline 240; sleep 3; done\nPolling under another agent name marks THEIR reader as attached on the node, which is how a seat that is not listening comes to look like one that is.' \
+	FLOWY_REASON=$(printf 'This hook cannot tell which seat this session is, so it read NOBODY'"'"'s inbox.\nIt guessed %s from a memo, %s tokens live in %s, and no waiter is running under THAT name - which is the only thing it checked, and says nothing about a waiter of yours.\nThe room may have messages for you and this says nothing about that.\nStart your own listener under YOUR OWN name - not the guess above:\n  while true; do FLOWY_TOKEN=$(cat %s/<you>) %s inbox --as <you> --url %s --deadline 240; sleep 3; done\nPolling under another agent name marks THEIR reader as attached on the node, which is how a seat that is not listening comes to look like one that is.' \
 		"$FLOWY_UNPROVED" "${#flowy_candidates[@]}" "$FLOWY_AGENTS" \
 		"$FLOWY_AGENTS" "$FLOWY_BIN" "$FLOWY_ADDR")
 fi
