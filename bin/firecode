@@ -9,7 +9,14 @@ set -euo pipefail
 # Resolved, so this still finds the repo when it is reached through a symlink
 # in ~/bin rather than by its real path.
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
-ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
+# FIRECODE_ROOT OVERRIDES THE LOCATION, so a copy of this script can be tested
+# against the real installation. Without it every path - runs, state, jails -
+# is derived from where the script sits, and a copy run out of a git worktree
+# points them all at an empty tree: it starts a VM, then dies on
+# "runs/up.log: No such file or directory" having already forked a guest that
+# nothing now owns. Verifying a change to this file should not require editing
+# the one every agent is using.
+ROOT=${FIRECODE_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}
 IMAGES="$ROOT/images"
 # The image whose e2fsprogs does the ext4 conversion, as root inside a
 # container. Same trick prepare uses, and the reason none of this needs sudo.
@@ -2130,6 +2137,27 @@ cmd_up() {
 		if sock=$(live_vm_socket "$here" 2>/dev/null) &&
 			python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - true >/dev/null 2>&1; then
 			((fast)) && up_checkpoint "$sock"
+			# THE PROJECT'S DECLARED LAYER, APPLIED BEFORE ANYBODY IS TOLD
+			# THE VM IS UP. 01M0G8AM6R2BGPCWZQMV6321DR. Until this line the
+			# answer to "what does this guest need" was a script somebody
+			# remembered to run, most recently an UNTRACKED one in a scratch
+			# directory - which is how a guest came to hold go1.22 against a
+			# box on go1.26 and red a branch for a fault that was not in it.
+			#
+			# It costs one exec in the guest when there is no firecode.layer:
+			# apply-layer says so and exits 0. When there is one and its hash
+			# is unchanged it costs one more, and runs nothing.
+			#
+			# A FAILURE HERE DOES NOT KILL THE VM. The guest is up and usable,
+			# the failure names the line that failed, and because a failed
+			# apply writes no stamp the next start tries again. Refusing to
+			# come up would strand somebody whose layer has a typo in it with
+			# no VM to fix it from - and the thing that keeps this honest is
+			# the stamp, not the exit code.
+			if [[ -f $here/firecode.layer ]]; then
+				"$SCRIPTS/apply-layer.sh" --project "$here" ||
+					log "layer: NOT applied - the guest is up and is missing what firecode.layer asks for"
+			fi
 			log "up. firecode in <command>, firecode enter, firecode down"
 			return 0
 		fi

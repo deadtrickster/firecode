@@ -76,10 +76,6 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ -n "$vm" ] || {
-	printf 'apply-layer: --vm is required\n' >&2
-	exit 2
-}
 [ -n "$project" ] || {
 	printf 'apply-layer: --project is required\n' >&2
 	exit 2
@@ -102,8 +98,16 @@ want=$(sha256sum "$spec" | cut -d' ' -f1)
 # as its own argument, prints its usage and exits non-zero. The first apply
 # here failed that way and reported the LAYER's line 3 as the failure, which
 # was a true sentence about the wrong thing.
+# ADDRESSED BY PROJECT WHEN NO VM IS NAMED, because the VM's name is not
+# reliably the project directory's basename and guessing it is the kind of
+# assumption that works until somebody names a VM something else. `firecode in`
+# resolves the project itself; that is its job, not this script's.
 guest() {
-	"$FIRECODE" in "$vm" bash -lc "$1"
+	if [ -n "$vm" ]; then
+		"$FIRECODE" in "$vm" bash -lc "$1"
+	else
+		"$FIRECODE" in --project "$project" bash -lc "$1"
+	fi
 }
 
 have=$(guest "cat $STAMP 2>/dev/null || true" 2>/dev/null | tr -d '[:space:]' || true)
