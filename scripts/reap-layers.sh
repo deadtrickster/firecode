@@ -95,6 +95,12 @@ if [ -d "$RUNS" ]; then
 	done
 fi
 
+# COUNTED BEFORE ANYTHING IS REMOVED. Taking this total after the loop is
+# right in a dry run and wrong under --apply, because by then the files are
+# gone: the first real run reported "14 newer than 14 days" where the dry run
+# had correctly said 80. A number that changes meaning depending on whether the
+# command did anything is worse than no number.
+total_before=$(find "$STATE_DIR" -maxdepth 1 -name '*-layer.ext4' 2>/dev/null | wc -l)
 kept_live=0 kept_young=0 n=0 bytes=0
 skipped_live=""
 while IFS= read -r f; do
@@ -118,7 +124,7 @@ while IFS= read -r f; do
 	[ "$apply" = yes ] && rm -f "$f"
 done < <(find "$STATE_DIR" -maxdepth 1 -name '*-layer.ext4' -mtime "+$days" 2>/dev/null | sort)
 
-kept_young=$(($(find "$STATE_DIR" -maxdepth 1 -name '*-layer.ext4' 2>/dev/null | wc -l) - n - kept_live))
+kept_young=$((total_before - n - kept_live))
 
 printf '\n'
 printf '%s layer(s), %s\n' "$n" "$(numfmt --to=iec --suffix=B "$bytes")"
