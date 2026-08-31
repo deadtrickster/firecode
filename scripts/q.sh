@@ -56,8 +56,30 @@ case ${1:-} in
 board)
 	# `todo` and `active` only: a done row is not work and paging it back is
 	# most of what makes this read expensive.
-	get "/api/artifacts?type=memory&kind=todo&limit=200" | jq -r --arg me "$NAME" --arg f "${2:-open}" '
-			[.artifacts[]? | select(.status=="todo" or .status=="active")]
+	#
+	# FILTERED AT THE DOOR, IN TWO CALLS, RATHER THAN ONE PAGE FILTERED HERE.
+	#
+	# This asked for limit=200 and selected todo|active afterwards. On
+	# 2026-08-31 that door returned EXACTLY 200 - the population is 489 and
+	# rising - so the page was the limit rather than the set, and every open row
+	# past the 200th was invisible. Measured that day: this printed 31 rows when
+	# there were 32, and two seats reported different board sizes to the
+	# operator because both had read a truncated page.
+	#
+	# The miss is silent and it grows: `done` rows accumulate forever and share
+	# the page with the handful that are open, so the fraction of the board this
+	# can see falls every week. Raising the limit only moves the date.
+	#
+	# status= is honoured by the door rather than accepted and dropped - checked
+	# on 2026-08-31, status=todo returned 24 rows all of which were todo, and
+	# status=active returned 8 all of which were active, against a true open
+	# count of 32. Two exact calls also carry far less than one 489-row page,
+	# which is the whole point of this file.
+	{
+		get "/api/artifacts?type=memory&kind=todo&status=todo&limit=1000"
+		get "/api/artifacts?type=memory&kind=todo&status=active&limit=1000"
+	} | jq -rs --arg me "$NAME" --arg f "${2:-open}" '
+			[.[].artifacts[]? | select(.status=="todo" or .status=="active")]
 			| map(select(
 					$f == "open"
 					or ($f == "me"      and (.fields.assignee // "") == $me)
