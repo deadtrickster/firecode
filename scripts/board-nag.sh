@@ -537,9 +537,37 @@ if [[ $board_rows =~ ^[0-9]+$ ]] && ((board_rows >= BOARD_ROW_LIMIT)); then
 	printf 'the board. The rows it cannot see are the oldest open ones. Raise\n'
 	printf 'BOARD_ROW_LIMIT past the door ceiling and it will be clamped, not raised.\n\n'
 fi
+# A ROW WAITING ON SOMEBODY ELSE IS NOT WORK WAITING FOR YOU.
+#
+# This selected on status and assignee alone, so a row whose `waiting_on` names
+# another person was printed under "WORK IS WAITING FOR <you> AND YOU ARE IDLE.
+# Do this now, before anything else" - every fifteen minutes, for the one thing
+# the seat cannot do. Measured 2026-08-31: five rows marked waiting on the
+# operator and on another seat were all still listed as mine to act on.
+#
+# That is worse than noise. It teaches the reader that this list is wrong, and
+# the next genuinely actionable row arrives in a list they have learned to skim.
+#
+# `flowy todo waiting-on` exists precisely to record this, and writes
+# fields.waiting_on. Honouring it here is what makes marking a row worth doing.
+# A row waiting on the READER is still theirs - being asked a question is work.
 lines=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
-	select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0)][0:5][] |
+	select((.fields.assignee // "") == $me or ((.fields.assignee // "") | length) == 0) |
+	select(((.fields.waiting_on // "") | length) == 0 or (.fields.waiting_on // "") == $me)][0:5][] |
 	"  [\(.status // "-")] \(if ((.fields.assignee // "") | length) == 0 then "unowned" else .fields.assignee end): \(.title[0:64])"' <<<"$board" 2>/dev/null)
+
+# AND SAID, NOT SILENTLY DROPPED. A row that vanishes from this list because it
+# is blocked looks like a row that was finished. The count says where they went,
+# and names who is being waited on when it is one person - which is usually the
+# operator, and is usually the thing worth acting on.
+held=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
+	select((.fields.assignee // "") == $me) |
+	select(((.fields.waiting_on // "") | length) > 0 and (.fields.waiting_on // "") != $me)]
+	| length' <<<"$board" 2>/dev/null)
+held_on=$(jq -r --arg me "$name" '[.artifacts[]? | select((.status // "") != "done") |
+	select((.fields.assignee // "") == $me) |
+	select(((.fields.waiting_on // "") | length) > 0 and (.fields.waiting_on // "") != $me)
+	| .fields.waiting_on] | unique | join(", ")' <<<"$board" 2>/dev/null)
 # `// "unowned"` only catches null, and a row HANDED BACK carries "" rather than
 # null - so a released row printed as "[todo] :" and read like a display glitch
 # instead of like the free row it is. Seen within a minute of the first handback
@@ -586,6 +614,14 @@ if [[ ${1:-} == --watch ]]; then
 	# next. The operator caught it within minutes.
 	printf 'WORK IS WAITING FOR %s AND YOU ARE IDLE. Do this now, before anything else:\n\n' "$name"
 	printf '%s\n\n' "$lines"
+	# The rows that are NOT listed above, and why. Without this a blocked row
+	# looks finished, and a seat reading a short list concludes the board is
+	# nearly clear when in fact it is nearly all waiting on one person.
+	if [[ $held =~ ^[0-9]+$ ]] && ((held > 0)); then
+		printf 'NOT LISTED: %d row(s) of yours are waiting on %s, not on you.\n' \
+			"$held" "${held_on:-somebody else}"
+		printf 'Chase, do not start them - and if the answer has arrived, clear the mark.\n\n'
+	fi
 	if [[ -n $qlines ]]; then
 		printf 'MERGE QUEUE (%d landable). A LANDABLE row is the first thing to do - it\n' "$ready"
 		printf 'goes stale the moment the target moves, and anybody may land it:\n'
