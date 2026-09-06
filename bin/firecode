@@ -2169,10 +2169,27 @@ cmd_up() {
 		# and matching only the VMM's exit meant those waited the full fifteen
 		# minutes and then reported a timeout, which says nothing about the
 		# actual cause.
-		if grep -qE "Firecracker exiting with error|VM exited|\[firecode\] error:" \
-			"$RUNS/up.log" 2>/dev/null; then
+		# ONE PATTERN, NOT TWO. The line that DECIDES there was a failure and
+		# the line that SHOWS it used to look for different things:
+		#
+		#   decided on:  Firecracker exiting with error | VM exited | [firecode] error:
+		#   displayed:   [firecode] error: | Error | error:
+		#
+		# so a log whose only match was "VM exited" entered this branch and then
+		# printed nothing. Measured 2026-09-06 restoring a checkpoint: the whole
+		# report was "the VM failed to start:" and a colon, and the snapshot had
+		# in fact loaded fine - 204, four vcpus resumed, 3928us. An empty reason
+		# sent me looking at the checkpoint for an hour.
+		#
+		# The fallback matters as much as the shared pattern. If the trigger
+		# line is ever reworded again, tail is still something rather than
+		# nothing - a reader who is shown the end of the log can work; a reader
+		# shown a colon cannot.
+		local failed='Firecracker exiting with error|VM exited|\[firecode\] error:'
+		if grep -qE "$failed" "$RUNS/up.log" 2>/dev/null; then
 			log "the VM failed to start:"
-			grep -E "\[firecode\] error:|Error|error:" "$RUNS/up.log" | tail -3 >&2
+			grep -E "$failed|Error|error:" "$RUNS/up.log" | tail -3 >&2 ||
+				tail -5 "$RUNS/up.log" >&2
 			die "see $RUNS/up.log"
 		fi
 		sleep "$nap"
