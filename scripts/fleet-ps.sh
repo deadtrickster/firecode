@@ -34,27 +34,41 @@ set -uo pipefail
 
 usage() {
 	cat <<'EOF'
-usage: fleet-ps.sh [-q] PATTERN
+usage: fleet-ps.sh [-q] [-x EXE] PATTERN
 
   Lists "PID CMDLINE" for every process whose full command line matches
   PATTERN (an extended regular expression), excluding this search itself.
 
-  -q  print only pids, one per line, for scripting
+  -q       print only pids, one per line, for scripting
+  -x EXE   require the executable's basename to be EXE, so a supervising
+           shell that merely CONTAINS the pattern is not counted as the
+           thing itself
+
+  A COMMAND LINE MATCH IS NOT AN INSTANCE. A Monitor, a listen loop or any
+  wrapper carries its child's command text on its own line, so matching alone
+  counts the tree and not the process. Measured 2026-09-14 on .76 and here:
+  "inbox --as NAME" matched 3, of which ONE was the flowy binary and the rest
+  were shells supervising it. Counting those as waiters says two are running
+  when one is. Use -x for "how many X are running"; use plain matching for
+  "who mentions X".
 
   Exits 0 if anything matched, 1 if nothing did - like pgrep, so it can gate
   a conditional. Any other status is this script failing, not an empty result.
 
 examples:
-  fleet-ps.sh 'flowy inbox'          # who holds a reader
+  fleet-ps.sh -x flowy 'inbox --as me'  # how many waiters, counting only the binary
+  fleet-ps.sh 'flowy inbox'          # anything mentioning it, wrappers included
   fleet-ps.sh -q 'run-tests\.sh'     # pids only
   fleet-ps.sh 'repair-missing-blobs' # is the deleter running
 EOF
 }
 
 quiet=0
-while getopts ":qh" opt; do
+want_exe=""
+while getopts ":qx:h" opt; do
 	case "$opt" in
 	q) quiet=1 ;;
+	x) want_exe=$OPTARG ;;
 	h)
 		usage
 		exit 0
@@ -98,6 +112,13 @@ for entry in /proc/[0-9]*; do
 
 	# Trailing separator from the final NUL.
 	cmdline=${cmdline%"${cmdline##*[! ]}"}
+
+	if [ -n "$want_exe" ]; then
+		# The executable, not the command line. A wrapper's argv carries its
+		# child's text; its exe does not.
+		exe=$(readlink "$entry/exe" 2>/dev/null) || continue
+		[ "${exe##*/}" = "$want_exe" ] || continue
+	fi
 
 	if printf '%s' "$cmdline" | grep -qE -- "$pattern"; then
 		found=1
