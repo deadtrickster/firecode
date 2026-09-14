@@ -113,10 +113,28 @@ for entry in /proc/[0-9]*; do
 	# Trailing separator from the final NUL.
 	cmdline=${cmdline%"${cmdline##*[! ]}"}
 
+	stale=""
 	if [ -n "$want_exe" ]; then
 		# The executable, not the command line. A wrapper's argv carries its
 		# child's text; its exe does not.
 		exe=$(readlink "$entry/exe" 2>/dev/null) || continue
+
+		# A REPLACED BINARY STILL RUNS, AND THE LINK SAYS SO. After an upgrade
+		# that mv's a new file over the old one, every process still on the old
+		# inode reports "/path/name (deleted)". Comparing the raw basename then
+		# matches nothing, so this filter went BLIND exactly when it mattered
+		# most - the moment after a deploy, when the question is which
+		# processes are still running the previous build.
+		#
+		# Measured 2026-09-14: shipped a new flowy to three boxes, then counted
+		# waiters with -x and got 0 on all three while their listeners were
+		# demonstrably alive and answering.
+		case "$exe" in
+		*" (deleted)")
+			exe=${exe%" (deleted)"}
+			stale=" [running a replaced binary - restart to pick up the new one]"
+			;;
+		esac
 		[ "${exe##*/}" = "$want_exe" ] || continue
 	fi
 
@@ -125,7 +143,7 @@ for entry in /proc/[0-9]*; do
 		if [ "$quiet" -eq 1 ]; then
 			printf '%s\n' "$pid"
 		else
-			printf '%s %s\n' "$pid" "$cmdline"
+			printf '%s %s%s\n' "$pid" "$cmdline" "$stale"
 		fi
 	fi
 done
