@@ -394,6 +394,7 @@ owed=$(jq -r 'if has("answers_owed") then .answers_owed else -1 end' <<<"$nag" 2
 free=$(jq -r '.unowned // 0' <<<"$nag")
 stale=$(jq -r '.stale // 0' <<<"$nag")
 stale_mins=$(jq -r '((.stale_after_seconds // 1200) / 60) | floor' <<<"$nag")
+stale_rows=$(jq -r '(.stale_ids // []) | join(" ")' <<<"$nag")
 # THE DISTRIBUTION PROBE, printed whenever it is not "ok" - which includes
 # "alone" and "empty", because a reader who never sees the line cannot tell a
 # balanced board from a probe that is not running.
@@ -736,6 +737,7 @@ fi
 		printf '%d of your active row(s) have had no write for over %d minutes - which says nothing about\n' "$stale" "$stale_mins"
 		printf 'whether somebody is working them. If one is yours and running, leave a note on it; if it is\n'
 		printf 'not, hand it back. A claim nobody can see progress on reads as abandoned to everybody else.\n'
+		[[ -n $stale_rows ]] && printf 'quiet since: %s\n' "$stale_rows"
 	fi
 	printf '%s\n' "$workload"
 	printf '%s\n' "$drain_status"
