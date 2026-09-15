@@ -305,12 +305,6 @@ if [[ ${1:-} == --watch ]]; then
 			break
 		fi
 
-		if ((clearable > 0)) || ((pile > 0 && pile > last_pile)) ||
-			((pile > 0 && reminded >= BOARD_REMIND)); then
-			((pile > 0)) && : >"$remind_file" 2>/dev/null || true
-			break
-		fi
-
 		waited=$((waited + SECONDS - before))
 		((waited >= BOARD_DEADLINE)) && exit 1 # quiet deadline, like the waiter's
 	done
