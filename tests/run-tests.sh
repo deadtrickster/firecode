@@ -207,6 +207,37 @@ test_denylist() {
 	out=$(FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec --workdir "$HOME/.aws" true 2>&1)
 	contains "credential directories refused without any config" "refusing" "$out"
 	rmdir "$HOME/.aws" 2>/dev/null
+
+	# Credential spots beyond the original list, in a fake home so nothing
+	# real is created or removed.
+	local home="$WORK/fakehome" p
+	for p in .config/gcloud .azure .config/BraveSoftware; do
+		mkdir -p "$home/$p"
+		out=$(HOME="$home" FIRECODE_DENY_FILE=/nonexistent \
+			"$FIRECODE" exec --workdir "$home/$p" true 2>&1)
+		contains "$p refused without any config" "refusing" "$out"
+	done
+
+	# A --add-dir that is a *parent* of a sensitive path would carry it in
+	# the copy - the ancestor is refused, and the refusal names the file.
+	touch "$home/.netrc"
+	out=$(HOME="$home" FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec \
+		--workdir "$project" --add-dir "$home" --dry-run true 2>&1)
+	contains "a parent of a sensitive path is refused as --add-dir" "refusing" "$out"
+	contains "the ancestor refusal names what it found" ".netrc" "$out"
+
+	# A parent with nothing sensitive in it is still allowed - existence is
+	# what matters, or every home-adjacent directory would be refused. The
+	# refusal (or its absence) happens before any drive is built, so the run
+	# failing later for other reasons is fine; only "refusing" matters here.
+	mkdir -p "$home/clean/sub"
+	out=$(HOME="$home/clean" FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec \
+		--workdir "$project" --add-dir "$home/clean" --dry-run true 2>&1)
+	if [[ $out == *refusing* ]]; then
+		no "a clean directory is not refused as an ancestor" "$out"
+	else
+		ok "a clean directory is not refused as an ancestor"
+	fi
 }
 
 test_gitignore_excluded() {

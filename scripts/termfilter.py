@@ -14,6 +14,9 @@ your terminal emulator - that executes some of it. The families that matter:
 
 Rendering is left alone: CSI (cursor, colour, scrolling) and OSC 0/1/2 (the
 window title) pass through, because without them a TUI cannot draw at all.
+The one CSI family dropped is XTWINOPS (final t) - resizing your window, and
+title-report queries that some terminals answer by typing the title, which
+the guest chose, back as input.
 
 Two strengths, because the two paths differ. An interactive session is a TUI
 and needs the escape sequences it uses to render; an unattended run is a log
@@ -83,6 +86,14 @@ class Filter:
             # where no interactive program is running. A TUI genuinely needs
             # these: it is how it works out what the terminal can do, and
             # blocking them is what leaves Enter mis-decoded.
+            # XTWINOPS (final t) is the exception, dropped in both modes:
+            # resize and iconify are nothing a contained guest has business
+            # doing, and CSI 21 t makes some terminals type the window title
+            # back as *input* - a title OSC 0/2 just let the guest choose.
+            # Sent at the session's last moment, the reply lands in whatever
+            # holds the tty next: your shell. No TUI needs these to render.
+            if self.buf[j] == 0x74:  # t
+                return j + 1, "drop"
             if self.strict and self.buf[j] in (0x63, 0x6E):  # c, n
                 return j + 1, "drop"
             return j + 1, "keep"

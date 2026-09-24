@@ -30,12 +30,17 @@ inside can ask you a question and wait for the answer.
 Wiping your system, and reading things it has no business reading - SSH keys,
 GPG keys, browser profiles, cloud credentials. The guest has no path to any of
 them: it sees a copy of one project and nothing else of yours. `--add-dir`
-refuses outright to carry `.ssh`, `.gnupg`, `.aws`, `.kube`, `.config/gh`,
-`.password-store` or a browser profile out of your home directory, and so does
-`--workdir`.
+refuses outright to carry `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`,
+`.config/gh`, `.password-store`, `.netrc`, npm/cargo/gcloud/azure credentials
+or a browser profile out of your home directory, and so does `--workdir` - a
+directory *containing* one of those is refused the same way, so `--add-dir ~`
+cannot carry them in either. Your own list goes in
+`~/.config/firecode/never-share`, one path or glob per line.
 
 It does not protect your API credits or your network. The agent has your Claude
-credentials, because otherwise it cannot work.
+credentials, because otherwise it cannot work - unless you run with
+`--auth-relay`, which authenticates through this host and leaves the VM
+holding none.
 
 ## Install
 
@@ -145,6 +150,7 @@ the guest boots:
 | layer | what it is | writable |
 | --- | --- | --- |
 | base image | what `prepare` built, shared by every VM | no |
+| imported images | docker images added with `firecode layer add`, one per digest | no |
 | project layer | the main checkout's, where its toolchains live | only from that checkout |
 | workspace layer | this directory's own | yes |
 
@@ -238,8 +244,8 @@ Restoring puts the next run exactly where the snapshot was taken. Sparse
 copies, so 13G of drives is about 1.4G on disk. Restore refuses while a run
 holds the project.
 
-This is disk state, not a paused VM. Firecracker can snapshot memory too, but
-that only helps a VM that is still running.
+This is disk state, not a paused VM. Saving a running VM - memory and all - is
+what [checkpoints](#checkpoints) do, below.
 
 ## Reaching things
 
@@ -255,9 +261,9 @@ are dropped, and named when the config drive is built.
 
 **The guest, from the host.** Your host is the other end of the guest's link, so
 a dev server it starts is directly reachable. A project keeps the same address
-across runs - it is picked from the taps that exist by hashing the project path
-- so a dashboard stays at a URL you can bookmark. firecode prints it either
-way, and falls back to any free tap when that one is busy:
+across runs - it is picked from the taps that exist by hashing the project
+path - so a dashboard stays at a URL you can bookmark. firecode prints it
+either way, and falls back to any free tap when that one is busy:
 
 ```
 [firecode] guest is 172.16.1.2 - a server it starts on PORT is at
@@ -295,9 +301,11 @@ way to your terminal:
 
 - **dropped**: OSC 52 (setting your clipboard), DCS/APC/PM/SOS payloads - which
   on some terminals include "define this key to type the following", outliving
-  the session - and `ESC c`, a full reset that wipes your scrollback
-- **kept**: CSI, so cursor movement and colour still work, and OSC 0/1/2 for the
-  window title, because without those a TUI cannot draw
+  the session - `ESC c`, a full reset that wipes your scrollback, and window
+  operations (`CSI ... t`): resizing you, and title-report queries some
+  terminals answer by typing the title - which the guest chose - back as input
+- **kept**: the rest of CSI, so cursor movement and colour still work, and
+  OSC 0/1/2 for the window title, because without those a TUI cannot draw
 
 An unattended run is stricter still: it prints logs, so nothing but text gets
 through. The console log keeps the unfiltered bytes, so the record is complete.
@@ -324,13 +332,8 @@ To get a stdio server into a guest, either install its binary in the image or
 wrap it in http on the host, where it is relayed like the rest.
 
 A **spawned** run is different and deliberately so: it is started with an empty
-MCP config, so it has no tools at all. That is the flat-depth boundary - a
-child that could reach the spawn server could start VMs of its own, and the
-concurrency caps would stop meaning anything. It is a policy in the spawn
-server rather than a limitation of the harness, and it costs the child nothing
-in *voice*: `firecode-chat` is on PATH in every guest, so a spawned agent can
-still say it is blocked and ask a question. Talking and fanning out are
-different powers.
+MCP config, so it has no tools at all. Why that boundary exists, and what a
+child keeps regardless, is under [Spawning more VMs](#spawning-more-vms).
 
 ## What the agent is told
 
@@ -386,7 +389,8 @@ run - a pty is served over vsock instead of the serial console.
 
 Images are built and read without root: `mkfs.ext4 -d` writes one straight from
 a directory and `debugfs rdump` reads it back, neither needing a mount. The
-guest image is built by exporting a Docker container.
+first guest image is built by exporting a Docker container; every later one by
+`prepare --in-vm`, written from inside a VM booted off the previous image.
 
 The `claude` and `opencode` binaries are not baked in. They are copied from the
 host at launch, so the guest runs the version you run.
@@ -543,6 +547,9 @@ firecode checkpoint      # freeze the loaded fixture
 firecode down && firecode up --fast    # back to the loaded fixture, ~1.7s
 ```
 
+The restore itself is the ~60ms; the rest of the 1.7s is `down` - a clean
+guest shutdown and the work copied back out.
+
 A restored VM is **transient**. It gets the checkpoint's own copies of every
 drive it writes to, so nothing it does touches the real project, the workspace
 layer or the agent state - which is exactly why it can be reset over and over,
@@ -550,8 +557,9 @@ and why the checkpoint never goes stale by being used. The read-only layers are
 shared as always, since nothing writes to them.
 
 A checkpoint is a build artifact, not a live thing. It is stamped with the base
-image, the agent's config drive and the project's content, and any of those
-changing means the next fast start boots normally and takes a new one. What it
+images, the project's content, the machine shape (`--mem`, `--vcpu`) and the
+agent binary, and any of those changing means the next fast start boots
+normally and takes a new one. What it
 does *not* track is a toolchain installed after it was taken - `--refresh` for
 that.
 
@@ -623,9 +631,11 @@ existed, every agent borrowed the one configured project and built over what
 the last one left.
 
 Children run with `--no-mcp` and an empty `--mcp-config`, so they cannot reach
-the server and spawn in turn. That is about fan-out, not about voice: a
-spawned agent still has `firecode-chat` and can say it is blocked or ask a
-question. If you ever relax the flatness, the three conditions are a depth
+the server and spawn in turn - a child that could would make the concurrency
+caps meaningless. It is a policy in the spawn server rather than a limitation
+of the harness, and it is about fan-out, not about voice: a spawned agent
+still has `firecode-chat` and can say it is blocked or ask a question.
+Talking and fanning out are different powers. If you ever relax the flatness, the three conditions are a depth
 budget decremented per level, a fresh workspace per child, and the parent run
 recorded on it - the second because two runs sharing one workspace layer
 corrupt it, which surfaces as a guest whose root has gone read-only.
@@ -662,7 +672,8 @@ skips itself unless the jailer runs without a password. What they pin down, in
 rough order of how much it would hurt to get wrong: host transcripts are
 byte-identical after an import; a guest that deletes its whole project leaves
 the host tree untouched; the denylist refuses a path as `--workdir`, as a
-subdirectory, and as `--add-dir`; gitignored files stay out and git history
+subdirectory, as `--add-dir`, and as a parent whose copy would carry a
+sensitive path; gitignored files stay out and git history
 comes along; the guest's paths, home and uid match the host's; the agent's home
 survives into the next run; work reaches the result directory and does not leak
 into the source tree; two concurrent runs take different taps and only one holds

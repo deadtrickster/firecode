@@ -23,6 +23,11 @@ CHECKS = [
     ("colour still renders", b"\x1b[31mred\x1b[0m", True),
     ("cursor movement still renders", b"\x1b[2J\x1b[H", True),
     ("the window title is still allowed", b"\x1b]0;title\x07", True),
+    # XTWINOPS. CSI 21 t makes some terminals type the window title back as
+    # input - and the guest just chose the title. The rest of the family
+    # (resize, iconify) is nothing a contained guest has business doing.
+    ("the title cannot be read back as input", b"\x1b[21t", False),
+    ("the window is not the guest's to resize", b"\x1b[8;24;80t", False),
 ]
 
 

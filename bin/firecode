@@ -133,9 +133,18 @@ SENSITIVE_HOME_DIRS=(
 	.docker
 	.config/gh
 	.password-store
+	.netrc
+	.npmrc
+	.cargo/credentials
+	.cargo/credentials.toml
+	.config/gcloud
+	.azure
 	.mozilla
 	.config/google-chrome
 	.config/chromium
+	.config/BraveSoftware
+	.config/microsoft-edge
+	.config/vivaldi
 )
 
 # Your own list, one path or glob per line, # for comments. For work that
@@ -156,6 +165,13 @@ refuse_if_sensitive() {
 		full="$HOME/$rel"
 		if [[ $path == "$full" || $path == "$full"/* ]]; then
 			die "refusing to put $full in the guest - keys and credentials stay on the host"
+		fi
+		# The other direction: a path that *contains* a sensitive one would
+		# carry it in the copy, since staging excludes only gitignored files.
+		# Only if it exists - refusing $HOME for a .netrc nobody has would
+		# refuse every home-adjacent directory.
+		if [[ $full == "$path"/* && -e $full ]]; then
+			die "refusing $path - it contains $full, and keys and credentials stay on the host"
 		fi
 	done
 
@@ -4115,6 +4131,14 @@ launch() {
 	# The project directory is a way into the guest just as much as --add-dir
 	# is. Matters most if launching is ever exposed to something automated.
 	refuse_if_sensitive "$WORKDIR"
+	# --add-dir is checked here too, not only when its drive is built, so the
+	# refusal lands before anything is staged - and under --dry-run, which
+	# stops before the drive-building pass would ever reach it.
+	local xd
+	for xd in ${EXTRA_DIRS+"${EXTRA_DIRS[@]}"}; do
+		xd=$(cd "$xd" 2>/dev/null && pwd) || die "--add-dir: no such directory: $xd"
+		refuse_if_sensitive "$xd"
+	done
 
 	# A task means unattended. Flags on their own - `--resume <id>`, a model
 	# choice - mean you want the session, and you are the one driving it, so

@@ -174,17 +174,21 @@ a run's jail is longer than that).
 ## Checkpoints
 
 A saved VM is guest memory plus device state plus a copy of every drive the
-guest writes to. Restoring maps it back: ~60ms, against a cold boot's seven
-seconds, most of which is guest memory allocation rather than booting.
+guest writes to. Restoring maps it back: ~60ms, against a cold boot's seconds
+(~2.9s for a 4G VM), most of which is guest memory allocation rather than
+booting.
 
 A restored VM is **transient** - it runs on the checkpoint's copies, so
 nothing it does touches the live project, layer or state. That is what makes
 it resettable arbitrarily often, and why using a checkpoint can never
 invalidate it.
 
-A checkpoint is a build artifact. It is stamped with the base image, the
-config drive, the project's content and the machine shape; any of those
-changing means the next fast start boots normally and takes a new one.
+A checkpoint is a build artifact. It is stamped with the base images, the
+project's content, the machine shape and the agent binary; any of those
+changing means the next fast start boots normally and takes a new one. The
+config drive is not stamped - it is pinned into the checkpoint itself, so the
+host files that feed it rotating (credentials, settings) cannot expire every
+checkpoint on the machine.
 
 ## Seeing in
 
