@@ -12,9 +12,11 @@ VENDOR="$ROOT/vendor/bin"
 ARCH=$(uname -m)
 
 WANT_DEBUG_KERNEL=0
+FORCE=0
 for arg in "$@"; do
 	case "$arg" in
 	--debug-kernel) WANT_DEBUG_KERNEL=1 ;;
+	--force) FORCE=1 ;;
 	*)
 		echo "setup: unknown argument $arg" >&2
 		exit 1
@@ -30,7 +32,7 @@ mkdir -p "$VENDOR" "$IMAGES"
 
 RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases"
 
-if [[ -x $VENDOR/firecracker && -x $VENDOR/jailer && ${1:-} != --force ]]; then
+if [[ -x $VENDOR/firecracker && -x $VENDOR/jailer ]] && ((!FORCE)); then
 	echo "[setup] firecracker $("$VENDOR/firecracker" --version | head -1) already in vendor/bin"
 else
 	echo "[setup] fetching the latest firecracker release"
@@ -39,7 +41,17 @@ else
 
 	TMP=$(mktemp -d)
 	trap 'rm -rf "$TMP"' EXIT
-	curl -fL "$RELEASE_URL/download/$LATEST/firecracker-$LATEST-$ARCH.tgz" | tar -xz -C "$TMP"
+	# Checked against the release's own sha256 before anything is unpacked.
+	# The jailer is what install-privileged.sh copies somewhere root runs it
+	# from, so a truncated or substituted download must stop here.
+	tgz="firecracker-$LATEST-$ARCH.tgz"
+	curl -fsSL -o "$TMP/$tgz" "$RELEASE_URL/download/$LATEST/$tgz"
+	curl -fsSL -o "$TMP/$tgz.sha256.txt" "$RELEASE_URL/download/$LATEST/$tgz.sha256.txt"
+	(cd "$TMP" && sha256sum -c --status "$tgz.sha256.txt") || {
+		echo "setup: $tgz does not match its published sha256 - nothing installed" >&2
+		exit 1
+	}
+	tar -xzf "$TMP/$tgz" -C "$TMP"
 
 	install -m 0755 "$TMP/release-$LATEST-$ARCH/firecracker-$LATEST-$ARCH" "$VENDOR/firecracker"
 	install -m 0755 "$TMP/release-$LATEST-$ARCH/jailer-$LATEST-$ARCH" "$VENDOR/jailer"

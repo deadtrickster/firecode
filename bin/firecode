@@ -34,6 +34,39 @@ declare -a FIRECODE_ARGV=("$@")
 FC="$VENDOR/firecracker"
 JAILER="$VENDOR/jailer"
 
+# The root-owned side, when scripts/install-privileged.sh has been run: a
+# wrapper that is the only thing sudo grants, the firecracker it insists on, and
+# a jail base root owns. Without it a jailed run asks sudo for the jailer in
+# vendor/bin, and --no-jail needs nothing. Not for root itself - the wrapper
+# pins the uid to its sudo caller, and root has none.
+PRIV_LIBEXEC=/usr/local/libexec/firecode
+JAIL_WRAPPER=""
+PRIV_JAIL_BASE=""
+if ((EUID != 0)) && [[ -x $PRIV_LIBEXEC/jail && -r $PRIV_LIBEXEC/jail-base ]]; then
+	JAIL_WRAPPER=$PRIV_LIBEXEC/jail
+	PRIV_JAIL_BASE=$(<"$PRIV_LIBEXEC/jail-base")
+fi
+USER_JAIL_BASE=$JAIL_BASE
+JAIL_FC=$FC
+
+# Every place a jail can be, for the scans that look for live or stale ones.
+jail_bases() {
+	printf '%s\n' "$USER_JAIL_BASE"
+	[[ -n $PRIV_JAIL_BASE ]] && printf '%s\n' "$PRIV_JAIL_BASE"
+	return 0
+}
+
+# Remove one run's jail - the directory above its root. A root-owned base is
+# not ours to rm in, so the wrapper does it.
+jail_remove() {
+	local dir=${1%/}
+	if [[ -n $PRIV_JAIL_BASE && $dir == "$PRIV_JAIL_BASE"/firecracker/* ]]; then
+		sudo -n "$JAIL_WRAPPER" clean "$(basename "$dir")"
+	else
+		rm -rf "$dir"
+	fi
+}
+
 # A missing HOME is a wrong answer, not a crash.
 #
 # Under `set -u` a bare $HOME kills the script outright, and HOME is absent in
@@ -3225,13 +3258,16 @@ cmd_cp() {
 
 	# Whichever VM is running right now. One at a time is the common case; be
 	# explicit about it rather than guessing between several.
-	local -a socks=()
-	local d
-	for d in "$JAIL_BASE"/firecracker/*/root; do
-		[[ -S $d/firecracker-vsock.sock ]] || continue
-		# The file outlives the VM. Only something listening counts.
-		vm_reachable "$d/firecracker-vsock.sock" &&
-			socks+=("$d/firecracker-vsock.sock")
+	local -a socks=() bases=()
+	local d b
+	mapfile -t bases < <(jail_bases)
+	for b in "${bases[@]}"; do
+		for d in "$b"/firecracker/*/root; do
+			[[ -S $d/firecracker-vsock.sock ]] || continue
+			# The file outlives the VM. Only something listening counts.
+			vm_reachable "$d/firecracker-vsock.sock" &&
+				socks+=("$d/firecracker-vsock.sock")
+		done
 	done
 	((${#socks[@]} > 0)) || die "no VM is running"
 	((${#socks[@]} == 1)) || die "${#socks[@]} VMs are running - stop all but one"
@@ -3816,7 +3852,7 @@ cleanup_run() {
 		# "test && command" it is the command's failure that set -e acts on,
 		# so an unguarded one ends the run early and skips what follows.
 		[[ -n $RUN_DIR ]] && rm -f "$RUN_DIR"/*.ext4 2>/dev/null
-		if [[ -n $JAIL_DIR ]]; then rm -rf "$(dirname "$JAIL_DIR")" 2>/dev/null || true; fi
+		if [[ -n $JAIL_DIR ]]; then jail_remove "$(dirname "$JAIL_DIR")" 2>/dev/null || true; fi
 	fi
 	return $status
 }
@@ -4216,8 +4252,19 @@ launch() {
 	id="firecode-$(date +%Y%m%d-%H%M%S)-$BASHPID"
 	RUN_DIR="$RUNS/$id"
 	RUN_ID="$id"
+	# A jailed run under the wrapper lives in the root-owned base, which the
+	# wrapper makes a directory in for us; anything else in our own.
+	if ((!NOJAIL)) && [[ -n $JAIL_WRAPPER ]]; then
+		JAIL_BASE=$PRIV_JAIL_BASE
+		JAIL_FC=$PRIV_LIBEXEC/firecracker
+	fi
 	JAIL_DIR="$JAIL_BASE/firecracker/$id/root"
-	mkdir -p "$RUN_DIR" "$JAIL_DIR"
+	mkdir -p "$RUN_DIR"
+	if [[ $JAIL_BASE == "$USER_JAIL_BASE" ]]; then
+		mkdir -p "$JAIL_DIR"
+	else
+		priv "$JAIL_WRAPPER" prepare "$id"
+	fi
 	# Which project this VM is for, so several can run and still be told
 	# apart by something other than "the only one".
 	# A name a person can say. The run id is a timestamp and a pid, which
@@ -5148,7 +5195,7 @@ EOF
 
 	local -a jargs=(
 		--id "$id"
-		--exec-file "$FC"
+		--exec-file "$JAIL_FC"
 		--uid "$(id -u)"
 		--gid "$(id -g)"
 		--chroot-base-dir "$JAIL_BASE"
@@ -5200,7 +5247,11 @@ EOF
 			cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket --config-file vm-config.json)
 		fi
 	else
-		cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
+		if [[ $JAIL_BASE == "$PRIV_JAIL_BASE" && -n $JAIL_WRAPPER ]]; then
+			cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAIL_WRAPPER" run "${jargs[@]}")
+		else
+			cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
+		fi
 	fi
 
 	if ((restoring)); then
@@ -6253,7 +6304,11 @@ cmd_gc() {
 		sort -rn | cut -d' ' -f2-)
 	# Jail directories outlive a VM that was killed rather than stopped.
 	local j
-	for j in "$JAIL_BASE"/firecracker/*/; do
+	local -a jail_dirs=()
+	while IFS= read -r j; do
+		jail_dirs+=("$j"/firecracker/*/)
+	done < <(jail_bases)
+	for j in ${jail_dirs+"${jail_dirs[@]}"}; do
 		[[ -d $j ]] || continue
 		if vm_reachable "$j/root/firecracker-vsock.sock"; then
 			continue # still alive
@@ -6289,7 +6344,7 @@ cmd_gc() {
 		# come up short. Where it does, say so and carry on: leaving one
 		# directory behind is not a reason to abandon the rest of the sweep,
 		# and there is no terminal here to authenticate with anyway.
-		rm -rf "$j" 2>/dev/null || stuck+=("$j")
+		jail_remove "$j" 2>/dev/null || stuck+=("$j")
 	done
 	# RELAYS OUTLIVE THEIR VM AND KEEP A NETWORK SLOT LOCKED FOREVER.
 	#
@@ -6324,7 +6379,8 @@ cmd_gc() {
 		comm=$(cat "$proc/comm" 2>/dev/null) || continue
 		[[ $comm == socat ]] || continue
 		cwd=$(readlink "$proc/cwd" 2>/dev/null) || continue
-		[[ $cwd == "$JAIL_BASE"/firecracker/* ]] || continue
+		[[ $cwd == "$USER_JAIL_BASE"/firecracker/* ||
+			(-n $PRIV_JAIL_BASE && $cwd == "$PRIV_JAIL_BASE"/firecracker/*) ]] || continue
 		cwd=${cwd% (deleted)}
 		[[ -d $cwd ]] && continue
 		ppid=$(awk '{print $4}' "$proc/stat" 2>/dev/null || echo 0)
@@ -6455,10 +6511,23 @@ cmd_doctor() {
 
 	echo
 	echo " privileges - each of these is a prompt you would otherwise get every run"
-	# The jailer specifically, not sudo in general: a correctly scoped rule
-	# grants this one binary, so `sudo -n true` failing proves nothing.
-	doc_check warn "jailer runs unprompted" "sudo -n '$JAILER' --version" "" \
+	# The wrapper specifically, not sudo in general: a correctly scoped rule
+	# grants this one file, so `sudo -n true` failing proves nothing. Asked
+	# with a usage error, which it answers before doing anything.
+	doc_check warn "jail wrapper runs unprompted" \
+		"test -n '$JAIL_WRAPPER' && sudo -n '$JAIL_WRAPPER' 2>&1 | grep -q usage" \
+		"${PRIV_JAIL_BASE:+jails in $PRIV_JAIL_BASE}" \
 		"sudo $SCRIPTS/install-privileged.sh   # or run with --no-jail"
+	# The rule this replaced granted the jailer in vendor/bin with free
+	# arguments - root for anything running as you. Re-running the installer
+	# overwrites it.
+	doc_check fail "no passwordless rule for the vendor jailer" \
+		"! sudo -n -l 2>/dev/null | grep -qF '$JAILER'" "" \
+		"sudo $SCRIPTS/install-privileged.sh   # replaces the old rule"
+	if [[ -n $JAIL_WRAPPER ]] && ! cmp -s "$FC" "$PRIV_LIBEXEC/firecracker"; then
+		echo "    note: vendor/bin/firecracker differs from the installed copy; jailed"
+		echo "          runs use the installed one until install-privileged.sh is re-run"
+	fi
 	doc_check warn "a tap is ready" "ip link show fccode1" \
 		"$(ip -o link show 2>/dev/null | grep -c fccode) tap(s)" \
 		"sudo $ROOT/bin/firecode net-setup --count 4"

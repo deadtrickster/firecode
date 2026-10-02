@@ -78,11 +78,15 @@ Two things need root, both one-time:
 
 ```sh
 sudo firecode net-setup --count 4          # persistent taps, owned by you
-sudo ./scripts/install-privileged.sh       # passwordless jailer
+sudo ./scripts/install-privileged.sh       # passwordless jailed runs
 ```
 
-Read the top of that second script first - the jailer execs a binary as a uid
-of the caller's choosing, so treat it as passwordless root. Skip it and
+The second one never grants the jailer itself: the jailer execs any file named
+like firecracker as any uid it is given, so a passwordless rule for it is root
+for anything running as you. It copies firecracker and the jailer somewhere
+root-owned and grants only a wrapper (`scripts/jail-wrapper.sh`) that accepts
+firecode's own arguments - your uid, that firecracker, a root-owned jail base.
+Re-run it after `firecode setup` fetches a new firecracker. Skip it and
 `--no-jail` needs nothing at all; you still get a real KVM guest, minus the
 chroot and uid drop around the VMM process.
 

@@ -765,6 +765,54 @@ test_result_git_is_inert() {
 		"$(git -C "$WORK/defanged" log --format=%s -1 HEAD~1 2>&1)"
 }
 
+# The one thing sudo grants is the jail wrapper, and the jailer behind it is
+# root for whoever picks its arguments. So the wrapper takes exactly firecode's
+# and nothing else. Host-side: a copy with the root check cut out, pointed at a
+# stub jailer that only says what it was given.
+test_jail_wrapper_refuses() {
+	local d="$WORK/jailwrap" w me gid out
+	rm -rf "$d"
+	mkdir -p "$d/libexec" "$d/base"
+	printf '#!/bin/sh\necho JAILER "$@"\n' >"$d/libexec/jailer"
+	cp /bin/true "$d/libexec/firecracker"
+	chmod +x "$d/libexec/jailer"
+	w="$d/libexec/jail"
+	sed -e '/^\[\[ \$EUID -eq 0 \]\]/d' \
+		-e "s|^LIBEXEC=.*|LIBEXEC=$d/libexec|" -e "s|^BASE=.*|BASE=$d/base|" \
+		"$ROOT/scripts/jail-wrapper.sh" >"$w"
+	me=$(id -u) gid=$(id -g)
+	local -a good=(--id r1 --exec-file "$d/libexec/firecracker" --uid "$me" --gid "$gid"
+		--chroot-base-dir "$d/base" --new-pid-ns --cgroup-version 2
+		--cgroup "memory.max=1024" --cgroup "cpu.max=200000 100000" --cgroup "pids.max=4096"
+		-- --api-sock /firecracker.socket)
+	out=$(SUDO_UID=$me SUDO_GID=$gid bash "$w" run "${good[@]}" 2>&1)
+	contains "firecode's own arguments reach the jailer" "JAILER --id r1" "$out"
+
+	local name args
+	while IFS='|' read -r name args; do
+		# shellcheck disable=SC2086  # deliberately split: each case is a flag list
+		out=$(SUDO_UID=$me SUDO_GID=$gid bash "$w" run $args 2>&1)
+		if [[ $out == *JAILER* ]]; then
+			no "refused: $name" "$out"
+		else
+			ok "refused: $name"
+		fi
+	done <<EOF
+uid 0|--id r1 --exec-file $d/libexec/firecracker --uid 0 --gid $gid --chroot-base-dir $d/base --new-pid-ns -- x
+someone else's uid|--id r1 --exec-file $d/libexec/firecracker --uid $((me + 1)) --gid $gid --chroot-base-dir $d/base --new-pid-ns -- x
+an exec file of your choosing|--id r1 --exec-file /tmp/firecracker --uid $me --gid $gid --chroot-base-dir $d/base --new-pid-ns -- x
+a chroot base of your choosing|--id r1 --exec-file $d/libexec/firecracker --uid $me --gid $gid --chroot-base-dir /tmp --new-pid-ns -- x
+an id that is a path|--id ../x --exec-file $d/libexec/firecracker --uid $me --gid $gid --chroot-base-dir $d/base --new-pid-ns -- x
+a cgroup file that is not a limit|--id r1 --exec-file $d/libexec/firecracker --uid $me --gid $gid --chroot-base-dir $d/base --new-pid-ns --cgroup cgroup.procs=1 -- x
+a jailer flag firecode never passes|--id r1 --exec-file $d/libexec/firecracker --uid $me --gid $gid --chroot-base-dir $d/base --new-pid-ns --netns /proc/1/ns/net -- x
+no pid namespace|--id r1 --exec-file $d/libexec/firecracker --uid $me --gid $gid --chroot-base-dir $d/base -- x
+EOF
+	out=$(SUDO_UID=0 SUDO_GID=0 bash "$w" run "${good[@]}" 2>&1)
+	if [[ $out == *JAILER* ]]; then no "refused: a root caller" "$out"; else ok "refused: a root caller"; fi
+	out=$(SUDO_UID=$me SUDO_GID=$gid bash "$w" clean ../../etc 2>&1)
+	contains "clean refuses an id that is a path" "usage" "$out"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1194,6 +1242,7 @@ run_test arg_massaging
 run_test terminal_escapes
 run_test relay_stays_on_upstream
 run_test result_git_is_inert
+run_test jail_wrapper_refuses
 run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched
