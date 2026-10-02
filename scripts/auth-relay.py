@@ -210,6 +210,41 @@ PROVIDERS = {
 }
 
 
+def upstream_url(upstream, path):
+    """The upstream URL for a guest's request target, or None to refuse it.
+
+    THE TARGET IS THE GUEST'S, AND THE TOKEN IS OURS. http.server hands the
+    request target over exactly as sent, so `GET .evil.com/x` arrives as the
+    path `.evil.com/x`, and pasting that after `https://api.anthropic.com`
+    names a different host - one the guest owns, which then receives this
+    machine's bearer token. So the target must be an origin-form path, and the
+    URL built from it must still name the upstream's own scheme and host.
+    """
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        return None
+    url = upstream.rstrip("/") + path
+    want, got = urllib.parse.urlsplit(upstream), urllib.parse.urlsplit(url)
+    if (got.scheme, got.netloc) != (want.scheme, want.netloc):
+        return None
+    if not got.path.startswith(want.path.rstrip("/") + "/"):
+        return None
+    return url
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect goes back to the guest rather than being followed here.
+
+    Following it would re-send the Authorization header to wherever the
+    Location points, which is the same leak by another route.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
 class Relay(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -217,6 +252,10 @@ class Relay(BaseHTTPRequestHandler):
         pass                                    # one line per token is noise
 
     def _relay(self, body=None):
+        url = upstream_url(self.server.upstream, self.path)
+        if url is None:
+            self.send_error(400, "request target must be a path on the upstream")
+            return
         token, why = self.server.token_fn()
         if token is None:
             self.send_error(503, why)
@@ -228,11 +267,10 @@ class Relay(BaseHTTPRequestHandler):
         if self.server.provider == "claude":
             headers.setdefault("anthropic-version", "2023-06-01")
 
-        url = self.server.upstream.rstrip("/") + self.path
         req = urllib.request.Request(url, data=body, headers=headers,
                                      method=self.command)
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with _opener.open(req, timeout=600) as resp:
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
                     if k.lower() in ("transfer-encoding", "connection",

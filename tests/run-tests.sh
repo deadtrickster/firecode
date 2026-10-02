@@ -709,6 +709,22 @@ test_terminal_escapes() {
 	done < <(python3 "$ROOT/tests/escapes.py" 2>&1)
 }
 
+# The auth relay holds this machine's token and the guest chooses the request
+# target. A target that is not a path once named a host of the guest's choosing
+# and the token went there. Hermetic: a stub token and a local upstream.
+test_relay_stays_on_upstream() {
+	local line out rc
+	out=$(python3 "$ROOT/tests/relay.py" 2>&1)
+	rc=$?
+	while IFS= read -r line; do
+		case "$line" in
+		ok\ *) ok "${line#ok }" ;;
+		NO\ *) no "${line#NO }" ;;
+		esac
+	done <<<"$out"
+	((rc == 0)) || [[ $out == *NO\ * ]] || no "the relay test ran" "$out"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1136,6 +1152,7 @@ run_test projects_is_a_registry_not_a_config_file
 run_test denylist
 run_test arg_massaging
 run_test terminal_escapes
+run_test relay_stays_on_upstream
 run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched
