@@ -725,6 +725,46 @@ test_relay_stays_on_upstream() {
 	((rc == 0)) || [[ $out == *NO\ * ]] || no "the relay test ran" "$out"
 }
 
+# A result's .git was written by the guest, and repo config is code: fsmonitor
+# runs on `git status`, hooks on `git commit`. Host-side and instant - a drive
+# made with mkfs -d stands in for one a guest wrote, and the real extract path
+# takes it apart.
+test_result_git_is_inert() {
+	local src="$WORK/evil" id="test-defang-$$" out marker="$WORK/guest-ran-on-host"
+	local mkfs
+	mkfs=$(PATH="$PATH:/sbin:/usr/sbin" command -v mkfs.ext4) ||
+		{ no "mkfs.ext4 is available" "not found"; return; }
+	rm -rf "$src" "$marker"
+	git init -q "$src"
+	git -C "$src" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+		commit -q --allow-empty -m init
+	echo change >"$src/f"
+	git -C "$src" config core.fsmonitor "touch $marker; false"
+	git -C "$src" config filter.x.clean "touch $marker; cat"
+	echo 'f filter=x' >"$src/.gitattributes"
+	printf '#!/bin/sh\ntouch %s\n' "$marker" >"$src/.git/hooks/pre-commit"
+	chmod +x "$src/.git/hooks/pre-commit"
+
+	mkdir -p "$ROOT/runs/$id"
+	"$mkfs" -q -F -d "$src" "$ROOT/runs/$id/src.ext4" 16M >/dev/null 2>&1
+	out=$("$FIRECODE" extract "$id" "$WORK/defanged" 2>&1)
+	rm -rf "${ROOT:?}/runs/$id"
+
+	git -C "$WORK/defanged" status --porcelain >/dev/null 2>&1
+	git -C "$WORK/defanged" add -A >/dev/null 2>&1
+	git -C "$WORK/defanged" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+		commit -qm x >/dev/null 2>&1
+	if [[ -e $marker ]]; then
+		no "git in a result runs nothing the guest configured" "$out"
+	else
+		ok "git in a result runs nothing the guest configured"
+	fi
+	check "the guest's config is kept for reading" "yes" \
+		"$([[ -f $WORK/defanged/.git/config.guest && -d $WORK/defanged/.git/hooks.guest ]] && echo yes || echo no)"
+	check "the result is still a repository" "init" \
+		"$(git -C "$WORK/defanged" log --format=%s -1 HEAD~1 2>&1)"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1153,6 +1193,7 @@ run_test denylist
 run_test arg_massaging
 run_test terminal_escapes
 run_test relay_stays_on_upstream
+run_test result_git_is_inert
 run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched

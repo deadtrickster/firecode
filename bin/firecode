@@ -2473,6 +2473,8 @@ cmd_land() {
        The agent produced files without committing them; copy what you want
        by hand, and next time say in the task that committing is part of it."
 
+	defang_git "$result"
+
 	# Committed only, and everything else named rather than dropped quietly.
 	local dirty
 	dirty=$(git -C "$result" status --porcelain 2>/dev/null | head -20)
@@ -5452,6 +5454,56 @@ extract_image() {
 	sbin debugfs -R "rdump / $dest" "$img" >/dev/null 2>&1 ||
 		log "WARNING: extraction reported errors, check $dest"
 	rm -rf "$dest/lost+found"
+	defang_git "$dest"
+}
+
+# A .git the guest wrote, made safe for git on THIS machine.
+#
+# Repo config is code. core.fsmonitor runs on `git status`, a filter driver
+# runs on status and checkout, core.hooksPath and .git/hooks run on commit, an
+# include.path pulls in more of the same - and every one of them was written by
+# the agent, then run as you by `firecode land`, `firecode gc`, or you typing
+# `git log` in the result. safe.directory does not help: the extracted files
+# are owned by you.
+#
+# So the guest's config is reduced to what the object store needs to be read -
+# the format version and extensions - and the rest is kept beside it, renamed,
+# for anyone who wants to see what the agent set. Idempotent, so land and gc
+# can call it on results extracted before this existed.
+defang_git() {
+	local dir=$1 g k v
+	g="$dir/.git"
+	# A .git that is a file or a link points somewhere else, and that
+	# somewhere may be one of your own repositories.
+	if [[ -L $g || -f $g ]]; then
+		mv -f "$g" "$dir/.git.guest"
+		log "the result's .git pointed elsewhere; kept as .git.guest, not used"
+		return 0
+	fi
+	[[ -d $g ]] || return 0
+	[[ -f $g/.firecode-defanged ]] && return 0
+	if [[ -f $g/config ]]; then
+		mv -f "$g/config" "$g/config.guest"
+		# Read with --file, which parses and runs nothing; includes are
+		# not followed unless asked.
+		git config --file "$g/config.guest" --get-regexp \
+			'^(core\.(repositoryformatversion|bare)|extensions\..*)$' 2>/dev/null |
+			while read -r k v; do
+				git config --file "$g/config" "$k" "$v"
+			done
+		git config --file "$g/config" core.bare false
+	fi
+	if [[ -d $g/hooks ]]; then
+		rm -rf "$g/hooks.guest"
+		mv -f "$g/hooks" "$g/hooks.guest"
+		mkdir -p "$g/hooks"
+	fi
+	# Each of these makes git read config, or a whole repository, from a
+	# path the guest chose.
+	for k in commondir config.worktree; do
+		[[ -e $g/$k ]] && mv -f "$g/$k" "$g/$k.guest"
+	done
+	: >"$g/.firecode-defanged"
 }
 
 # ---------------------------------------------------------------- commands
@@ -5955,6 +6007,7 @@ sweep_results() {
 			[[ -n $(find "$dir" -maxdepth 0 -mmin "+$((hours * 60))" 2>/dev/null) ]] || continue
 		fi
 
+		defang_git "$dir"
 		head=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || continue
 		# The project it was copied from, and its main checkout when that is a
 		# worktree - a commit made in a worktree lives in the shared object
