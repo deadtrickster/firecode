@@ -6,7 +6,7 @@
 #   scripts/reap-layers.sh --days 7        # a different cutoff
 #   scripts/reap-layers.sh --apply         # actually remove them
 #
-# Measured 2026-08-29 by claude-host, filed as 01M17AKXX74DPAGDXC1YZ2EGGR:
+# Measured 2026-08-29:
 # state held 147 files named *-layer.ext4 accounting for 169G, and on 2026-08-30
 # root was at 99% - 32G free of 2.3T - with 146 layers holding 266G.
 #

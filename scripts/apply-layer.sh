@@ -4,9 +4,8 @@
 #
 #   scripts/apply-layer.sh --vm NAME --project DIR [--dry-run] [--force]
 #
-# 01M0G8AM6R2BGPCWZQMV6321DR, the operator: "fc vms support per project layers.
-# i should be able to manage them from the flowy ui. Dockerfile style. also must
-# be available for agent to edit."
+# Per-project layers, declared Dockerfile-style, editable by the agent and
+# manageable from a UI rather than by hand.
 #
 # WHAT IT REPLACES. ensure_layer() makes one empty 16G sparse ext4 per project
 # and nothing ever puts anything in it declaratively - it fills only as a guest

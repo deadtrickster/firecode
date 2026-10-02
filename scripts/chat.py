@@ -132,7 +132,8 @@ def say(who, text, to=None):
 #
 # Best effort and never fatal. A mirror that fails must not lose the message
 # from the room it was actually said in.
-FLOWY_URL = os.environ.get("FIRECODE_FLOWY_URL", "http://192.168.1.55:8787")
+# Unset means no mirror: there is no flowy node anyone can assume.
+FLOWY_URL = os.environ.get("FIRECODE_FLOWY_URL") or os.environ.get("FLOWY_ADDR", "")
 FLOWY_TOKEN_DIR = os.path.expanduser("~/.config/flowy/agents")
 FLOWY_RELAY_TOKEN = os.environ.get("FIRECODE_FLOWY_TOKEN", "")
 
@@ -160,6 +161,8 @@ def flowy_token_for(who):
 
 
 def forward_to_flowy(msg):
+    if not FLOWY_URL:
+        return
     token, own = flowy_token_for(msg.get("from"))
     if not token:
         return

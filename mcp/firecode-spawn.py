@@ -1385,7 +1385,8 @@ def call_tool(cfg, runs, name, args, caller_run=None):
                     f"IN THE FIRECODE ROOM - host-local, agents only. "
                     f"THE OPERATOR CANNOT READ THIS. To reach them use flowy: "
                     f"FLOWY_TOKEN=$(cat ~/.config/flowy/agents/<name>) "
-                    f"~/Projects/flowy-dogfood/flowy say --url http://192.168.1.55:8787 "
+                    f"{os.environ.get('FLOWY_BIN', 'flowy')} say --url "
+                    f"{os.environ.get('FLOWY_ADDR', '$FLOWY_ADDR')} "
                     f"--room general \"...\"")
 
         # chat_wait: the mark lives beside the room's log, keyed by name, so

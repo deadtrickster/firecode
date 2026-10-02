@@ -508,7 +508,7 @@ stage_project() {
 	# ANOTHER CHECKOUT'S WORKTREE REGISTRATIONS MEAN NOTHING IN HERE, and left
 	# in place they refuse work the agent was sent to do:
 	#
-	#   fatal: 'feat/raiser' is already used by worktree at /home/dead/...
+	#   fatal: 'feat/raiser' is already used by worktree at ~/...
 	#
 	# .git/worktrees holds one directory per worktree the HOST has, each naming
 	# a host path. The VM has none of them, but git believes the registration
@@ -1668,8 +1668,8 @@ USAGE
 
 # --- imported images as layers ------------------------------------------
 #
-# A project's build environment is usually already a docker image - serenedb
-# ships its own toolchain image, and rebuilding that inside a VM per run would
+# A project's build environment is usually already a docker image - a database
+# project ships its own toolchain image, and rebuilding that inside a VM per run would
 # be absurd. So import it: export the image once, keyed by its digest, and
 # mount it as a read-only lower layer under the project's own.
 #
@@ -2154,7 +2154,7 @@ cmd_up() {
 			python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - true >/dev/null 2>&1; then
 			((fast)) && up_checkpoint "$sock"
 			# THE PROJECT'S DECLARED LAYER, APPLIED BEFORE ANYBODY IS TOLD
-			# THE VM IS UP. 01M0G8AM6R2BGPCWZQMV6321DR. Until this line the
+			# THE VM IS UP. Until this line the
 			# answer to "what does this guest need" was a script somebody
 			# remembered to run, most recently an UNTRACKED one in a scratch
 			# directory - which is how a guest came to hold go1.22 against a
@@ -2974,7 +2974,7 @@ print("-- last id: %d" % d.get("last", 0))' \
 	[[ $# -gt 0 ]] || die "usage: firecode chat 'what you want to say'"
 	# Remember who this session speaks as.
 	#
-	# Everyone in the room picks a name - orchestrator, flowy, claude-host -
+	# Everyone in the room picks a name - orchestrator, flowy, reviewer -
 	# and nothing outside this command knows which of them is you. The Stop
 	# hook found that out the hard way: with no way to recognise its own
 	# messages it read back a question the session had just asked and refused
@@ -3004,7 +3004,7 @@ print("-- last id: %d" % d.get("last", 0))' \
 	printf '[firecode chat] THE HUMAN CANNOT READ THIS. For the operator, use:\n' >&2
 	# shellcheck disable=SC2016 # the $(cat ...) is literal text for the reader to type, not an expansion
 	printf '[firecode chat]   FLOWY_TOKEN=$(cat ~/.config/flowy/agents/<you>) %s say --url %s "text"\n' \
-		"${FLOWY_BIN:-$HOME/Projects/flowy-dogfood/flowy}" "${FLOWY_ADDR:-http://192.168.1.55:8787}" >&2
+		"${FLOWY_BIN:-flowy}" "${FLOWY_ADDR:-\$FLOWY_ADDR}" >&2
 
 	FIRECODE_CHAT_WHO="$who" FIRECODE_CHAT_TEXT="$*" FIRECODE_CHAT_TO="$to" python3 -c '
 import json, os, sys, urllib.request
@@ -6817,7 +6817,7 @@ spawn-server)
 	# THE PORT IS READ FROM THE ARGUMENTS, not assumed. `--port 9999` is somebody
 	# deliberately standing up a second server beside the first, and refusing
 	# that would be this guard inventing a collision that is not happening -
-	# which is the same defect pre-gate.sh had when it defaulted the agent name.
+	# which is the same defect as a script defaulting an agent's name.
 	# ASKING WHAT IT IS is not asking to start one. Without this line
 	# `spawn-server --help` was refused with "nothing to start", which is the
 	# guard answering a question nobody asked - measured the first time it ran.

@@ -24,7 +24,8 @@ import urllib.request
 SERVE = os.environ.get("OPENSENSE_SERVE", "http://127.0.0.1:4096")
 WHO = os.environ.get("FIRECODE_CHAT_NAME", "glm")
 TRIGGER = os.environ.get("RELAY_TRIGGER", "glm")
-LOG = os.environ.get("RELAY_LOG", "/home/dead/Projects/firecode/runs/opencode-relay.log")
+LOG = os.environ.get("RELAY_LOG", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runs", "opencode-relay.log"))
 
 
 def http_json(method, path, body=None, timeout=15):
