@@ -34,6 +34,19 @@ finish() {
 	systemctl reboot
 }
 
+# ONLY THE SESSION THAT OWNS THE VM ENDS IT. socat runs this script for every
+# connection, and `firecode enter` - which fctop's shell key uses - is a
+# connection like any other. Every one of them used to reboot on exit, so
+# leaving a second shell stopped a VM that `enter` promised to leave running.
+# The owner is the session `firecode shell` opens at boot in interactive mode,
+# and the host waits on the VMM for it; mkdir is atomic, so exactly one session
+# claims that. A VM from `firecode up` runs in auto mode and has no owner here:
+# it stops with `firecode down`, never because a shell was closed.
+owner=0
+if [[ ${FIRECODE_MODE:-} == interactive ]] && mkdir /run/firecode-console-owner 2>/dev/null; then
+	owner=1
+fi
+
 cat <<BANNER
 
   firecode microVM  (${FIRECODE_ID:-unknown})
@@ -86,4 +99,9 @@ else
 	runuser -u "$FIRECODE_USER" -- env "${env[@]}" "${cmd[@]}"
 fi
 
-finish
+if ((owner)); then
+	finish
+	exit 0
+fi
+echo
+echo "  leaving the shell; the VM keeps running (firecode down stops it)"

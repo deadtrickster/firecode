@@ -1306,6 +1306,22 @@ test_libvirt_backend() {
 	fi
 }
 
+# A second shell into a VM - `firecode enter`, fctop's shell key - used to
+# reboot the VM on exit, stopping it under the session that owns it.
+test_second_shell_leaves_vm_running() {
+	((QUICK)) && return 0
+	local p line out
+	p=$(make_project)
+	out=$(cd "$p" && timeout 400 python3 "$ROOT/tests/second_session.py" "$p" "$FIRECODE" 2>&1)
+	while IFS= read -r line; do
+		case "$line" in
+		ok\ *) ok "${line#ok }" ;;
+		NO\ *) no "${line#NO }" ;;
+		esac
+	done <<<"$out"
+	grep -qE '^(ok|NO) ' <<<"$out" || no "the second-session test ran" "$(tail -3 <<<"$out")"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1593,6 +1609,7 @@ run_test concurrent_runs
 run_test ro_image_cached
 run_test jailed
 run_test interactive
+run_test second_shell_leaves_vm_running
 run_test vm_stops_completely
 run_test child_dies_with_parent
 run_test cancel_stops_the_run
