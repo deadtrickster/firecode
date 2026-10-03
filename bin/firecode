@@ -5229,6 +5229,12 @@ launch() {
 	# up unable to see its own root disk. Same kernel, opposite argument.
 	local boot_args="console=ttyS0 reboot=k panic=1"
 	[[ $VMM == firecracker ]] && boot_args="$boot_args pci=off"
+	# Under QEMU the NIC is a PCI device and systemd names it enp0sN, and the
+	# guest configures eth0 - so a libvirt VM came up with no network at all
+	# ("no eth0") while its tap waited on the host. Classic names back.
+	# libvirt only: firecracker has no PCI, its NIC is eth0 already, and its
+	# boot line stays what existing checkpoints were made with.
+	[[ $VMM == libvirt ]] && boot_args="$boot_args net.ifnames=0"
 	boot_args="$boot_args firecode.lower=$dev_lower firecode.upper=$dev_upper"
 	((QUIET_BOOT)) && boot_args="$boot_args quiet loglevel=3 systemd.show_status=false"
 
@@ -5332,107 +5338,134 @@ EOF
 	# thing that boots them differs, because firecracker has no PCI bus and
 	# therefore no way to hand a GPU to a VM. Everything above this line is
 	# shared, which is the whole reason a second backend is affordable.
+	#
+	# AND THEN THE SAME ENDING. This branch used to `return` out of launch
+	# once the domain stopped, which skipped everything below: the console
+	# was never shown, the result never copied out - so the work went with
+	# the run's drives at cleanup - and the gate's verdict never read, so a
+	# failed gate exited 0. It boots, shows the console as it is written, and
+	# falls through to "VM exited" like the firecracker path.
+	local rc=0 vm_done=0
 	if [[ $VMM == libvirt ]]; then
 		((${#pin_cpus[@]})) && export FIRECODE_PIN="${pin_cpus[*]}"
-		libvirt_boot "$drives_joined" "$boot_args" "$cid" "$RUN_DIR/console.log"
-		return $?
-	fi
-
-	# The VM boundary is Firecracker and KVM either way. The jailer adds a
-	# chroot, a dropped uid and a private pid namespace around the VMM
-	# process itself - defence in depth against a VMM escape, and the only
-	# part that needs root. Without it you still get a real VM.
-	local -a cmd=()
-	# taskset rather than a config knob: firecracker has no cpu affinity
-	# setting, and the vcpu threads inherit the process's.
-	local -a pin_prefix=()
-	((${#pin_cpus[@]})) && pin_prefix=(taskset -c "$(
-		IFS=,
-		echo "${pin_cpus[*]}"
-	)")
-	if ((NOJAIL)); then
-		log "WARNING: --no-jail, the VMM runs unconfined on the host"
-		if ((restoring)); then
-			cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket)
-		else
-			cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket --config-file vm-config.json)
+		# tail's own pid, not the pipeline's: $! after a pipeline is the
+		# filter, and killing that loses what it has not printed yet. Stop
+		# tail, and the filter drains and exits on its own.
+		local shown="" tail_pid_file="$RUN_DIR/.console-tail.pid"
+		if [[ $mode != interactive ]]; then
+			: >"$RUN_DIR/console.log"
+			{
+				tail -n +1 -F "$RUN_DIR/console.log" 2>/dev/null &
+				echo $! >"$tail_pid_file"
+				wait
+			} | python3 "$SCRIPTS/termfilter.py" --strict &
+			shown=$!
 		fi
-	else
-		if [[ $JAIL_BASE == "$PRIV_JAIL_BASE" && -n $JAIL_WRAPPER ]]; then
-			cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAIL_WRAPPER" run "${jargs[@]}")
-		else
-			cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
-		fi
-	fi
-
-	if ((restoring)); then
-		log "restoring from a checkpoint ($VCPU vcpu, ${MEM}M)"
-		log "this VM is transient - it writes to its own copies, not the real drives"
-	else
-		log "booting ($VCPU vcpu, ${MEM}M)"
-	fi
-	echo >&2
-
-	local rc=0
-	if ((restoring)) && [[ $mode != interactive ]]; then
-		# Loading a snapshot is an API call, which means the VMM has to be
-		# running before the VM exists - so this path cannot hand the
-		# terminal straight to firecracker the way a cold boot does.
-		#
-		# Its serial input still has to stay open. A detached run has no
-		# terminal, so firecracker's console reader sees EOF immediately and
-		# ends its event loop - the VM resumes in 60ms and the VMM exits
-		# cleanly a moment later, which reads from outside as "restored, then
-		# died for no reason". A fifo held open here gives it a stdin that
-		# never ends and that nobody types into.
-		local serial_in="$JAIL_DIR/serial-in"
-		mkfifo "$serial_in" 2>/dev/null || true
-		# Held open and never written to: the descriptor is the point.
-		# shellcheck disable=SC2034  # kept open deliberately, not read
-		exec {SERIAL_FD}<>"$serial_in"
-		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
-			<"$serial_in" >"$RUN_DIR/console.log" 2>&1 &
-		local vm_pid=$!
-		VM_PID=$vm_pid
-		memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1
-		tail -n +1 -f --pid="$vm_pid" "$RUN_DIR/console.log" 2>/dev/null |
-			python3 "$SCRIPTS/termfilter.py" --strict &
-		wait "$vm_pid" 2>/dev/null || rc=$?
-	elif [[ $mode == interactive ]]; then
-		# The VM runs in the background with its serial console going to a
-		# log, and the session comes back over vsock with a pty of its own.
-		# Firecracker's serial input rewrites CR to LF, so a raw-mode TUI on
-		# that console never sees Enter. Keeping the VM off the terminal also
-		# means the jailer works here, which it does not when firecracker is
-		# attached to one.
-		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
-			>"$RUN_DIR/console.log" 2>&1 &
-		local vm_pid=$!
-		VM_PID=$vm_pid
-		((restoring)) && { memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1; }
-
-		echo >&2
-		python3 "$SCRIPTS/vsock-console.py" \
-			"$JAIL_DIR/firecracker-vsock.sock" "$CONSOLE_PORT" || rc=$?
-
-		# The guest reboots itself when the session ends, which is what makes
-		# the VMM exit. Give it a moment, then insist.
-		local waited=0
-		while kill -0 "$vm_pid" 2>/dev/null && ((waited < 60)); do
+		libvirt_boot "$drives_joined" "$boot_args" "$cid" "$RUN_DIR/console.log" || rc=$?
+		if [[ -n $shown ]]; then
 			sleep 0.5
-			waited=$((waited + 1))
-		done
-		kill "$vm_pid" 2>/dev/null || true
-		wait "$vm_pid" 2>/dev/null || true
-	else
-		# tee keeps the unfiltered record; what reaches the terminal is
-		# scrubbed. An unattended run prints logs, and a log has no business
-		# setting the clipboard or redefining a key.
-		(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") 2>&1 |
-			tee "$RUN_DIR/console.log" |
-			python3 "$SCRIPTS/termfilter.py" --strict || rc=$?
+			kill "$(cat "$tail_pid_file" 2>/dev/null)" 2>/dev/null || true
+			wait "$shown" 2>/dev/null || true
+			rm -f "$tail_pid_file"
+		fi
+		vm_done=1
 	fi
 
+	if ((!vm_done)); then
+		# The VM boundary is Firecracker and KVM either way. The jailer adds a
+		# chroot, a dropped uid and a private pid namespace around the VMM
+		# process itself - defence in depth against a VMM escape, and the only
+		# part that needs root. Without it you still get a real VM.
+		local -a cmd=()
+		# taskset rather than a config knob: firecracker has no cpu affinity
+		# setting, and the vcpu threads inherit the process's.
+		local -a pin_prefix=()
+		((${#pin_cpus[@]})) && pin_prefix=(taskset -c "$(
+			IFS=,
+			echo "${pin_cpus[*]}"
+		)")
+		if ((NOJAIL)); then
+			log "WARNING: --no-jail, the VMM runs unconfined on the host"
+			if ((restoring)); then
+				cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket)
+			else
+				cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket --config-file vm-config.json)
+			fi
+		else
+			if [[ $JAIL_BASE == "$PRIV_JAIL_BASE" && -n $JAIL_WRAPPER ]]; then
+				cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAIL_WRAPPER" run "${jargs[@]}")
+			else
+				cmd=(${pin_prefix+"${pin_prefix[@]}"} ${SUDO+"${SUDO[@]}"} "$JAILER" "${jargs[@]}")
+			fi
+		fi
+
+		if ((restoring)); then
+			log "restoring from a checkpoint ($VCPU vcpu, ${MEM}M)"
+			log "this VM is transient - it writes to its own copies, not the real drives"
+		else
+			log "booting ($VCPU vcpu, ${MEM}M)"
+		fi
+		echo >&2
+
+		if ((restoring)) && [[ $mode != interactive ]]; then
+			# Loading a snapshot is an API call, which means the VMM has to be
+			# running before the VM exists - so this path cannot hand the
+			# terminal straight to firecracker the way a cold boot does.
+			#
+			# Its serial input still has to stay open. A detached run has no
+			# terminal, so firecracker's console reader sees EOF immediately and
+			# ends its event loop - the VM resumes in 60ms and the VMM exits
+			# cleanly a moment later, which reads from outside as "restored, then
+			# died for no reason". A fifo held open here gives it a stdin that
+			# never ends and that nobody types into.
+			local serial_in="$JAIL_DIR/serial-in"
+			mkfifo "$serial_in" 2>/dev/null || true
+			# Held open and never written to: the descriptor is the point.
+			# shellcheck disable=SC2034  # kept open deliberately, not read
+			exec {SERIAL_FD}<>"$serial_in"
+			(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
+				<"$serial_in" >"$RUN_DIR/console.log" 2>&1 &
+			local vm_pid=$!
+			VM_PID=$vm_pid
+			memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1
+			tail -n +1 -f --pid="$vm_pid" "$RUN_DIR/console.log" 2>/dev/null |
+				python3 "$SCRIPTS/termfilter.py" --strict &
+			wait "$vm_pid" 2>/dev/null || rc=$?
+		elif [[ $mode == interactive ]]; then
+			# The VM runs in the background with its serial console going to a
+			# log, and the session comes back over vsock with a pty of its own.
+			# Firecracker's serial input rewrites CR to LF, so a raw-mode TUI on
+			# that console never sees Enter. Keeping the VM off the terminal also
+			# means the jailer works here, which it does not when firecracker is
+			# attached to one.
+			(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") \
+				>"$RUN_DIR/console.log" 2>&1 &
+			local vm_pid=$!
+			VM_PID=$vm_pid
+			((restoring)) && { memcheck_load "$JAIL_DIR/firecracker.socket" || rc=1; }
+
+			echo >&2
+			python3 "$SCRIPTS/vsock-console.py" \
+				"$JAIL_DIR/firecracker-vsock.sock" "$CONSOLE_PORT" || rc=$?
+
+			# The guest reboots itself when the session ends, which is what makes
+			# the VMM exit. Give it a moment, then insist.
+			local waited=0
+			while kill -0 "$vm_pid" 2>/dev/null && ((waited < 60)); do
+				sleep 0.5
+				waited=$((waited + 1))
+			done
+			kill "$vm_pid" 2>/dev/null || true
+			wait "$vm_pid" 2>/dev/null || true
+		else
+			# tee keeps the unfiltered record; what reaches the terminal is
+			# scrubbed. An unattended run prints logs, and a log has no business
+			# setting the clipboard or redefining a key.
+			(cg_join "$CG_DIR/vm" && cd "$JAIL_DIR" && exec "${cmd[@]}") 2>&1 |
+				tee "$RUN_DIR/console.log" |
+				python3 "$SCRIPTS/termfilter.py" --strict || rc=$?
+		fi
+	fi
 	echo >&2
 	log "VM exited (status $rc)"
 

@@ -1262,6 +1262,50 @@ test_freed_memory_returns_to_host() {
 	fi
 }
 
+# The libvirt backend, end to end, when this machine has libvirt. Each of
+# these was broken: a libvirt run returned out of launch when the domain
+# stopped, so nothing was shown, the work was never copied out and a failed
+# gate exited 0; every --no-net VM asked qemu for cid 3; the NIC came up as
+# enp0sN and the guest, configuring eth0, had no network.
+test_libvirt_backend() {
+	((QUICK)) && return 0
+	if ! command -v virsh >/dev/null; then
+		ok "libvirt backend (skipped, no libvirt here)"
+		return 0
+	fi
+	local a b out rc result
+	export LIBVIRT_DEFAULT_URI=${LIBVIRT_DEFAULT_URI:-qemu:///session}
+	a=$(make_project)
+	out=$(cd "$a" && timeout 300 "$FIRECODE" exec --vmm libvirt --no-net --verify false -- \
+		bash -c 'echo from-libvirt >made.txt; echo "shown-""live"' 2>&1)
+	rc=$?
+	contains "libvirt: the guest's output is shown" "shown-live" "$out"
+	result=$(sed -n 's/^  result:  //p' <<<"$out" | head -1)
+	check "libvirt: the work comes back" "from-libvirt" "$(cat "$result/made.txt" 2>&1)"
+	check "libvirt: a failed gate fails the run" "1" "$((rc != 0))"
+
+	b="$WORK/libvirt-b"
+	rm -rf "$b"
+	cp -a "$(make_project)" "$b"
+	(cd "$a" && "$FIRECODE" up --vmm libvirt --no-net --mem 1024 >/dev/null 2>&1)
+	(cd "$b" && "$FIRECODE" up --vmm libvirt --no-net --mem 1024 >/dev/null 2>&1)
+	check "libvirt: two --no-net VMs run at once, each reached" "a b" \
+		"$(cd "$a" && "$FIRECODE" in 'echo a' 2>/dev/null | tail -1) $(cd "$b" && "$FIRECODE" in 'echo b' 2>/dev/null | tail -1)"
+	(cd "$a" && "$FIRECODE" down >/dev/null 2>&1)
+	(cd "$b" && "$FIRECODE" down >/dev/null 2>&1)
+
+	if ip link show fccode1 >/dev/null 2>&1; then
+		out=$(cd "$a" && timeout 300 "$FIRECODE" exec --vmm libvirt -- \
+			bash -c 'ip -4 -o addr show eth0' 2>&1)
+		# `ip -o` output from the guest, not the host's "guest is 172.16..." line.
+		if grep -qE 'eth0 +inet 172\.16\.' <<<"$out"; then
+			ok "libvirt: the guest has its network on eth0"
+		else
+			no "libvirt: the guest has its network on eth0" "$(grep -i -E 'eth0|no eth0' <<<"$out" | head -2)"
+		fi
+	fi
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1556,6 +1600,7 @@ run_test env_survives_quotes
 run_test gate_cannot_be_forged_cheaply
 run_test add_dir_with_a_space
 run_test freed_memory_returns_to_host
+run_test libvirt_backend
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted
