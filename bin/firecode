@@ -193,20 +193,37 @@ CONSOLE_PORT=${FIRECODE_CONSOLE_PORT:-1024}
 FILES_PORT=${FIRECODE_FILES_PORT:-1025}
 EXEC_PORT=${FIRECODE_EXEC_PORT:-1026}
 
+# BOTH SPELLINGS OF EVERY PATH. The checks below compare strings, and a path
+# reached through a symlink is spelled differently from where it is: with
+# `ln -s ~/.ssh ~/proj/x`, `--project ~/proj/x` never starts with "$HOME/.ssh",
+# and the keys were staged. So each path is checked as given AND as it
+# resolves, against each sensitive spot as named AND as it resolves - the
+# second matters where $HOME is itself a link (/home -> /var/home). The path
+# is only checked here, not rewritten: a project opened through a link keeps
+# its name, its state and the path the guest sees.
 refuse_if_sensitive() {
-	local path=$1 rel full line
+	local p
+	for p in "$1" "$(realpath -m -- "$1" 2>/dev/null || printf '%s' "$1")"; do
+		refuse_if_sensitive_as "$p"
+	done
+}
+
+refuse_if_sensitive_as() {
+	local path=$1 rel full line real
 	for rel in "${SENSITIVE_HOME_DIRS[@]}"; do
-		full="$HOME/$rel"
-		if [[ $path == "$full" || $path == "$full"/* ]]; then
-			die "refusing to put $full in the guest - keys and credentials stay on the host"
-		fi
-		# The other direction: a path that *contains* a sensitive one would
-		# carry it in the copy, since staging excludes only gitignored files.
-		# Only if it exists - refusing $HOME for a .netrc nobody has would
-		# refuse every home-adjacent directory.
-		if [[ $full == "$path"/* && -e $full ]]; then
-			die "refusing $path - it contains $full, and keys and credentials stay on the host"
-		fi
+		for full in "$HOME/$rel" "$(realpath -m -- "$HOME/$rel" 2>/dev/null)"; do
+			[[ -n $full ]] || continue
+			if [[ $path == "$full" || $path == "$full"/* ]]; then
+				die "refusing to put $full in the guest - keys and credentials stay on the host"
+			fi
+			# The other direction: a path that *contains* a sensitive one would
+			# carry it in the copy, since staging excludes only gitignored files.
+			# Only if it exists - refusing $HOME for a .netrc nobody has would
+			# refuse every home-adjacent directory.
+			if [[ $full == "$path"/* && -e $full ]]; then
+				die "refusing $path - it contains $full, and keys and credentials stay on the host"
+			fi
+		done
 	done
 
 	[[ -f $DENY_FILE ]] || return 0
@@ -216,9 +233,12 @@ refuse_if_sensitive() {
 		line=${line%"${line##*[![:space:]]}"}
 		[[ -n $line ]] || continue
 		line=${line/#\~/$HOME}
-		# Match the entry itself, anything under it, and globs either way.
+		real=$(realpath -m -- "$line" 2>/dev/null || printf '%s' "$line")
+		# Match the entry itself, anything under it, and globs either way -
+		# and the entry as it resolves, for a path reached through a link.
 		# shellcheck disable=SC2053  # unquoted on purpose, the entry is a pattern
-		if [[ $path == $line || $path == $line/* || $path == "$line" || $path == "$line"/* ]]; then
+		if [[ $path == $line || $path == $line/* || $path == "$line" || $path == "$line"/* ||
+			$path == "$real" || $path == "$real"/* ]]; then
 			die "refusing $path - listed in $DENY_FILE"
 		fi
 	done <"$DENY_FILE"

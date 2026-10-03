@@ -218,6 +218,24 @@ test_denylist() {
 		contains "$p refused without any config" "refusing" "$out"
 	done
 
+	# THROUGH A LINK. The check compared strings, and ~/proj/x -> ~/.ssh is not
+	# spelled like ~/.ssh: the keys were staged. As --workdir, as --add-dir,
+	# and a deny-file entry reached the same way.
+	local lhome="$WORK/linkhome"
+	mkdir -p "$lhome/.ssh" "$lhome/lproj" "$WORK/secret2"
+	ln -sfn "$lhome/.ssh" "$lhome/lproj/x"
+	ln -sfn "$WORK/secret2" "$lhome/lproj/y"
+	printf '%s\n' "$WORK/secret2" >"$WORK/never-share2"
+	out=$(HOME="$lhome" FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec \
+		--workdir "$lhome/lproj/x" --dry-run true 2>&1)
+	contains "a link to .ssh is refused as --workdir" "refusing" "$out"
+	out=$(HOME="$lhome" FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec \
+		--workdir "$project" --add-dir "$lhome/lproj/x" --dry-run true 2>&1)
+	contains "a link to .ssh is refused as --add-dir" "refusing" "$out"
+	out=$(HOME="$lhome" FIRECODE_DENY_FILE="$WORK/never-share2" "$FIRECODE" exec \
+		--workdir "$lhome/lproj/y" --dry-run true 2>&1)
+	contains "a link to a denied path is refused" "refusing" "$out"
+
 	# A --add-dir that is a *parent* of a sensitive path would carry it in
 	# the copy - the ancestor is refused, and the refusal names the file.
 	touch "$home/.netrc"
