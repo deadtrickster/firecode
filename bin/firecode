@@ -1414,7 +1414,8 @@ spec = {"name": name, "mem_mib": int(mem), "vcpus": int(vcpu), "kernel": kernel,
         "seclabel": not os.environ.get("FIRECODE_LIBVIRT_SESSION"),
         # Which physical cores the vcpus are nailed to, when the run cares
         # about how long things take.
-        "pin": [int(c) for c in os.environ.get("FIRECODE_PIN", "").split() if c]}
+        "pin": [int(c) for c in os.environ.get("FIRECODE_PIN", "").split() if c],
+        "balloon": os.environ.get("FIRECODE_BALLOON", "1") != "0"}
 if tap:
     spec["mac"] = "06:00:ac:10:%02x:02" % int(os.environ.get("NET_SLOT", "0"))
 with open(spec_path, "w") as fh:
@@ -5239,6 +5240,19 @@ launch() {
 	local drives_joined
 	drives_joined=$(printf '%s,\n    ' "${drive_json[@]}")
 	drives_joined=${drives_joined%,$'\n    '}
+	# MEMORY GOES BACK. Guest RAM is mapped on demand, but nothing returned it:
+	# a page the guest touched stayed resident on the host until the VM
+	# stopped, so a VM that had built something or read a big tree sat at its
+	# whole --mem for the rest of its life, however idle. Free page reporting
+	# has the guest hand freed ranges back continuously, and firecracker
+	# madvise(DONTNEED)s them. amount_mib 0 - nothing is taken from the guest;
+	# deflate_on_oom so a later inflate can never starve it; no stats polling.
+	# Only settable before boot, and the stock kernel has the driver built in.
+	# FIRECODE_BALLOON=0 leaves it off.
+	local balloon=""
+	[[ ${FIRECODE_BALLOON:-1} != 0 ]] &&
+		balloon=',
+  "balloon": {"amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 0, "free_page_reporting": true}'
 	cat >"$JAIL_DIR/vm-config.json" <<EOF
 {
   "boot-source": {
@@ -5251,7 +5265,7 @@ launch() {
   ],
   "machine-config": {"vcpu_count": $VCPU, "mem_size_mib": $MEM},
   "network-interfaces": $net_ifaces,
-  "vsock": {"guest_cid": $cid, "uds_path": "firecracker-vsock.sock"}
+  "vsock": {"guest_cid": $cid, "uds_path": "firecracker-vsock.sock"}$balloon
 }
 EOF
 

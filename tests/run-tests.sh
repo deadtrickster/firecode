@@ -935,6 +935,35 @@ test_cp_from_guest_is_all_or_nothing() {
 	((rc == 0)) || [[ $out == *NO\ * ]] || no "the cp test ran" "$(tail -3 <<<"$out")"
 }
 
+# Freed guest memory goes back to the host. The libvirt half: the domain asks
+# QEMU for free page reporting, except with a passed-through device, whose
+# memory is locked for DMA. Host-side - the XML builder alone.
+test_libvirt_balloon_reports() {
+	local out
+	out=$(python3 - "$ROOT/scripts/libvirt-domain.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ld", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = {"name": "t", "mem_mib": 512, "vcpus": 1, "kernel": "k", "initrd": "i",
+        "cmdline": "", "cid": 9, "console_log": "/dev/null", "drives": [],
+        "tap": None, "pci": [], "seclabel": False, "pin": []}
+def bal(**kw):
+    x = m.build({**base, **kw})
+    i = x.find("<memballoon"); return x[i:x.find(">", i) + 1]
+print("plain", bal())
+print("gpu", bal(pci=["0000:01:00.0"]))
+print("off", bal(balloon=False))
+PY
+)
+	contains "a libvirt VM reports free pages" 'freePageReporting="on"' "$(grep '^plain' <<<"$out")"
+	contains "not with a passed-through device" 'model="none"' "$(grep '^gpu' <<<"$out")"
+	if grep '^off' <<<"$out" | grep -q freePageReporting; then
+		no "FIRECODE_BALLOON=0 leaves reporting off" "$out"
+	else
+		ok "FIRECODE_BALLOON=0 leaves reporting off"
+	fi
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1194,6 +1223,43 @@ test_add_dir_with_a_space() {
 	out=$(cd "$p" && timeout 240 "$FIRECODE" exec --no-jail --no-net --add-dir "$ref" -- \
 		cat "$ref/note.txt" 2>&1)
 	contains "an --add-dir with a space in its path is mounted" "found it" "$out"
+}
+
+# The firecracker half, measured: a guest allocates 1.5G, frees it, and the
+# host's RSS for the VM comes back down. Without the balloon it stayed at the
+# high-water mark until the VM stopped.
+test_freed_memory_returns_to_host() {
+	((QUICK)) && return 0
+	local p out="$WORK/balloon.log" pid run cg proc rss="" peak=0 i
+	p=$(make_project)
+	(cd "$p" && exec "$FIRECODE" exec --no-jail --no-net --mem 2048 -- bash -c \
+		'python3 -c "b=bytearray(1536<<20); b[::4096]=b\"x\"*(len(b)>>12); import time; time.sleep(8); del b; time.sleep(80)"') \
+		>"$out" 2>&1 &
+	pid=$!
+	sleep 3
+	# The run id ends in the launcher's pid, which is the job just started.
+	for run in "$ROOT"/runs/firecode-*-"$pid"; do :; done
+	for i in $(seq 1 45); do
+		cg=$(cat "$run/cgroup" 2>/dev/null)
+		while read -r proc; do
+			[[ $(cat "/proc/$proc/comm" 2>/dev/null) == firecracker ]] &&
+				rss=$(awk '/VmRSS/ {print int($2 / 1024)}' "/proc/$proc/status")
+		done < <(cat "$cg/vm/cgroup.procs" 2>/dev/null)
+		[[ -n $rss ]] && ((rss > peak)) && peak=$rss
+		# Reported back in batches about two seconds apart, so it takes a
+		# while; done as soon as it is back.
+		((peak > 1400 && ${rss:-0} > 0 && ${rss:-0} < peak - 1000)) && break
+		sleep 2
+	done
+	kill "$pid" 2>/dev/null
+	wait "$pid" 2>/dev/null
+	# At least 1G of the 1.5G back. Not all of it: only whole 2M blocks are
+	# reported, and a guest pushed near its limit frees in fragments.
+	if ((peak > 1400 && rss > 0 && rss < peak - 1000)); then
+		ok "freed guest memory comes back (peak ${peak}M, then ${rss}M)"
+	else
+		no "freed guest memory comes back" "peak ${peak}M, then ${rss:-?}M"
+	fi
 }
 
 test_killed_vm_is_reported_dead() {
@@ -1464,6 +1530,7 @@ run_test cp_from_guest_is_all_or_nothing
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
+run_test libvirt_balloon_reports
 run_test deliver_never_overwrites
 run_test prompt_required
 run_test host_transcripts_untouched
@@ -1488,6 +1555,7 @@ run_test cancel_stops_the_run
 run_test env_survives_quotes
 run_test gate_cannot_be_forged_cheaply
 run_test add_dir_with_a_space
+run_test freed_memory_returns_to_host
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted

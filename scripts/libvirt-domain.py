@@ -133,6 +133,16 @@ def build(spec):
         if spec.get("mac"):
             ET.SubElement(iface, "mac", address=spec["mac"])
 
+    # Freed guest memory goes back to the host, as under firecracker: libvirt
+    # adds a virtio balloon by default, but without free page reporting, so a
+    # page the guest touched stayed resident until the VM stopped. Not with a
+    # passed-through device: that memory is locked for DMA and cannot be
+    # given back, so there is nothing to report into.
+    if spec.get("balloon", True) and not spec.get("pci"):
+        ET.SubElement(dev, "memballoon", model="virtio", freePageReporting="on")
+    else:
+        ET.SubElement(dev, "memballoon", model="none" if spec.get("pci") else "virtio")
+
     console = ET.SubElement(dev, "serial", type="file")
     ET.SubElement(console, "source", path=spec["console_log"])
     ET.SubElement(console, "target", port="0")
@@ -152,7 +162,8 @@ def build(spec):
 
     # Memory that is not moved around underneath a device doing DMA. Required
     # for passthrough, and it is what makes the guest's whole footprint
-    # resident up front - the same trade firecracker makes when it allocates.
+    # resident up front. Firecracker does NOT do this: its guest memory is
+    # mapped on demand and, with the balloon, handed back when freed.
     if spec.get("pci"):
         mb = ET.SubElement(dom, "memoryBacking")
         ET.SubElement(mb, "locked")

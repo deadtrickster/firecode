@@ -422,6 +422,17 @@ tap has no carrier - a VM outliving a killed firecode still holds its device.
 than it was configured with. `--cgroups` additionally caps the host-side VMM
 process through the jailer, which is mostly redundant and off by default.
 
+`--mem` is a ceiling, not a reservation. Guest memory is mapped on demand, so a
+4G VM that has used 900M costs the host 900M. And it is given back: every VM
+has a virtio balloon with free page reporting, so memory the guest frees
+returns to the host within seconds - measured, a guest that allocated and
+freed 1.5G went from 1741M resident back to 219M. Without it a VM stayed at its
+high-water mark until it stopped. Only whole 2M blocks are reported, so a guest
+pushed near its limit gives back less. `FIRECODE_BALLOON=0` turns it off. It
+does not make overcommit safe: if every VM grows at once, the host's OOM
+killer still picks one. A GPU passthrough VM under libvirt has its memory
+locked for DMA, resident from the start, and never reports.
+
 ## Orchestration
 
 A VM that stays up, for when you will run more than one thing in it - a test
