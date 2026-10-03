@@ -62,6 +62,20 @@ if ((UNINSTALL)); then
 	exit 0
 fi
 
+# WHAT KEEPS THE JAILER'S chown INSIDE THE JAIL. It makes /dev/kvm and friends
+# and chowns them BY PATH, after pivot_root - so a symlink planted in the run's
+# root/ (which is yours) resolves inside the jail, where nothing of the host is
+# visible. The one way back out would be a hard link in there to a root-owned
+# host file, and the kernel refuses to let you make one only while
+# protected_hardlinks is on. The binary copy before the chroot is safe on its
+# own: O_NOFOLLOW, a refusal of nlink > 1, and an fchown on the open file.
+# (Read against firecracker v1.17.0, src/jailer/src/{env,chroot}.rs.)
+if [[ $(cat /proc/sys/fs/protected_hardlinks 2>/dev/null) != 1 ]]; then
+	echo "fs.protected_hardlinks is off, and the jail's safety depends on it." >&2
+	echo "Turn it on (sysctl -w fs.protected_hardlinks=1, and persist it) first." >&2
+	exit 1
+fi
+
 for f in jailer firecracker; do
 	[[ -x $VENDOR/$f ]] || {
 		echo "$f not found at $VENDOR/$f - run 'firecode setup' first" >&2

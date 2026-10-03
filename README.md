@@ -90,6 +90,13 @@ Re-run it after `firecode setup` fetches a new firecracker. Skip it and
 `--no-jail` needs nothing at all; you still get a real KVM guest, minus the
 chroot and uid drop around the VMM process.
 
+Without it, a jailed run still works but asks sudo for the jailer in
+`vendor/bin` every time, and its jail lives under `.jail/` in the checkout -
+a directory you own. While that sudo runs, anything running as you could swap
+the jail directory for a link before the jailer, as root, uses it. The
+installed wrapper does not have that window: its jail base is root-owned all
+the way down to the run's own `root/`.
+
 With no controlling terminal - cron, a hook, another agent - sudo cannot
 prompt. `SUDO_ASKPASS=/usr/bin/ksshaskpass` makes it ask on the desktop.
 
