@@ -995,6 +995,33 @@ test_child_dies_with_parent() {
 	fi
 }
 
+# A cancelled run stops. Its signal trap tears the run down, and it used to
+# return into the run afterwards: "cancelled", then "VM exited", the copy-out
+# from drives cleanup had already deleted, and exit 0. TERM rather than INT,
+# because a background job of a non-interactive shell starts with INT ignored.
+test_cancel_stops_the_run() {
+	((QUICK)) && return 0
+	local p out="$WORK/cancel.log" pid rc
+	p=$(make_project)
+	(cd "$p" && exec "$FIRECODE" exec --no-jail --no-net -- sleep 300) >"$out" 2>&1 &
+	pid=$!
+	for _ in $(seq 1 120); do
+		grep -q 'booting' "$out" && break
+		sleep 1
+	done
+	sleep 5
+	kill -TERM "$pid"
+	wait "$pid"
+	rc=$?
+	check "a cancelled run exits 128+SIGTERM" "143" "$rc"
+	if grep -qE 'VM exited|result:|returning the work' "$out"; then
+		no "and does nothing after it was cancelled" "$(grep -E 'cancelled|VM exited|result:' "$out")"
+	else
+		ok "and does nothing after it was cancelled"
+	fi
+	contains "it says it was cancelled" "cancelled (SIGTERM)" "$(cat "$out")"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1279,6 +1306,7 @@ run_test jailed
 run_test interactive
 run_test vm_stops_completely
 run_test child_dies_with_parent
+run_test cancel_stops_the_run
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted

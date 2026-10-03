@@ -4320,12 +4320,20 @@ launch() {
 	#
 	# Each signal is trapped by name rather than folded into the EXIT handler,
 	# because by the time EXIT runs there is nothing left to say WHY.
+	#
+	# AND THEN IT STOPS. cleanup_run returns rather than exits - it is also the
+	# EXIT handler - and a signal trap that only returns hands control back to
+	# the line it interrupted. A cancelled run used to log "cancelled", tear
+	# down its drives, then carry on into "VM exited" and the copy-out, exit 0,
+	# and in --worktree mode rsync --delete an empty extraction over the
+	# worktree. The status is the shell's own convention, 128 + the signal.
 	local sig
-	for sig in INT TERM HUP; do
+	for sig in INT:2 TERM:15 HUP:1; do
 		# shellcheck disable=SC2064 # $sig must expand now, not at signal time
-		trap "cancel_marker $sig; cleanup_run" "$sig"
+		trap "cancel_marker ${sig%:*}; cleanup_run; exit $((128 + ${sig#*:}))" "${sig%:*}"
 	done
-	trap cleanup_run EXIT PIPE
+	trap cleanup_run EXIT
+	trap 'cleanup_run; exit 141' PIPE
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
 
