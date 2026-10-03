@@ -3985,7 +3985,14 @@ launch() {
 			# this a result lands in a timestamped directory beside the
 			# project, which is right when you are watching and useless when
 			# something else is waiting for it to appear somewhere specific.
-			DELIVER=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+			#
+			# The parent is resolved on its own line, because in
+			# `X=$(cd ...)/$(basename ...)` the status is basename's: a typo'd
+			# parent became "/out", and the failure surfaced only at the end
+			# of the run, where it took the finished work with it.
+			DELIVER=$(cd "$(dirname "$2")" 2>/dev/null && pwd) ||
+				die "--deliver: no such directory: $(dirname "$2")"
+			DELIVER="$DELIVER/$(basename "$2")"
 			shift 2
 			;;
 		--vectorized)
@@ -5443,6 +5450,16 @@ EOF
 		echo
 	elif ((SYNC_BACK)); then
 		local out_dir="${DELIVER:-${WORKDIR}-${id#firecode-}}"
+		# Delivered INTO, never over. An existing directory with something in
+		# it - the project itself, a home directory, last run's result - would
+		# have the VM's files extracted on top of it. The work goes where it
+		# would have gone without --deliver instead, and says so.
+		if [[ -n $DELIVER ]] && [[ -e $DELIVER ]] &&
+			{ [[ ! -d $DELIVER ]] || [[ -n $(ls -A "$DELIVER" 2>/dev/null) ]]; }; then
+			out_dir="${WORKDIR}-${id#firecode-}"
+			log "WARNING: $DELIVER exists and is not empty - not delivering on top of it"
+			log "  the work is in $out_dir instead"
+		fi
 		log "copying the project out to $out_dir"
 		# The copy-out is thousands of small files and it is the last thing a
 		# run does, so it is where inode exhaustion lands - and an empty result

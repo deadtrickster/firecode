@@ -876,6 +876,27 @@ test_libvirt_cids_are_unique() {
 	fi
 }
 
+# --deliver puts the result at a path of the caller's choosing. A typo'd
+# parent used to become "/out" and fail only at the end, taking the work with
+# it; an existing directory had the VM's files extracted over its own.
+test_deliver_never_overwrites() {
+	local p out dest
+	p=$(make_project)
+	out=$(cd "$p" && "$FIRECODE" exec --no-jail --no-net \
+		--deliver "$WORK/no-such-parent/out" --dry-run true 2>&1)
+	contains "a --deliver with no parent is refused before the run" \
+		"no such directory" "$out"
+	((QUICK)) && return 0
+
+	dest="$WORK/occupied"
+	mkdir -p "$dest"
+	echo "mine" >"$dest/README.md"
+	out=$(cd "$p" && timeout 240 "$FIRECODE" exec --no-jail --no-net \
+		--deliver "$dest" -- bash -c 'echo vm >README.md' 2>&1)
+	check "a non-empty --deliver target keeps what it had" "mine" "$(cat "$dest/README.md")"
+	contains "and the work goes beside the project instead" "not delivering on top of it" "$out"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1371,6 +1392,7 @@ run_test spawn_server_scopes_callers
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
+run_test deliver_never_overwrites
 run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched
