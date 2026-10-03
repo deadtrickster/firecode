@@ -1033,7 +1033,7 @@ import_host_sessions() {
 
 	# Pull the drive apart, add the sessions, put it back together. Writing
 	# into a mounted image would need root; this does not.
-	sbin debugfs -R "rdump / $tmp" "$img" >/dev/null 2>&1 || true
+	(cd "$tmp" && sbin debugfs -R "rdump / ." "$img") >/dev/null 2>&1 || true
 	rm -rf "$tmp/lost+found"
 	# overlayfs makes its work directory mode 000, and mkfs cannot walk into
 	# what it cannot enter. This is our own copy, and the guest owns these
@@ -1508,15 +1508,14 @@ print(json.dumps(dict(zip(
 		return 0
 	fi
 
-	cat <<EOF
-FIRECODE_VM_RUN='${run:-}'
-FIRECODE_VM_PROJECT='${project:-}'
-FIRECODE_VM_IP='${ip:-}'
-FIRECODE_VM_SOCKET='$sock'
-FIRECODE_VM_EXEC_PORT='$EXEC_PORT'
-FIRECODE_PROCFS_CMD='$SCRIPTS/vmprocfs.py $sock $EXEC_PORT'
-FIRECODE_MIRROR_CMD='$SELF mirror --once${want:+ --project $want}'
-EOF
+	# For `eval "$(firecode info --env)"`, so escaped the same way.
+	env_line FIRECODE_VM_RUN "${run:-}"
+	env_line FIRECODE_VM_PROJECT "${project:-}"
+	env_line FIRECODE_VM_IP "${ip:-}"
+	env_line FIRECODE_VM_SOCKET "$sock"
+	env_line FIRECODE_VM_EXEC_PORT "$EXEC_PORT"
+	env_line FIRECODE_PROCFS_CMD "$SCRIPTS/vmprocfs.py $sock $EXEC_PORT"
+	env_line FIRECODE_MIRROR_CMD "$SELF mirror --once${want:+ --project $want}"
 	[[ -n $ip ]] ||
 		echo "# no address: this VM was started with --no-net, so nothing can connect to it" >&2
 }
@@ -3386,7 +3385,7 @@ cmd_state() {
 		img="$STATE_DIR/$(project_slug "$(cd "$dir" && pwd)").ext4"
 		[[ -f $img ]] || die "no state for $dir yet"
 		tmp=$(mktemp -d)
-		sbin debugfs -R "rdump /upper/claude/projects $tmp" "$img" >/dev/null 2>&1 || true
+		(cd "$tmp" && sbin debugfs -R "rdump /upper/claude/projects ." "$img") >/dev/null 2>&1 || true
 		if compgen -G "$tmp/projects/*/*.jsonl" >/dev/null; then
 			local s
 			# Newest last, so the most useful one is next to the prompt.
@@ -3808,6 +3807,16 @@ stop_children() {
 # One file, written before the teardown that removes the evidence, and best
 # effort throughout: a marker that could fail the cleanup it annotates would be
 # the fourth silent failure in this file tonight.
+# One line of the guest's env file: KEY=value, with the value escaped so the
+# file reads back exactly what was written. It is sourced by bash, as root,
+# at boot - and a value pasted between single quotes ended the quote at its
+# first apostrophe. A git name like D'Arcy left every later line unset - the
+# network, the verify gate - with a parse error nobody saw, and a crafted one
+# ran as root. %q is bash-only for control characters; every reader is bash.
+env_line() {
+	printf '%s=%q\n' "$1" "$2"
+}
+
 cancel_marker() {
 	local sig=${1:-unknown}
 	[[ -n ${RUN_DIR:-} && -d ${RUN_DIR:-} ]] || return 0
@@ -4573,11 +4582,11 @@ launch() {
 	local ctl_stage="$RUN_DIR/ctl"
 	mkdir -p "$ctl_stage"
 	{
-		echo "FIRECODE_ID=$id"
-		echo "FIRECODE_MODE=$mode"
-		[[ $AGENT != shell ]] && echo "FIRECODE_AGENT=$AGENT"
-		echo "FIRECODE_TIMEOUT=$TIMEOUT"
-		echo "FIRECODE_RELAY_PORTS='$relay_ports'"
+		env_line FIRECODE_ID "$id"
+		env_line FIRECODE_MODE "$mode"
+		[[ $AGENT != shell ]] && env_line FIRECODE_AGENT "$AGENT"
+		env_line FIRECODE_TIMEOUT "$TIMEOUT"
+		env_line FIRECODE_RELAY_PORTS "$relay_ports"
 		# The guest mirrors the host's layout: same user, same uid, same home,
 		# same project path. An absolute path in a resumed transcript, in a
 		# CLAUDE.md or in a tool call then means the same thing in both places,
@@ -4599,38 +4608,38 @@ launch() {
 		# Enter is the one you notice: a terminal speaking the kitty keyboard
 		# protocol reports it as CSI 13 u, arrows stay ordinary CSI, so the
 		# arrows work and Enter appears dead.
-		echo "FIRECODE_CONSOLE_PORT=$CONSOLE_PORT"
-		echo "FIRECODE_FILES_PORT=$FILES_PORT"
-		echo "FIRECODE_EXEC_PORT=$EXEC_PORT"
-		echo "FIRECODE_TERM='${TERM:-}'"
-		echo "FIRECODE_TERM_PROGRAM='${TERM_PROGRAM:-}'"
-		echo "FIRECODE_COLORTERM='${COLORTERM:-}'"
-		echo "FIRECODE_USER='$(id -un)'"
-		echo "FIRECODE_UID=$(id -u)"
-		echo "FIRECODE_GID=$(id -g)"
-		echo "FIRECODE_HOME='$HOME'"
-		echo "FIRECODE_PROJECT='$WORKDIR'"
+		env_line FIRECODE_CONSOLE_PORT "$CONSOLE_PORT"
+		env_line FIRECODE_FILES_PORT "$FILES_PORT"
+		env_line FIRECODE_EXEC_PORT "$EXEC_PORT"
+		env_line FIRECODE_TERM "${TERM:-}"
+		env_line FIRECODE_TERM_PROGRAM "${TERM_PROGRAM:-}"
+		env_line FIRECODE_COLORTERM "${COLORTERM:-}"
+		env_line FIRECODE_USER "$(id -un)"
+		env_line FIRECODE_UID "$(id -u)"
+		env_line FIRECODE_GID "$(id -g)"
+		env_line FIRECODE_HOME "$HOME"
+		env_line FIRECODE_PROJECT "$WORKDIR"
 		# An explicit endpoint wins over the relay: the relay authenticates
 		# against the real API, and pointing it at a local model would send
 		# your token somewhere it does not belong.
 		if [[ -n $API_BASE ]]; then
-			echo "ANTHROPIC_BASE_URL='$API_BASE'"
+			env_line ANTHROPIC_BASE_URL "$API_BASE"
 		elif ((AUTH_RELAY)); then
-			echo "ANTHROPIC_BASE_URL='http://localhost:$AUTH_RELAY_PORT'"
+			env_line ANTHROPIC_BASE_URL "http://localhost:$AUTH_RELAY_PORT"
 		fi
 		# Which model, when the endpoint is not the client's own provider.
 		# claude asks for opus/sonnet/haiku by name and the far end has never
 		# heard of them, so each has to be mapped or every request is a 404
 		# for a model that does not exist there.
 		if [[ -n $GUEST_AUTH_TOKEN ]]; then
-			echo "ANTHROPIC_AUTH_TOKEN='$GUEST_AUTH_TOKEN'"
+			env_line ANTHROPIC_AUTH_TOKEN "$GUEST_AUTH_TOKEN"
 		fi
 		if [[ -n $GUEST_MODEL ]]; then
-			echo "ANTHROPIC_MODEL='$GUEST_MODEL'"
-			echo "ANTHROPIC_DEFAULT_OPUS_MODEL='$GUEST_MODEL'"
-			echo "ANTHROPIC_DEFAULT_SONNET_MODEL='$GUEST_MODEL'"
-			echo "ANTHROPIC_SMALL_FAST_MODEL='${GUEST_SMALL_MODEL:-$GUEST_MODEL}'"
-			echo "ANTHROPIC_DEFAULT_HAIKU_MODEL='${GUEST_SMALL_MODEL:-$GUEST_MODEL}'"
+			env_line ANTHROPIC_MODEL "$GUEST_MODEL"
+			env_line ANTHROPIC_DEFAULT_OPUS_MODEL "$GUEST_MODEL"
+			env_line ANTHROPIC_DEFAULT_SONNET_MODEL "$GUEST_MODEL"
+			env_line ANTHROPIC_SMALL_FAST_MODEL "${GUEST_SMALL_MODEL:-$GUEST_MODEL}"
+			env_line ANTHROPIC_DEFAULT_HAIKU_MODEL "${GUEST_SMALL_MODEL:-$GUEST_MODEL}"
 		fi
 		# opencode has no environment variable for a provider's endpoint - it
 		# reads that from its config file - so this is the port, and the guest
@@ -4638,31 +4647,31 @@ launch() {
 		# drive: that drive is shared between runs and keyed by content, and
 		# the port is per run.
 		if ((AUTH_RELAY)) && [[ $AGENT == opencode && $RELAY_PROVIDER == xai && -z $API_BASE ]]; then
-			echo "FIRECODE_XAI_BASE_URL='http://localhost:$AUTH_RELAY_PORT/v1'"
+			env_line FIRECODE_XAI_BASE_URL "http://localhost:$AUTH_RELAY_PORT/v1"
 		fi
-		echo "FIRECODE_EXTRA='${extra_spec[*]-}'"
+		env_line FIRECODE_EXTRA "${extra_spec[*]-}"
 		# Where each --disk should be mounted, in the order they were given.
 		# Not the device names: those are assigned further down, after this
 		# file is already inside an image. The guest pairs them with the last
 		# N virtio disks, which is exactly where these are attached.
-		echo "FIRECODE_DISKS='$(disk_mounts)'"
+		env_line FIRECODE_DISKS "$(disk_mounts)"
 		# Read from the project, not from wherever firecode happens to live, so
 		# a repo-local identity wins the same way it would on the host.
-		echo "FIRECODE_GIT_NAME='$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)'"
-		echo "FIRECODE_GIT_EMAIL='$(git -C "$WORKDIR" config --get user.email 2>/dev/null || true)'"
+		env_line FIRECODE_GIT_NAME "$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)"
+		env_line FIRECODE_GIT_EMAIL "$(git -C "$WORKDIR" config --get user.email 2>/dev/null || true)"
 		if [[ $NONET -eq 0 ]]; then
-			echo "FIRECODE_GUEST_IP=172.16.SLOT.2/30"
-			echo "FIRECODE_GATEWAY=172.16.SLOT.1"
-			echo "FIRECODE_DNS='1.1.1.1 8.8.8.8'"
+			env_line FIRECODE_GUEST_IP "172.16.SLOT.2/30"
+			env_line FIRECODE_GATEWAY "172.16.SLOT.1"
+			env_line FIRECODE_DNS "1.1.1.1 8.8.8.8"
 		fi
 		if [[ -n $VERIFY ]]; then
-			echo "FIRECODE_VERIFY=$(printf '%q' "$VERIFY")"
-			echo "FIRECODE_VERIFY_TIMEOUT='$VERIFY_TIMEOUT'"
+			env_line FIRECODE_VERIFY "$VERIFY"
+			env_line FIRECODE_VERIFY_TIMEOUT "$VERIFY_TIMEOUT"
 		fi
 		# How long a finished run stays open to be spoken to. Worth raising
 		# when something is supervising the run and may want to interject.
 		[[ -n ${FIRECODE_INBOX_IDLE:-} ]] &&
-			echo "FIRECODE_INBOX_IDLE='$FIRECODE_INBOX_IDLE'"
+			env_line FIRECODE_INBOX_IDLE "$FIRECODE_INBOX_IDLE"
 	} >"$ctl_stage/env"
 	{
 		cat "$GUEST/firecode-context.md"
@@ -5530,9 +5539,15 @@ report_unlanded_commits() {
 # Read an ext4 image without mounting it, so no root is needed. Files the
 # guest created as root come out owned by you, which is what you want anyway.
 extract_image() {
-	local img=$1 dest=$2
+	local img dest=$2
+	img=$(realpath "$1")
 	mkdir -p "$dest"
-	sbin debugfs -R "rdump / $dest" "$img" >/dev/null 2>&1 ||
+	# From INSIDE the destination, dumping to ".". debugfs parses its -R string
+	# itself and splits it on whitespace, so `rdump / $dest` with a space in the
+	# path dumped nowhere and reported nothing: every project under a path with
+	# a space came back as an empty result - and a --worktree run then rsynced
+	# that emptiness over the worktree with --delete.
+	(cd "$dest" && sbin debugfs -R "rdump / ." "$img") >/dev/null 2>&1 ||
 		log "WARNING: extraction reported errors, check $dest"
 	rm -rf "$dest/lost+found"
 	defang_git "$dest"

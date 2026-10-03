@@ -1022,6 +1022,42 @@ test_cancel_stops_the_run() {
 	contains "it says it was cancelled" "cancelled (SIGTERM)" "$(cat "$out")"
 }
 
+# The guest's env file is sourced as root at boot. Values used to be pasted
+# between single quotes, so one apostrophe ended the quote: a git name like
+# D'Arcy left every later line unset - network, verify gate - and a crafted
+# one ran as root. A path, a name and an injection attempt, read back inside.
+test_env_survives_quotes() {
+	((QUICK)) && return 0
+	local p="$WORK/it's a project" name="D'Arcy x'; touch /tmp/env-injected; : '" out result
+	rm -rf "$p"
+	cp -a "$(make_project)" "$p"
+	git -C "$p" config user.name "$name"
+	out=$(cd "$p" && timeout 240 "$FIRECODE" exec --no-jail --no-net \
+		--verify "test -n 'it'\''s'" -- bash -c '
+		. /opt/firecode/run/env
+		printf "%s%s=[%s]\n" GOT_ NAME "$FIRECODE_GIT_NAME"
+		printf "%s%s=[%s]\n" GOT_ PROJECT "$FIRECODE_PROJECT"
+		printf "%s%s=[%s]\n" GOT_ VERIFY "$FIRECODE_VERIFY"
+		[[ -e /tmp/env-injected ]] && echo "INJ""ECTED"' 2>&1)
+	# Guest lines arrive behind a console prefix, and the guest also logs the
+	# command it ran - so the markers are assembled at run time, and only
+	# what was printed can match.
+	got() { grep -o "GOT_$1=\[.*\]" <<<"$out" | head -1 | sed 's/^GOT_//'; }
+	check "a git name with quotes reads back exactly" "NAME=[$name]" "$(got NAME)"
+	check "a project path with an apostrophe reads back exactly" "PROJECT=[$p]" "$(got PROJECT)"
+	check "the lines after them still arrive" "VERIFY=[test -n 'it'\''s']" "$(got VERIFY)"
+	if grep -q 'INJECTED' <<<"$out"; then # only ever printed, never in the command
+		no "a value cannot run code in the guest" "the injected command ran"
+	else
+		ok "a value cannot run code in the guest"
+	fi
+	# And the work comes back. debugfs split `rdump / <dest>` on the space in
+	# the path, so a project like this one came back as an empty result.
+	result=$(sed -n 's/^  result:  //p' <<<"$out" | head -1)
+	check "a path with a space and a quote still brings the work back" "yes" \
+		"$([[ -n $result && -f $result/README.md ]] && echo yes || echo "no: [$result]")"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1307,6 +1343,7 @@ run_test interactive
 run_test vm_stops_completely
 run_test child_dies_with_parent
 run_test cancel_stops_the_run
+run_test env_survives_quotes
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted
