@@ -470,6 +470,16 @@ took hours, and in both cases the last thing checked was not the thing being
 handed over. An agent asserting success is a claim about a process that is
 about to stop, made by the only party who could have checked and did not.
 
+**What the gate is not: proof against an agent that wants to fake it.** It
+runs in the same VM, and the agent has passwordless root in there - it can
+leave a process behind that rewrites the result, or replace the check itself.
+The harness closes the cheap ways (the verdict is written where only root can
+reach, markers the agent planted are cleared first, and a gate whose verdict
+never arrives is a failure, not a pass), but the gate guards against honest
+mistakes - a test that does not test, a file that is not there - not against
+an adversary. A gate that has to hold against the agent belongs in a fresh VM
+booted from the result, which the agent never ran in.
+
 **`firecode say`** posts another turn into a run that is already going, so a
 correction that occurs to you in minute ten does not have to wait for the end
 and a whole new run. Both agents take it, by different routes: claude reads

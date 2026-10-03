@@ -5519,6 +5519,15 @@ EOF
 				rc=$vrc
 			fi
 			rm -f "$vst"
+		elif [[ -n $VERIFY ]]; then
+			# A gate was asked for and no verdict came back. That is not a
+			# pass, and it is not "nothing checked it" either - something
+			# stopped the verdict reaching here, and the only safe reading of
+			# that is a failure. land refuses it the same way.
+			log "VERIFICATION VERDICT MISSING - a verify command was set and no result came back"
+			log "  treated as a failure"
+			echo missing >"$RUN_DIR/verify-status"
+			rc=1
 		fi
 
 		# A run that changed nothing should not leave a copy of your project

@@ -1125,6 +1125,26 @@ test_env_survives_quotes() {
 		"$([[ -n $result && -f $result/README.md ]] && echo yes || echo "no: [$result]")"
 }
 
+# The cheap forgery of a green gate: occupy the fixed /tmp path the status
+# was written to, so the write fails quietly, and leave a passing status in
+# the project for the copy to leave standing. With a gate of `false`.
+test_gate_cannot_be_forged_cheaply() {
+	((QUICK)) && return 0
+	local p out rc
+	p=$(make_project)
+	out=$(cd "$p" && timeout 240 "$FIRECODE" exec --no-jail --no-net --verify false -- \
+		bash -c 'mkdir -p /tmp/firecode-verify-status /tmp/firecode-exit-status
+			echo 0 >.firecode-verify-status; echo 0 >.firecode-exit-status' 2>&1)
+	rc=$?
+	if ((rc != 0)); then
+		ok "a planted passing status does not make a failing gate pass"
+	else
+		no "a planted passing status does not make a failing gate pass" \
+			"$(grep -iE 'verif' <<<"$out" | tail -3)"
+	fi
+	contains "and the failure is reported as the gate's" "VERIFICATION FAILED" "$out"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1413,6 +1433,7 @@ run_test vm_stops_completely
 run_test child_dies_with_parent
 run_test cancel_stops_the_run
 run_test env_survives_quotes
+run_test gate_cannot_be_forged_cheaply
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted

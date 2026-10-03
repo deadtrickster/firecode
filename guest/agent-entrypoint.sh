@@ -397,7 +397,19 @@ fi
 # harness's own files. A gate is supposed to judge the work; it should not be
 # tripped by the thing judging it. They are moved in at the very end, after
 # the gate has had its look.
-STATUS_TMP=/tmp/firecode-exit-status
+#
+# NOT /tmp. A fixed path in /tmp is the agent's to occupy first - a directory
+# named firecode-verify-status, and the status write fails quietly - and the
+# markers it would have produced can be left in the project beforehand, where
+# the copy below used to leave them standing. So the gate writes into a fresh
+# directory only root can enter, and the project's own markers are cleared
+# before the gate runs. (The agent has passwordless sudo in here, so this
+# closes the cheap ways, not every way - the docs say so.)
+GATE_DIR=$(mktemp -d /run/firecode-gate.XXXXXX 2>/dev/null || mktemp -d)
+chmod 700 "$GATE_DIR"
+rm -rf "$PROJECT/.firecode-exit-status" "$PROJECT/.firecode-verify-status" \
+	"$PROJECT/.firecode-verify-seconds" "$PROJECT/.firecode-verify.log" 2>/dev/null || true
+STATUS_TMP=$GATE_DIR/exit-status
 echo "$rc" >"$STATUS_TMP" 2>/dev/null || true
 
 # The gate.
@@ -417,7 +429,7 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	vrc=0
 	# Written outside the project while the gate runs, for the same reason as
 	# the status file, and moved in afterwards.
-	vlog=/tmp/firecode-verify.log
+	vlog=$GATE_DIR/verify.log
 	started=$SECONDS
 	{
 		echo "# firecode verification"
@@ -440,7 +452,7 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	# The last lines on the console, because a failure nobody sees is the
 	# problem this exists to solve. The whole output stays in the log.
 	tail -n 25 "$vlog" 2>/dev/null | sed 's/^/  /'
-	echo "$vrc" >/tmp/firecode-verify-status 2>/dev/null || true
+	echo "$vrc" >"$GATE_DIR/verify-status" 2>/dev/null || true
 	# How long the gate took, written down rather than only said.
 	#
 	# This number already existed - it is in the console line below - but
@@ -449,7 +461,7 @@ if [[ -n ${FIRECODE_VERIFY:-} ]]; then
 	# once and lands with one timestamp. A gate that took 0.2s on a run that
 	# took forty minutes is a gate that is not testing anything, and that is
 	# invisible unless the duration is a fact somebody can read.
-	echo "$took" >/tmp/firecode-verify-seconds 2>/dev/null || true
+	echo "$took" >"$GATE_DIR/verify-seconds" 2>/dev/null || true
 	if ((vrc == 0)); then
 		log "verification passed in ${took}s"
 	elif ((vrc == 124)); then
@@ -465,14 +477,14 @@ fi
 # Now the markers go in, with the gate finished and nothing left to mislead.
 # The host reads them out of the delivered tree and deletes them there, so
 # they are a courier rather than part of anyone's project.
-[[ -f $STATUS_TMP ]] &&
-	cp -f "$STATUS_TMP" "$PROJECT/.firecode-exit-status" 2>/dev/null
-[[ -f /tmp/firecode-verify-status ]] &&
-	cp -f /tmp/firecode-verify-status "$PROJECT/.firecode-verify-status" 2>/dev/null
-[[ -f /tmp/firecode-verify-seconds ]] &&
-	cp -f /tmp/firecode-verify-seconds "$PROJECT/.firecode-verify-seconds" 2>/dev/null
-[[ -f /tmp/firecode-verify.log ]] &&
-	cp -f /tmp/firecode-verify.log "$PROJECT/.firecode-verify.log" 2>/dev/null
+# Removed first, then copied: cp -f onto something the gate's run left in the
+# way (a directory, a link) would write somewhere else or not at all.
+for m in exit-status:.firecode-exit-status verify-status:.firecode-verify-status \
+	verify-seconds:.firecode-verify-seconds verify.log:.firecode-verify.log; do
+	[[ -f $GATE_DIR/${m%%:*} ]] || continue
+	rm -rf "${PROJECT:?}/${m#*:}" 2>/dev/null
+	cp "$GATE_DIR/${m%%:*}" "$PROJECT/${m#*:}" 2>/dev/null
+done
 
 sync
 exit "$rc"
