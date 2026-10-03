@@ -457,6 +457,29 @@ test_commit_reachability() {
 # sweep_results runs for real here, taken out of the script, against roots that
 # exist only inside $WORK. FIRECODE_RESULT_ROOTS is what keeps it away from
 # /tmp and ~/Projects.
+# A scratch project's age was its top-level directory's mtime, which a commit
+# or an edit in a subdirectory never changes - so one worked on every day was
+# "days old" and gc removed it. Age is now the newest thing in the tree.
+test_gc_keeps_active_scratch() {
+	local root="$WORK/scratchroot" out
+	rm -rf "$root"
+	mkdir -p "$root/active/src" "$root/stale/src"
+	echo today >"$root/active/src/main.c"
+	echo old >"$root/stale/src/main.c"
+	touch -d '5 days ago' "$root/stale/src/main.c" "$root/stale/src" "$root/stale" "$root/active"
+	out=$(
+		log() { printf 'gc: %s\n' "$*" >&2; }
+		eval "$(sed -n '/^sweep_scratch() {$/,/^}$/p' "$FIRECODE")"
+		# shellcheck disable=SC2034  # read by the eval'd sweep_scratch
+		RUNS="$WORK/no-such-runs"
+		FIRECODE_SCRATCH_ROOT="$root" FIRECODE_SCRATCH_DAYS=2 sweep_scratch 2>&1
+	)
+	check "a scratch project edited today survives an old top-level mtime" "yes" \
+		"$([[ -f $root/active/src/main.c ]] && echo yes || echo "no: $out")"
+	check "one with nothing new in it is still removed" "gone" \
+		"$([[ -d $root/stale ]] && echo "still there: $out" || echo gone)"
+}
+
 test_gc_keeps_unreachable_work() {
 	local root landed orphan out
 	root="$WORK/gcroots"
@@ -1423,6 +1446,7 @@ run_test session_import_resumable
 run_test results_come_back
 run_test commits_are_reported_unlanded
 run_test commit_reachability
+run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
 run_test no_relays
 run_test concurrent_runs

@@ -6334,6 +6334,15 @@ sweep_scratch() {
 		if grep -qs -- "$dir" /proc/[0-9]*/maps 2>/dev/null; then
 			continue
 		fi
+		# AGE IS THE NEWEST THING IN THE TREE, not the directory's own mtime.
+		# That changes only when a top-level entry is added or removed - a
+		# commit, an edit in src/, a whole day of work changes nothing it
+		# sees - so a project worked on daily for three days was "three days
+		# old" and went. The find below is the real test; the -mtime filter
+		# feeding this loop only skips what cannot possibly be old.
+		if [[ -n $(find "$dir" -newermt "$(date -d "-$days days" -Iseconds)" -print -quit 2>/dev/null) ]]; then
+			continue
+		fi
 		rm -rf "$dir" 2>/dev/null && swept=$((swept + 1))
 	done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime "+$days" 2>/dev/null)
 
