@@ -63,14 +63,30 @@ def get(sock, guest_path, host_path, limit):
         if n == 0:
             raise SystemExit(f"the guest has nothing at {guest_path}")
         spool.seek(0)
-        with tarfile.open(fileobj=spool, mode="r|*") as tar:
-            try:
-                tar.extractall(host_path, filter="data")
-            except tarfile.OutsideDestinationError as exc:
-                raise SystemExit(f"refused: the archive tried to escape - {exc}")
-            except (tarfile.AbsolutePathError, tarfile.LinkOutsideDestinationError,
-                    tarfile.SpecialFileError) as exc:
-                raise SystemExit(f"refused: {exc}")
+        # CHECKED WHOLE, THEN EXTRACTED. Streaming extraction wrote every member
+        # before the first bad one, so a refusal left a partial tree behind -
+        # and only some of the filter's errors were caught, so the rest ended
+        # in a traceback. The spool is seekable, so every member goes through
+        # the same "data" filter first, nothing is written unless all pass,
+        # and the unpacked size is held to the same limit as the bytes sent:
+        # "r:*" decompresses, and a small gzip can unpack to anything.
+        try:
+            with tarfile.open(fileobj=spool, mode="r:*") as tar:
+                members, unpacked = [], 0
+                for m in tar.getmembers():
+                    members.append(tarfile.data_filter(m, host_path))
+                    unpacked += m.size
+                    if unpacked > limit:
+                        raise SystemExit(
+                            f"the archive unpacks to more than "
+                            f"{limit // (1024 * 1024)}M - refusing it (raise with --limit)")
+                tar.extractall(host_path, members=members, filter="data")
+        except tarfile.OutsideDestinationError as exc:
+            raise SystemExit(f"refused, nothing written: the archive tried to escape - {exc}")
+        except tarfile.FilterError as exc:
+            raise SystemExit(f"refused, nothing written: {exc}")
+        except tarfile.TarError as exc:
+            raise SystemExit(f"refused, nothing written: not a readable archive - {exc}")
     print(f"{n // 1024}K from {guest_path} into {host_path}")
 
 

@@ -920,6 +920,21 @@ test_deliver_never_overwrites() {
 	contains "and the work goes beside the project instead" "not delivering on top of it" "$out"
 }
 
+# `firecode cp` unpacks what a guest sends. A refused archive used to leave
+# what came before the bad member on disk, and some refusals were tracebacks.
+test_cp_from_guest_is_all_or_nothing() {
+	local line out rc
+	out=$(python3 "$ROOT/tests/vsock_cp.py" 2>&1)
+	rc=$?
+	while IFS= read -r line; do
+		case "$line" in
+		ok\ *) ok "${line#ok }" ;;
+		NO\ *) no "${line#NO }" ;;
+		esac
+	done <<<"$out"
+	((rc == 0)) || [[ $out == *NO\ * ]] || no "the cp test ran" "$(tail -3 <<<"$out")"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1445,6 +1460,7 @@ run_test arg_massaging
 run_test terminal_escapes
 run_test relay_stays_on_upstream
 run_test spawn_server_scopes_callers
+run_test cp_from_guest_is_all_or_nothing
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
