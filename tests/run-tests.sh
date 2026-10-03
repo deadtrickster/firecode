@@ -848,6 +848,34 @@ test_spawn_server_scopes_callers() {
 	((rc == 0)) || [[ $out == *NO\ * ]] || no "the spawn access test ran" "$out"
 }
 
+# A libvirt VM's vsock cid is host-global. It was recorded as 3 + NET_SLOT
+# before NET_SLOT existed, so every run said cid:3, and --no-net VMs all wanted
+# cid 3. The allocator, lifted out of bin/firecode and raced against itself.
+test_libvirt_cids_are_unique() {
+	local d="$WORK/cids" fn i
+	rm -rf "$d"
+	mkdir -p "$d/runs/old" "$d/state"
+	echo "cid:3" >"$d/runs/old/vsock"
+	fn=$(sed -n '/^alloc_libvirt_cid()/,/^}/p' "$FIRECODE")
+	for i in $(seq 1 10); do
+		mkdir -p "$d/runs/r$i"
+		(
+			# shellcheck disable=SC2034 # read by the eval'd function
+			RUNS="$d/runs" STATE_DIR="$d/state" RUN_DIR="$d/runs/r$i"
+			eval "$fn"
+			alloc_libvirt_cid
+		) &
+	done
+	wait
+	check "ten at once get ten different cids" "10" \
+		"$(cat "$d"/runs/r*/vsock | sort -u | wc -l)"
+	if grep -qx 'cid:3' "$d"/runs/r*/vsock; then
+		no "a cid already recorded is not handed out again" "$(cat "$d"/runs/r*/vsock | sort | head -3)"
+	else
+		ok "a cid already recorded is not handed out again"
+	fi
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1342,6 +1370,7 @@ run_test relay_stays_on_upstream
 run_test spawn_server_scopes_callers
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
+run_test libvirt_cids_are_unique
 run_test prompt_required
 run_test host_transcripts_untouched
 run_test project_tree_untouched

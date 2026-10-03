@@ -1389,7 +1389,9 @@ libvirt_boot() {
 
 	# The drive list, rebuilt from the same JSON firecracker was given, so
 	# there is exactly one place that decides what a VM has and in what order.
-	python3 - "$spec" "$name" "$MEM" "$VCPU" "$KERNEL" "$INITRD" "$cmdline" \
+	# NET_SLOT is a shell variable, never exported - so the spec writer read
+	# 0 and every libvirt VM got the MAC ...:00:02. Handed over explicitly.
+	NET_SLOT="${NET_SLOT:-0}" python3 - "$spec" "$name" "$MEM" "$VCPU" "$KERNEL" "$INITRD" "$cmdline" \
 		"$cid" "$console" "$JAIL_DIR" "${TAP_DEV:-}" "${GPU_PCI:-}" <<'PY'
 import json, os, sys
 spec_path, name, mem, vcpu, kernel, initrd, cmdline, cid, console, jail, tap, gpu = sys.argv[1:13]
@@ -3449,6 +3451,28 @@ NET_FD=""
 # Sets NET_SLOT and NET_FD rather than printing. It cannot print: a command
 # substitution runs in a subshell, so the descriptor holding the lock would be
 # closed the moment it returned, and every VM would take the same slot.
+# A vsock cid for a libvirt VM: unique on this host, reserved before boot.
+#
+# It used to be 3 + NET_SLOT, written before net_up had assigned NET_SLOT -
+# so every run recorded cid:3 while its VM booted on 3+slot, and ps, in, say
+# and info reached nothing or somebody else's VM. And with --no-net there is
+# no slot at all: every such VM wanted cid 3, and qemu refuses the second.
+# So the cid is its own thing: the lowest one no run directory names, taken
+# under a lock and written down at once, which is the reservation.
+LIBVIRT_CID=""
+alloc_libvirt_cid() {
+	local lock="$STATE_DIR/cid.lock" c used
+	mkdir -p "$STATE_DIR"
+	exec {cid_fd}>"$lock"
+	flock "$cid_fd"
+	used=$(cat "$RUNS"/*/vsock 2>/dev/null | sed -n 's/^cid://p' | sort -un)
+	c=3
+	while grep -qx "$c" <<<"$used"; do c=$((c + 1)); done
+	LIBVIRT_CID=$c
+	printf 'cid:%s\n' "$c" >"$RUN_DIR/vsock"
+	exec {cid_fd}>&-
+}
+
 alloc_net_slot() {
 	local s fd i
 	mkdir -p "$STATE_DIR/net"
@@ -4318,7 +4342,7 @@ launch() {
 	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
 	# How to reach this VM's channels, whichever backend started it.
 	if [[ $VMM == libvirt ]]; then
-		printf 'cid:%s\n' "$((3 + ${NET_SLOT:-0}))" >"$RUN_DIR/vsock"
+		alloc_libvirt_cid
 	else
 		printf '%s\n' "$JAIL_DIR/firecracker-vsock.sock" >"$RUN_DIR/vsock"
 	fi
@@ -5197,7 +5221,11 @@ launch() {
 	boot_args="$boot_args firecode.lower=$dev_lower firecode.upper=$dev_upper"
 	((QUIET_BOOT)) && boot_args="$boot_args quiet loglevel=3 systemd.show_status=false"
 
-	local cid=$((3 + ${NET_SLOT:-0}))
+	# Firecracker gives each VM a vsock of its own behind a unix socket, so its
+	# cid is never seen by anything else. Under libvirt it is host-global, and
+	# it is the one alloc_libvirt_cid reserved.
+	local cid=3
+	[[ $VMM == libvirt ]] && cid=$LIBVIRT_CID
 	local drives_joined
 	drives_joined=$(printf '%s,\n    ' "${drive_json[@]}")
 	drives_joined=${drives_joined%,$'\n    '}
