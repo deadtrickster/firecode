@@ -1168,6 +1168,19 @@ test_gate_cannot_be_forged_cheaply() {
 	contains "and the failure is reported as the gate's" "VERIFICATION FAILED" "$out"
 }
 
+# --add-dir paths went to the guest as one space-separated list, so a path
+# with a space became two broken entries and was never mounted.
+test_add_dir_with_a_space() {
+	((QUICK)) && return 0
+	local p ref="$WORK/my notes" out
+	p=$(make_project)
+	mkdir -p "$ref"
+	echo "found it" >"$ref/note.txt"
+	out=$(cd "$p" && timeout 240 "$FIRECODE" exec --no-jail --no-net --add-dir "$ref" -- \
+		cat "$ref/note.txt" 2>&1)
+	contains "an --add-dir with a space in its path is mounted" "found it" "$out"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1458,6 +1471,7 @@ run_test child_dies_with_parent
 run_test cancel_stops_the_run
 run_test env_survives_quotes
 run_test gate_cannot_be_forged_cheaply
+run_test add_dir_with_a_space
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted

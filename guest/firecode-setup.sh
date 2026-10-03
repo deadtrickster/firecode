@@ -152,12 +152,13 @@ setup_relays() {
 # same absolute path it has on the host.
 mount_extras() {
 	local spec label target
-	for spec in ${FIRECODE_EXTRA:-}; do
+	# One entry per line - a path may contain a space.
+	while IFS= read -r spec; do
 		label=${spec%%:*}
 		target=${spec#*:}
 		[[ -n $label && -n $target ]] || continue
 		mount_label "$label" "$target" -o ro
-	done
+	done <<<"${FIRECODE_EXTRA:-}"
 }
 
 # Host disks handed to this VM whole, rather than copied into it - which is
@@ -171,10 +172,10 @@ mount_disks() {
 	local spec="${FIRECODE_DISKS:-}"
 	[[ -n $spec ]] || return 0
 
-	# Deliberate word splitting: the spec is a space-separated list this
-	# harness wrote itself, one entry per --disk.
-	# shellcheck disable=SC2206
-	local -a wanted=($spec) devs=()
+	# One entry per line, one line per --disk - a mountpoint may contain a
+	# space, which a space-separated list split in two.
+	local -a wanted=() devs=()
+	mapfile -t wanted <<<"$spec"
 	local d
 	for d in /dev/vd*; do [[ -b $d ]] && devs+=("$d"); done
 	local n=${#wanted[@]} total=${#devs[@]}

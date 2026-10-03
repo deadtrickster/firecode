@@ -1290,16 +1290,17 @@ require_vm_socket() {
 # A disk with no mountpoint is still attached - the guest may want the raw
 # device, which is the case for anything that manages its own storage.
 disk_mounts() {
-	local spec rest out=""
+	# One per line, for the same reason as FIRECODE_EXTRA: a mountpoint may
+	# have a space in it.
+	local spec rest
 	for spec in ${DISKS+"${DISKS[@]}"}; do
 		rest=${spec#*:}
 		if [[ $rest == "$spec" || -z $rest ]]; then
-			out="$out -"
+			printf '%s\n' -
 			continue
 		fi
-		out="$out ${rest%%:*}:$([[ $spec == *:ro ]] && echo ro || echo rw)"
+		printf '%s\n' "${rest%%:*}:$([[ $spec == *:ro ]] && echo ro || echo rw)"
 	done
-	printf '%s' "${out# }"
 }
 
 # What this machine can and cannot tell you about code that measures itself.
@@ -4700,7 +4701,9 @@ launch() {
 		if ((AUTH_RELAY)) && [[ $AGENT == opencode && $RELAY_PROVIDER == xai && -z $API_BASE ]]; then
 			env_line FIRECODE_XAI_BASE_URL "http://localhost:$AUTH_RELAY_PORT/v1"
 		fi
-		env_line FIRECODE_EXTRA "${extra_spec[*]-}"
+		# One entry per LINE: a path may have a space in it, and a list
+		# joined with spaces became two broken entries in the guest.
+		env_line FIRECODE_EXTRA "$(printf '%s\n' ${extra_spec+"${extra_spec[@]}"})"
 		# Where each --disk should be mounted, in the order they were given.
 		# Not the device names: those are assigned further down, after this
 		# file is already inside an image. The guest pairs them with the last
