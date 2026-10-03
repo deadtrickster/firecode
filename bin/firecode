@@ -139,7 +139,13 @@ HYBRID=0
 PCORES=""
 VPMU=0
 GPU_PCI=""
-LIBVIRT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
+# The session daemon by default: it runs qemu as you, so it can read the
+# images under your home - the system daemon runs it as libvirt-qemu, and a
+# 0750 home (Ubuntu's default) made every libvirt run fail before the domain
+# existed. The firecode taps are yours, so networking works the same. A GPU
+# needs the system daemon (libvirt detaches it from the host), and
+# libvirt_boot switches to it for that; LIBVIRT_DEFAULT_URI overrides both.
+LIBVIRT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///session}"
 RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
@@ -1385,6 +1391,10 @@ libvirt_boot() {
 
 	local spec="$RUN_DIR/domain.json" xml="$RUN_DIR/domain.xml"
 	local name="firecode-${RUN_ID#firecode-}"
+	if [[ -n ${GPU_PCI:-} && -z ${LIBVIRT_DEFAULT_URI:-} ]]; then
+		LIBVIRT_URI=qemu:///system
+		log "a passed-through device needs the system libvirt daemon - using $LIBVIRT_URI"
+	fi
 	# Read by the spec writer below, so it has to be set before it runs.
 	[[ $LIBVIRT_URI == *session* ]] && export FIRECODE_LIBVIRT_SESSION=1
 
@@ -6661,15 +6671,15 @@ cmd_doctor() {
 		# both. Octal rather than the rwx string, because matching dashes in
 		# "drwxr-x---" is fiddly and wrong in a way that silently passes -
 		# which it did on the first attempt here.
-		doc_check warn "libvirt can read your home" \
+		# Only the system daemon has this problem, and it is the default
+		# only for --gpu runs now; the session daemon runs qemu as you.
+		doc_check warn "libvirt (system daemon) can read your home" \
 			"[[ \$(stat -c '%a' '$HOME' 2>/dev/null) =~ [1357]\$ ]]" \
-			"" "your home is $(stat -c '%a %A' "$HOME" 2>/dev/null) so qemu:///system (running as
-       libvirt-qemu) cannot reach a layer image under it, and every
-       'firecode --vmm libvirt' run will fail before the domain exists.
-       Use the session daemon instead:
-         LIBVIRT_DEFAULT_URI=qemu:///session firecode --vmm libvirt ...
-       It runs qemu as you, reads your files, and needs no root - at the
-       cost of usermode networking rather than a bridge."
+			"" "your home is $(stat -c '%a %A' "$HOME" 2>/dev/null), so qemu:///system (running as
+       libvirt-qemu) cannot reach a layer image under it. Ordinary libvirt
+       runs use qemu:///session and are unaffected; a --gpu run needs the
+       system daemon and will fail until libvirt-qemu can traverse your home
+       (or the firecode checkout lives somewhere it can)."
 	fi
 
 	echo

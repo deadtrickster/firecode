@@ -1266,7 +1266,8 @@ test_freed_memory_returns_to_host() {
 # these was broken: a libvirt run returned out of launch when the domain
 # stopped, so nothing was shown, the work was never copied out and a failed
 # gate exited 0; every --no-net VM asked qemu for cid 3; the NIC came up as
-# enp0sN and the guest, configuring eth0, had no network.
+# enp0sN and the guest, configuring eth0, had no network. Run on firecode's
+# default URI - qemu:///session - unless LIBVIRT_DEFAULT_URI says otherwise.
 test_libvirt_backend() {
 	((QUICK)) && return 0
 	if ! command -v virsh >/dev/null; then
@@ -1274,7 +1275,6 @@ test_libvirt_backend() {
 		return 0
 	fi
 	local a b out rc result
-	export LIBVIRT_DEFAULT_URI=${LIBVIRT_DEFAULT_URI:-qemu:///session}
 	a=$(make_project)
 	out=$(cd "$a" && timeout 300 "$FIRECODE" exec --vmm libvirt --no-net --verify false -- \
 		bash -c 'echo from-libvirt >made.txt; echo "shown-""live"' 2>&1)

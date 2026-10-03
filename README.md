@@ -758,6 +758,12 @@ firecode state reset          # forget this project's history, tree and layer
 Per-run drives are deleted when the VM exits unless you pass `--keep`. Console
 logs stay. Layers, state and snapshots are never touched by `gc`.
 
+`--vmm libvirt` talks to `qemu:///session` - qemu runs as you, reads the
+images under your home, and uses the same taps. `--gpu` switches to
+`qemu:///system`, which a passed-through device needs; that daemon runs qemu
+as `libvirt-qemu`, so it has to be able to traverse your home (`firecode
+doctor` checks). `LIBVIRT_DEFAULT_URI` overrides either.
+
 ## Limits and caveats
 
 - Your host credentials go into the VM unless you use `--auth-relay`, which
