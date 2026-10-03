@@ -25,6 +25,7 @@ opencode's config for xai - and give it no credentials at all.
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
@@ -210,6 +211,22 @@ PROVIDERS = {
 }
 
 
+def host_header_ok(value, port):
+    """localhost or an IP literal, on this relay's port - never a domain,
+    which is the only thing DNS rebinding can point here."""
+    host, sep, p = value.rpartition(":")
+    if not sep or p != str(port):
+        return False
+    host = host.strip("[]")
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def upstream_url(upstream, path):
     """The upstream URL for a guest's request target, or None to refuse it.
 
@@ -252,6 +269,12 @@ class Relay(BaseHTTPRequestHandler):
         pass                                    # one line per token is noise
 
     def _relay(self, body=None):
+        # A domain in Host means a page rebound that domain to this machine:
+        # the guest and the host only ever name this relay by address.
+        if not host_header_ok(self.headers.get("Host", ""),
+                              self.server.server_address[1]):
+            self.send_error(403, "Host must name this relay by address")
+            return
         url = upstream_url(self.server.upstream, self.path)
         if url is None:
             self.send_error(400, "request target must be a path on the upstream")

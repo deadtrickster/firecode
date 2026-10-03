@@ -624,8 +624,29 @@ an MCP server reached over the same vsock relay as everything else:
 ```sh
 cp mcp/spawn.example.json spawn.json    # list the projects that may be spawned
 firecode spawn-server
-firecode claude --host-port 9770 "farm this out across the sub-projects"
+firecode claude --orchestrate "farm this out across the sub-projects"
 ```
+
+**Who may use it.** A VM is known by its connection - the relay carrying it
+runs in the VM's cgroup, so the server reads which run is asking and the guest
+has nothing to forge. Only a VM started with `--orchestrate` is let in, and
+then it can spawn on **its own project** or on **scratch it made**, use the
+`vm_*` tools on that scratch only (a project's VMs can include your own
+interactive session), and see, cancel and land only the runs **it** spawned -
+never with `force`. The spawn port is never relayed into a VM any other way,
+whatever `~/.claude.json` or the host-ports file lists.
+
+Everything else on this machine counts as the host, which includes any web
+page a browser here is showing, so the host must send the token the server
+keeps in `~/.config/firecode/spawn-token`:
+
+```sh
+claude mcp add --transport http firecode-spawn http://127.0.0.1:9770/mcp \
+  --header "Authorization: Bearer $(cat ~/.config/firecode/spawn-token)"
+```
+
+Requests must also name the server by address in `Host` (no domain, which is
+what DNS rebinding needs) and carry `Content-Type: application/json`.
 
 Projects are named keys from the config, never paths from the caller -
 otherwise an agent could ask for any directory and read it in a VM it controls.

@@ -813,6 +813,23 @@ EOF
 	contains "clean refuses an id that is a path" "usage" "$out"
 }
 
+# The spawn server lets an orchestrator VM start and drive its own children,
+# and nothing else in: no other VM, no host caller without the token, no page
+# a browser is showing. Hermetic: the server in-process, the caller set per
+# request, since the question is what each kind of caller may then do.
+test_spawn_server_scopes_callers() {
+	local line out rc
+	out=$(python3 "$ROOT/tests/spawn_access.py" 2>&1)
+	rc=$?
+	while IFS= read -r line; do
+		case "$line" in
+		ok\ *) ok "${line#ok }" ;;
+		NO\ *) no "${line#NO }" ;;
+		esac
+	done <<<"$out"
+	((rc == 0)) || [[ $out == *NO\ * ]] || no "the spawn access test ran" "$out"
+}
+
 test_arg_massaging() {
 	local project out
 	project=$(make_project)
@@ -1241,6 +1258,7 @@ run_test denylist
 run_test arg_massaging
 run_test terminal_escapes
 run_test relay_stays_on_upstream
+run_test spawn_server_scopes_callers
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test prompt_required

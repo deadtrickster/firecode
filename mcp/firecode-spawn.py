@@ -21,9 +21,11 @@ standard library.
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -124,9 +126,76 @@ BRIEF = _load("brief.md").decode("utf-8", "replace").strip()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIRECODE = os.path.join(ROOT, "bin", "firecode")
+RUNS_DIR = os.path.join(ROOT, "runs")
+
+# What a caller on the HOST presents. A VM is known by its connection - see
+# _peer - and needs nothing; the host is everyone else, which includes any web
+# page a browser on this machine is showing, so the host has to prove itself.
+TOKEN_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "firecode", "spawn-token")
+
+
+def host_header_ok(value, port):
+    """A Host that names this server by address, never by a domain.
+
+    DNS rebinding works by pointing a name the attacker owns at 127.0.0.1, so
+    the browser's request arrives saying `Host: evil.example:9770`. Only a
+    domain can be rebound; localhost and IP literals - including the 10.0.2.2
+    a usermode-networked VM sees the host as - cannot.
+    """
+    import ipaddress
+    host, sep, p = value.rpartition(":")
+    if not sep or p != str(port):
+        return False
+    host = host.strip("[]")
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def host_token():
+    """The host callers' token, made once and kept, so an MCP config written
+    with it keeps working across restarts. 0600, in a 0700 directory."""
+    os.makedirs(os.path.dirname(TOKEN_PATH), mode=0o700, exist_ok=True)
+    try:
+        with open(TOKEN_PATH) as fh:
+            tok = fh.read().strip()
+        if tok:
+            return tok
+    except FileNotFoundError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(tok + "\n")
+    return tok
 
 
 class Config:
+    def keep_children_flat(self, own):
+        """Strip the ways a child could be given this server's port."""
+        args, out = self.extra_args, []
+        i = 0
+        while i < len(args):
+            if args[i] == "--orchestrate":
+                i += 1
+                continue
+            if args[i] == "--host-port" and i + 1 < len(args) and str(args[i + 1]) == str(own):
+                i += 2
+                continue
+            out.append(args[i])
+            i += 1
+        if own in self.host_ports or out != args:
+            print(f"[spawn] dropping {own} / --orchestrate from what children "
+                  "get: a child that can spawn is not flat", file=sys.stderr)
+        self.extra_args = out
+        self.host_ports = [p for p in self.host_ports if p != own]
+
     def _fits(self):
         """How many VMs this machine can carry at once.
 
@@ -250,6 +319,11 @@ class Config:
         self.host_ports = [int(p) for p in (raw.get("host_ports") or [])]
         self.agent = raw.get("agent", "claude")
         self.extra_args = list(raw.get("extra_args") or [])
+        # A VM this server starts is never an orchestrator itself: one that
+        # could reach this server could spawn, and depth stops being flat.
+        # The VM side of that is bin/firecode marking only runs given the port
+        # on their command line - so it must never be on theirs.
+        self.keep_children_flat(int(raw.get("port", 9770)))
 
         self.concurrency_reason = getattr(self, "concurrency_reason", "configured")
 
@@ -391,6 +465,7 @@ class Runs:
                 "log": log_path,
                 "result_dir": None,
                 "land_on_pass": bool(land_on_pass),
+                "parent_run": parent_run,
                 "proc": proc,
                 "_log_fh": log,
             }
@@ -1095,7 +1170,7 @@ def _offline_note(cfg):
             "over a network.")
 
 
-def _workspace_new(cfg, name):
+def _workspace_new(cfg, name, caller_run=None):
     """A project of the caller's own, inside the scratch directory.
 
     The name is sanitised and joined to scratch_root, and the result has to
@@ -1112,7 +1187,13 @@ def _workspace_new(cfg, name):
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", (name or "").strip())[:48].strip("-.")
     if not safe:
         raise ValueError("a workspace needs a name made of letters or digits")
+    owners = cfg.__dict__.setdefault("scratch_owner", {})
     if safe in cfg.projects:
+        # A VM gets back only a workspace it made: the operator's projects
+        # and another orchestrator's scratch are not renamed into its own by
+        # asking for them by name.
+        if caller_run and owners.get(safe) != caller_run:
+            raise ValueError(f"{safe!r} is taken - pick another name")
         return safe, cfg.projects[safe]
 
     path = os.path.abspath(os.path.join(cfg.scratch_root, safe))
@@ -1126,6 +1207,7 @@ def _workspace_new(cfg, name):
     if not os.path.isdir(os.path.join(path, ".git")):
         subprocess.run(["git", "init", "-q", path], check=False, timeout=60)
     cfg.projects[safe] = path
+    owners[safe] = caller_run
     return safe, path
 
 
@@ -1221,7 +1303,75 @@ def explain(what, out, rc=None):
             f"---\n{text.strip()[:1500]}")
 
 
+# What a VM - an orchestrator - may do, by tool.
+#
+# Its own identity comes from the connection, so the question is only what it
+# may touch. spawn: its own project or scratch it made - each child is a run
+# of its own, with a result of its own, which is what parallel work needs.
+# The vm_* tools address "the VM of project P", and P's VMs can include the
+# operator's interactive session and the orchestrator itself, so those take
+# only scratch it made, where every VM is its own. Run ids: only runs it
+# spawned. Everything else is the host's.
+_VM_TOOLS = {"vm_up", "vm_in", "vm_down", "vm_checkpoint", "vm_reset",
+             "vm_serve", "vm_logs", "vm_ps", "vm_watch", "vm_say", "vm_stop"}
+_RUN_TOOLS = {"land", "output", "cancel", "status"}
+_OPEN_TOOLS = {"workspace_new", "chat_say", "chat_wait", "vm_list",
+               "list_projects"}
+
+
+def _own_project(caller_run):
+    try:
+        with open(os.path.join(RUNS_DIR, caller_run, "project")) as fh:
+            return os.path.realpath(fh.read().strip())
+    except OSError:
+        return None
+
+
+def _scratch_of(cfg, caller_run):
+    owners = cfg.__dict__.get("scratch_owner", {})
+    return {n for n, o in owners.items() if o == caller_run}
+
+
+def authorize(cfg, runs, name, args, caller_run):
+    """Raise PermissionError unless a VM caller may do this. Host: anything."""
+    if caller_run is None:
+        return
+    mine = _scratch_of(cfg, caller_run)
+    if name in _OPEN_TOOLS:
+        return
+    if name == "spawn":
+        proj = args.get("project")
+        own = _own_project(caller_run)
+        if proj in mine or (proj in cfg.projects and own
+                            and os.path.realpath(cfg.projects[proj]) == own):
+            return
+        raise PermissionError(
+            f"an orchestrator spawns on its own project or on scratch it made "
+            f"with workspace_new - {proj!r} is neither")
+    if name in _VM_TOOLS:
+        if args.get("project") in mine:
+            return
+        raise PermissionError(
+            f"{name} from a VM works only on scratch it made with workspace_new: "
+            f"a project's VMs can include the operator's own session. For "
+            f"parallel work on {args.get('project')!r}, use spawn")
+    if name in _RUN_TOOLS:
+        rid = args.get("run_id")
+        if name == "status" and not rid:
+            return                     # filtered to its own in the tool
+        run = runs.runs.get(rid)
+        if not run or run.get("parent_run") != caller_run:
+            raise PermissionError(f"{rid!r} is not a run you spawned")
+        if name == "land" and args.get("force"):
+            raise PermissionError(
+                "landing a failed gate (force) is the operator's call, not an "
+                "orchestrator's - report it instead")
+        return
+    raise PermissionError(f"{name} is not available to a VM")
+
+
 def call_tool(cfg, runs, name, args, caller_run=None):
+    authorize(cfg, runs, name, args, caller_run)
     # A VM asked for by another VM is nested inside it, so it stops when its
     # parent does instead of outliving it as an orphan nobody is watching.
     parent = ["--parent-run", caller_run] if caller_run else []
@@ -1338,7 +1488,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         return out or "landed."
 
     if name == "workspace_new":
-        key, path = _workspace_new(cfg, args["name"])
+        key, path = _workspace_new(cfg, args["name"], caller_run)
         return (f"{key} is yours, at {path} - empty, a git repo, and usable as "
                 f"a project anywhere one is asked for: vm_up, spawn, vm_in.\n"
                 f"It lasts as long as this server runs; the operator's own "
@@ -1553,7 +1703,14 @@ def call_tool(cfg, runs, name, args, caller_run=None):
             return (f"No projects configured. Add them to {cfg.path} - "
                     "paths are never taken from the caller.")
         out = ["projects:"]
-        out += [f"  {n}  {p}" for n, p in sorted(cfg.projects.items())]
+        shown = cfg.projects.items()
+        if caller_run is not None:
+            own = _own_project(caller_run)
+            mine = _scratch_of(cfg, caller_run)
+            shown = [(n, p) for n, p in shown
+                     if n in mine or os.path.realpath(p) == own]
+            out = ["projects you can spawn on (your own, and scratch you made):"]
+        out += [f"  {n}  {p}" for n, p in sorted(shown)]
         if cfg.datasets:
             out.append("")
             out.append("datasets (attach with vm_up datasets=[...]):")
@@ -1587,9 +1744,11 @@ def call_tool(cfg, runs, name, args, caller_run=None):
     if name == "status":
         if args.get("run_id"):
             return json.dumps(runs.view(args["run_id"]), indent=2)
-        if not runs.runs:
+        ids = [r for r, v in runs.runs.items()
+               if caller_run is None or v.get("parent_run") == caller_run]
+        if not ids:
             return "nothing started yet"
-        return json.dumps([runs.view(r) for r in runs.runs], indent=2)
+        return json.dumps([runs.view(r) for r in ids], indent=2)
 
     if name == "output":
         return runs.tail(args["run_id"], int(args.get("lines", 60)))
@@ -1632,16 +1791,21 @@ def _ownership_note(caller_run):
     return "\n".join(note)
 
 
-def _peer_run_id(client_address, server_port):
-    """Which VM is on the other end of this connection, if any.
+def _peer(client_address, server_port):
+    """Who is on the other end of this connection: ("vm", run), ("host",
+    None), or (None, None) when it cannot be told.
+
+    The last is refused by the caller rather than taken for the host. It used
+    to come back as None, the same value as "a process on the host", so a
+    lookup that failed - a race, a socket owned by another user - granted
+    everything the host may do.
 
     A guest reaches this server through its own relay process, and that relay
     runs inside the VM's cgroup - so the connection itself says who is asking,
-    with nothing for the guest to declare and nothing for it to forge. Used
-    only to decide what a spawned VM should outlive; never for access.
-
-    Returns a run id, or None when the caller is not inside a firecode VM -
-    which is the normal case for an agent running on the host.
+    with nothing for the guest to declare and nothing for it to forge. That
+    is what makes it usable for access: a VM is scoped to its own children by
+    it, and the host - which includes any web page a browser here is showing -
+    has to present a token instead.
     """
     try:
         peer_port = client_address[1]
@@ -1656,7 +1820,7 @@ def _peer_run_id(client_address, server_port):
                     want = f[9]          # the socket's inode
                     break
         if want is None:
-            return None
+            return None, None
 
         target = f"socket:[{want}]"
         for pid in os.listdir("/proc"):
@@ -1679,10 +1843,10 @@ def _peer_run_id(client_address, server_port):
                 # child of.
                 found = [p[len("run-"):] for p in cg.strip().split("/")
                          if p.startswith("run-")]
-                return found[-1] if found else None
+                return ("vm", found[-1]) if found else ("host", None)
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1702,14 +1866,63 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def _admit(self, body_expected):
+        """Who this is, or a refusal already sent and None returned.
+
+        In order: a Host header naming this server, so a page that rebinds a
+        name of its own to 127.0.0.1 is turned away; a JSON body, so a form or
+        a no-cors fetch cannot post one; then the caller. A VM is admitted
+        only if it was started as an orchestrator, which leaves a mark in its
+        run directory; the host only with the token.
+
+        A refusal closes the connection: the body it did not read would
+        otherwise be parsed as the next request on it.
+        """
+        self.close_connection = True
+        port = self.server.server_address[1]
+        if not host_header_ok(self.headers.get("Host", ""), port):
+            self._send(403, b'{"error":"wrong Host"}')
+            return None
+        ctype = self.headers.get("Content-Type", "").split(";")[0].strip()
+        if body_expected and ctype != "application/json":
+            self._send(415, b'{"error":"application/json only"}')
+            return None
+        kind, run = _peer(self.client_address, port)
+        if kind == "vm":
+            if os.path.exists(os.path.join(RUNS_DIR, run, "orchestrate")):
+                self.close_connection = False
+                return ("vm", run)
+            self._send(403, b'{"error":"this VM was not started with --orchestrate"}')
+            return None
+        if kind == "host":
+            got = self.headers.get("Authorization", "")
+            want = f"Bearer {type(self).token}"
+            if type(self).token and hmac.compare_digest(got.encode(), want.encode()):
+                self.close_connection = False
+                return ("host", None)
+            self._send(401, b'{"error":"token required"}')
+            return None
+        self._send(403, b'{"error":"cannot tell who is calling"}')
+        return None
+
+    token = None
+
     def do_GET(self):
         # No server-initiated stream; everything is request/response.
+        if self._admit(False) is None:
+            return
         self._send(405)
 
     def do_DELETE(self):
+        if self._admit(False) is None:
+            return
         self._send(200, b"{}")
 
     def do_POST(self):
+        who = self._admit(True)
+        if who is None:
+            return
+        self._caller = who[1]
         length = int(self.headers.get("Content-Length") or 0)
         try:
             req = json.loads(self.rfile.read(length) or b"{}")
@@ -1791,8 +2004,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/call":
             name = params.get("name", "")
             args = params.get("arguments") or {}
-            caller = _peer_run_id(self.client_address,
-                                  self.server.server_address[1])
+            caller = self._caller
             # What was asked for, before it is done. An operator watching this
             # sees a VM being started against one of their disks at the moment
             # it happens, not after it has finished.
@@ -1851,6 +2063,8 @@ def main(argv):
     cfg = Config(config_path)
     Handler.cfg = cfg
     Handler.runs = Runs(cfg)
+    Handler.token = host_token()
+    cfg.keep_children_flat(port)
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"[spawn] listening on http://127.0.0.1:{port}/mcp")
@@ -1859,7 +2073,10 @@ def main(argv):
           f"{cfg.max_total} in total")
     print(f"[spawn]   {cfg.concurrency_reason}")
     print("[spawn] reach it from a guest with: "
-          f"firecode claude --host-port {port} ...")
+          f"firecode claude --orchestrate ...")
+    print(f"[spawn] from the host, send the token in {TOKEN_PATH}:")
+    print(f"[spawn]   claude mcp add --transport http firecode-spawn "
+          f"http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer $(cat {TOKEN_PATH})\"")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

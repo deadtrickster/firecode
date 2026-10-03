@@ -1,7 +1,8 @@
 {
   "_comment": [
     "Copy to <repo>/spawn.json and edit. Start it with: firecode spawn-server",
-    "Then give a guest access to it with: firecode claude --host-port 9770 ...",
+    "Then let a guest orchestrate with: firecode claude --orchestrate ...",
+    "Host-side clients send the token in ~/.config/firecode/spawn-token (see README).",
     "",
     "Projects are named keys on purpose. The caller picks a name, never a",
     "path, so an agent in a VM cannot ask for a directory you did not list.",

@@ -80,9 +80,10 @@ srv.token_fn = token_fn
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
-def ask(target):
+def ask(target, host=None):
+    host = host or f"127.0.0.1:{srv.server_address[1]}"
     c = socket.create_connection(srv.server_address, timeout=5)
-    c.sendall(f"GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+    c.sendall(f"GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
     out = b""
     while chunk := c.recv(4096):
         out += chunk
@@ -99,5 +100,14 @@ status = ask("/v1/models")
 check("a path is relayed end to end", status == "200", f"got {status}")
 check("the upstream gets the host's token, not the guest's",
       seen == [("/v1/models", "Bearer SECRET")], f"upstream saw {seen}")
+
+# A page that rebinds a domain of its own to 127.0.0.1 still says that domain.
+seen.clear()
+status = ask("/v1/models", host=f"rebind.example:{srv.server_address[1]}")
+check("a rebound domain in Host is refused", status == "403", f"got {status}")
+check("and never reaches the upstream", not seen, f"upstream saw {seen}")
+status = ask("/v1/models", host=f"10.0.2.2:{srv.server_address[1]}")
+check("an address in Host is relayed (a usermode VM's view of the host)",
+      status == "200", f"got {status}")
 
 sys.exit(1 if failed else 0)

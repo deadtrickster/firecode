@@ -144,6 +144,7 @@ RESUME_TREE=auto
 IMPORT_SESSIONS=auto
 USE_GITIGNORE=1
 NO_MCP=0
+ORCHESTRATE=0
 NO_TMUX=0
 DRY_RUN=0
 WORKTREE=""
@@ -4019,6 +4020,10 @@ launch() {
 			HOST_PORTS+=("$2")
 			shift 2
 			;;
+		--orchestrate)
+			ORCHESTRATE=1
+			shift
+			;;
 		--exclude)
 			EXCLUDES+=("$2")
 			shift 2
@@ -4369,6 +4374,18 @@ launch() {
 	local -a mcp=()
 	((NO_MCP)) || read -r -a mcp <<<"$(discover_mcp_ports)"
 
+	# THE SPAWN SERVER IS REACHED ON PURPOSE OR NOT AT ALL. A VM that reaches
+	# it is an orchestrator: it can start VMs and drive the ones it started.
+	# That is granted by asking for it on this command line - --orchestrate, or
+	# --host-port naming the port - and never by the port turning up in
+	# ~/.claude.json or the host-ports file, which every run reads. The server
+	# checks for the mark this leaves and refuses a VM without it.
+	local spawn_port=${FIRECODE_SPAWN_PORT:-9770} orchestrator=$ORCHESTRATE p
+	for p in ${HOST_PORTS+"${HOST_PORTS[@]}"}; do
+		[[ $p == "$spawn_port" ]] && orchestrator=1
+	done
+	((ORCHESTRATE)) && HOST_PORTS+=("$spawn_port")
+
 	# Ports you always want reachable - a local model server, say - without
 	# having to remember --host-port every time. One per line, # for comments.
 	if [[ -f $PORTS_FILE ]]; then
@@ -4441,8 +4458,13 @@ launch() {
 
 	# nothing and exits 1, which under `set -e` takes the whole run down.
 	relay_ports=$(printf '%s\n' ${mcp+"${mcp[@]}"} ${HOST_PORTS+"${HOST_PORTS[@]}"} |
-		grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)
+		grep -E '^[0-9]+$' | sort -un |
+		{ ((orchestrator)) && cat || grep -vx "$spawn_port"; } | tr '\n' ' ' || true)
 	relay_ports=${relay_ports% }
+	if ((orchestrator)); then
+		: >"$RUN_DIR/orchestrate"
+		log "orchestrator: this VM can start VMs and drive the ones it starts"
+	fi
 
 	# --- per-project agent state, so --continue and --resume have something
 	#     to continue from. Taken first: it decides where the src drive lives.
@@ -6710,7 +6732,9 @@ options (before the agent's own arguments):
   --host-port N   make the host's localhost:N reachable at localhost:N in the
                   guest, over vsock; repeatable. For a local llama-server or
                   any other OpenAI-compatible endpoint on loopback.
-  --resume-tree   carry the previous run's /src forward (implied by -c/-r)
+  --orchestrate   let this VM reach the spawn server, to start VMs on its own
+                  project or scratch and drive the ones it started
+  --resume-tree  carry the previous run's /src forward (implied by -c/-r)
   --fresh         start from the host tree even when continuing
   --import-sessions    copy this project's host transcripts into the VM,
                        rewriting host paths to /src so they can be resumed
