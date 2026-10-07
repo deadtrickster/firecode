@@ -1,0 +1,61 @@
+name: macos
+
+# The host side of firecode on a Mac, checked on every push.
+#
+# What this cannot check is anything that boots a guest. A GitHub macOS runner
+# is itself a virtual machine, and Virtualization.framework does not run inside
+# a macOS guest - so firecode-vz builds and signs here, and starts nowhere. The
+# VM half of the suite (`firecode test` without --quick) needs a real Mac.
+#
+# What it does catch is what breaks quietly: a GNU-only flag outside the PATH
+# preamble, a Swift or SDK change that stops firecode-vz compiling, and Ubuntu
+# changing how it ships the arm64 kernel - which it did once already, between
+# 6.17 (gzip) and 7.0 (EFI zboot).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: homebrew tools
+        run: |
+          brew install bash coreutils gnu-sed findutils gawk grep e2fsprogs \
+            socat flock rsync tmux zstd python@3.13 shellcheck
+
+      - name: firecode-vz builds, and carries the virtualization entitlement
+        run: |
+          ./macos/build.sh "$RUNNER_TEMP/firecode-vz"
+          codesign -d --entitlements - "$RUNNER_TEMP/firecode-vz" 2>&1 |
+            grep -q com.apple.security.virtualization
+          "$RUNNER_TEMP/firecode-vz" --version
+
+      - name: shellcheck
+        run: |
+          shellcheck bin/firecode scripts/*.sh tests/run-tests.sh guest/*.sh \
+            guest/initramfs/init guest/initramfs/bootstrap \
+            macos/build.sh macos/bin/ss macos/bin/taskset
+
+      # The registry tests read spawn.json; the example is a valid one.
+      - name: host-side tests
+        run: |
+          cp mcp/spawn.example.json spawn.json
+          bin/firecode test --quick
+
+      # Fetches Ubuntu's current arm64 kernel and unpacks it, and builds both
+      # initramfs images - the step a change in Ubuntu's packaging breaks.
+      - name: setup
+        run: bin/firecode setup
+
+      # Informational: there is no guest image here, and none can be built.
+      - name: doctor
+        run: bin/firecode doctor || true
