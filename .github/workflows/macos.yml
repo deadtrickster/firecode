@@ -45,16 +45,21 @@ jobs:
             guest/initramfs/init guest/initramfs/bootstrap \
             macos/build.sh macos/bin/ss macos/bin/taskset
 
-      # The registry tests read spawn.json; the example is a valid one.
-      - name: host-side tests
-        run: |
-          cp mcp/spawn.example.json spawn.json
-          bin/firecode test --quick
-
       # Fetches Ubuntu's current arm64 kernel and unpacks it, and builds both
       # initramfs images - the step a change in Ubuntu's packaging breaks.
       - name: setup
         run: bin/firecode setup
+
+      # Some of the quick tests start a run and read what it logs before it
+      # boots - the composed agent command, the mode it chose - so they need
+      # the assets a run resolves. setup gave the kernel; the image only has
+      # to exist, because the boot it would feed cannot happen on this runner.
+      # The registry tests read spawn.json; the example is a valid one.
+      - name: host-side tests
+        run: |
+          truncate -s 64M images/agent-firecode.ext4
+          cp mcp/spawn.example.json spawn.json
+          bin/firecode test --quick
 
       # Informational: there is no guest image here, and none can be built.
       - name: doctor

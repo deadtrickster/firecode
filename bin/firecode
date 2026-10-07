@@ -399,17 +399,29 @@ INITRD=""
 # "" the stock kernel, "debug" the traceable one, or a path.
 WANT_KERNEL="${FIRECODE_KERNEL:-}"
 
+# A missing asset ends a real run. A dry run builds and boots nothing, so it
+# says what is missing and carries on - which is also what lets the checks
+# made before boot (the denylist, argument handling) be tested on a machine
+# that has never built an image.
+asset_missing() {
+	if ((DRY_RUN)); then
+		log "dry run: $1"
+		return 0
+	fi
+	die "$1"
+}
+
 resolve_assets() {
 	if [[ $VMM == vz ]]; then
 		FC="$VENDOR/firecode-vz"
 		JAIL_FC=$FC
-		[[ -x $FC ]] || die "firecode-vz not built - run: firecode setup"
+		[[ -x $FC ]] || asset_missing "firecode-vz not built - run: firecode setup"
 		# No jailer here, and none needed for the same job: the machine
 		# itself runs in Apple's own sandboxed XPC service, not in this
 		# process. The jail directory stays, as the VMM's working directory.
 		NOJAIL=1
 	else
-		[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firecode setup"
+		[[ -x $FC && -x $JAILER ]] || asset_missing "firecracker not installed - run: firecode setup"
 	fi
 
 	local k
@@ -426,21 +438,21 @@ resolve_assets() {
 			k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -not -name '*-debug' \
 				-not -name '*-arm64' -type f | sort -V | tail -1)
 		fi
-		[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
+		[[ -n $k ]] || asset_missing "no guest kernel in $IMAGES - run: firecode setup"
 		;;
 	debug)
 		# Ubuntu's kernel, which is what vz boots, already has ftrace,
 		# kprobes, BPF and BTF.
 		[[ $VMM == vz ]] && {
 			k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-arm64' -type f | sort -V | tail -1)
-			[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
+			[[ -n $k ]] || asset_missing "no guest kernel in $IMAGES - run: firecode setup"
 		}
 		[[ -n ${k:-} ]] || k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-debug' -type f | sort -V | tail -1)
-		[[ -n $k ]] || die "no debug kernel - run: firecode setup --debug-kernel"
+		[[ -n $k ]] || asset_missing "no debug kernel - run: firecode setup --debug-kernel"
 		;;
 	*)
 		k=$WANT_KERNEL
-		[[ -f $k ]] || die "no such kernel: $k"
+		[[ -f $k ]] || asset_missing "no such kernel: $k"
 		;;
 	esac
 	KERNEL=$k
@@ -448,11 +460,11 @@ resolve_assets() {
 	# Explicitly the prepared image. Do not glob and take the first match:
 	# that is how this used to silently boot the untouched base image.
 	ROOTFS="$IMAGES/agent-firecode.ext4"
-	[[ -f $ROOTFS ]] || die "no guest rootfs - run: firecode prepare"
+	[[ -f $ROOTFS ]] || asset_missing "no guest rootfs - run: firecode prepare"
 
 	# Assembles the layered root before handing over to the guest's init.
 	INITRD="$IMAGES/initrd.gz"
-	[[ -f $INITRD ]] || die "no initrd - rebuild with: firecode prepare --force"
+	[[ -f $INITRD ]] || asset_missing "no initrd - rebuild with: firecode prepare --force"
 }
 
 # ---------------------------------------------------------------- host MCP
@@ -4616,7 +4628,6 @@ launch() {
 	done
 	[[ -n $AGENT ]] || die "no command given"
 
-	resolve_assets
 	WORKDIR=$(cd "$WORKDIR" && pwd) || die "workdir does not exist"
 
 	# Never pack a huge directory nobody named.
@@ -4682,6 +4693,11 @@ launch() {
 		xd=$(cd "$xd" 2>/dev/null && pwd) || die "--add-dir: no such directory: $xd"
 		refuse_if_sensitive "$xd"
 	done
+
+	# After the refusals, not before: whether a path may go into a guest is a
+	# question about the path, and the answer must not depend on whether this
+	# machine has built a guest yet.
+	resolve_assets
 
 	# A task means unattended. Flags on their own - `--resume <id>`, a model
 	# choice - mean you want the session, and you are the one driving it, so
@@ -6324,6 +6340,7 @@ cmd_ps_json() {
 	while IFS=$'\t' read -r id proj parent vmname; do
 		[[ -n $want && $vmname != "$want" ]] && ! same_path "$proj" "$want" && continue
 		backend="firecracker"
+		((MACOS)) && backend="vz"
 		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
 		quiet=""
 		[[ -f $RUNS/$id/console.log ]] &&
@@ -6389,6 +6406,7 @@ cmd_ps() {
 		any=1
 		addr=$(cat "$RUNS/$id/vsock" 2>/dev/null)
 		local backend="firecracker"
+		((MACOS)) && backend="vz"
 		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
 		echo
 		printf '%s  %s\n' "${vmname:-$id}" "$proj"
