@@ -81,13 +81,32 @@ done
 # rather than sourced, because bin/firecode is 271K of script with side effects
 # at load. If that ever changes, this over-reports live layers and reaps fewer,
 # which is the safe direction to be wrong in.
+# The processes of a run's cgroup. On a Mac there are no cgroups and
+# bin/firecode keeps the tree as files of "pid start-time" lines; a recorded
+# pid counts only while it still names the process that was recorded, since a
+# pid is reused and a run is not.
+cg_procs() {
+	if [ "$(uname -s)" != Darwin ]; then
+		cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null || true
+		return
+	fi
+	cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null |
+		while read -r pid start; do
+			[ -n "$pid" ] || continue
+			now=$(ps -o lstart= -p "$pid" 2>/dev/null) || continue
+			# Word by word: the spacing inside ps's date is not to be trusted.
+			# shellcheck disable=SC2086,SC2116  # the splitting is the point
+			[ "$(echo $now)" = "$(echo $start)" ] && echo "$pid"
+		done
+}
+
 live=""
 if [ -d "$RUNS" ]; then
 	for rd in "$RUNS"/*/; do
 		[ -f "$rd/project" ] && [ -f "$rd/cgroup" ] || continue
 		cg=$(cat "$rd/cgroup" 2>/dev/null) || continue
 		[ -n "$cg" ] || continue
-		procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null || true)
+		procs=$(cg_procs "$cg")
 		[ -n "${procs//[[:space:]]/}" ] || continue
 		dir=$(cat "$rd/project" 2>/dev/null) || continue
 		hash=$(printf '%s' "$dir" | sha256sum | cut -c1-8)

@@ -39,7 +39,10 @@ fi
 # The agent owns the console while it runs. Done here rather than with a
 # Conflicts= in the unit, which systemd acts on when the job is queued and so
 # also fired on interactive runs, where this unit is skipped entirely.
-systemctl stop serial-getty@ttyS0.service 2>/dev/null || true
+# Whichever console the kernel was given: ttyS0 under firecracker and qemu,
+# hvc0 under Virtualization.framework.
+console=$(sed -n 's/.*console=\([^ ]*\).*/\1/p' /proc/cmdline)
+systemctl stop "serial-getty@${console:-ttyS0}.service" 2>/dev/null || true
 
 cd "$PROJECT" 2>/dev/null || cd "$RUN_HOME" || exit 1
 

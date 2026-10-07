@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# ss for macOS, the one question firecode asks of it: which TCP ports are
+# listening, and - with -p - by which pid. Answered from lsof, printed in the
+# shape `ss -ltn[p]` prints, so the callers' greps and seds match unchanged:
+#
+#   LISTEN 0 128 127.0.0.1:9770 0.0.0.0:* users:(("python3",pid=123,fd=3))
+procs=0
+for a in "$@"; do
+	[[ $a == -* && $a == *p* ]] && procs=1
+done
+echo "State  Recv-Q Send-Q Local-Address:Port Peer-Address:Port Process"
+lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v procs="$procs" 'NR > 1 {
+	addr = $9
+	sub(/^\*/, "0.0.0.0", addr)
+	line = "LISTEN 0 128 " addr " 0.0.0.0:*"
+	if (procs) line = line " users:((\"" $1 "\",pid=" $2 ",fd=" $4 "))"
+	if (!seen[line]++) print line
+}'

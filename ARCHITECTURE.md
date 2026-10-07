@@ -110,6 +110,43 @@ their VMs.
 What is *not* shared: checkpoints are firecracker's (a VFIO device cannot be
 saved), and hardware counters are qemu's (firecracker masks CPUID leaf 0xA).
 
+### The third: Virtualization.framework, on a Mac
+
+`--vmm vz`, and the only one there. `macos/firecode-vz.swift` is not a third
+dialect for this file to speak: it is firecracker's interface over Apple's
+framework - the same `vm-config.json`, the same API socket (pause, resume,
+snapshot create and load), the same vsock-behind-a-unix-socket with
+`CONNECT <port>` one way and `<uds_path>_<port>` the other. So relays, the
+exec channel, `cp`, the console and checkpoints are the Linux code, unchanged.
+
+What the framework does differently, and where that is absorbed:
+
+- **A guest reset boots the machine again** rather than ending it. Every
+  firecode guest ends with `systemctl reboot`, so under vz `reboot.target` is
+  aliased to `poweroff.target` for the boot (`firecode.vmm=vz` on the kernel
+  line), and firecode-vz stops the machine if the initramfs's boot marker
+  appears a second time - a panic or `reboot -f` would otherwise rerun the
+  agent.
+- **No RTC.** firecode-vz appends `firecode.epoch=<now>` to the kernel line and
+  the initramfs sets the clock from it; a restored guest is told the time over
+  the exec channel.
+- **A restore must match the save exactly**, machine identifier and kernel
+  command line included, so both are fixed when the config is read and carried
+  in the snapshot.
+- **Guest-to-host vsock ports are registered, not discovered.** firecode-vz
+  watches the jail for `<uds_path>_<port>` sockets and listens on each.
+- **No cgroups.** `cg_*` keep the same tree as files under `.cgroup/`; a leaf's
+  `cgroup.procs` holds `pid start-time`, liveness checks both, and a kill takes
+  each recorded process's descendants too. The spawn server finds a caller with
+  `lsof` and walks up to the relay recorded in that tree. Invariants 1 to 3
+  hold; the mechanism is weaker than `cgroup.kill` against a process that
+  forks and detaches on purpose.
+- **Unix socket paths are capped at 104 bytes**, so the jail base is reached
+  through `/tmp/firecode-<uid>`, a symlink to `.jail/`.
+
+The guest image is the same build (`guest/build-rootfs.sh`), arm64, and
+autologins on whichever of `ttyS0` and `hvc0` it was given.
+
 ## The root is layers, not a copy
 
 Assembled by the initramfs from kernel arguments, overlayfs:

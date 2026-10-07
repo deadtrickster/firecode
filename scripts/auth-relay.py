@@ -27,6 +27,7 @@ opencode's config for xai - and give it no credentials at all.
 import argparse
 import ipaddress
 import json
+import subprocess
 import os
 import sys
 import threading
@@ -59,6 +60,18 @@ STRIP = {"authorization", "x-api-key", "host", "connection", "content-length",
          "upgrade", "cookie"}
 
 
+def keychain_credentials():
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=30, check=True).stdout
+        return json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def claude_token():
     """The host's token, read fresh per request.
 
@@ -69,7 +82,10 @@ def claude_token():
         with open(CREDS) as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return None, "no credentials on the host"
+        # Claude Code on a Mac keeps them in the login Keychain instead.
+        data = keychain_credentials()
+        if data is None:
+            return None, "no credentials on the host"
     oauth = data.get("claudeAiOauth") or {}
     token = oauth.get("accessToken")
     if not token:

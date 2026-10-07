@@ -21,7 +21,10 @@ GUESTDIR=${2:?}
 TOOLS=${3:-}
 TREE=/tmp/firecode-tree
 SUITE=${SUITE:-noble}
-MIRROR=${MIRROR:-http://archive.ubuntu.com/ubuntu}
+case $(dpkg --print-architecture) in
+amd64 | i386) MIRROR=${MIRROR:-http://archive.ubuntu.com/ubuntu} ;;
+*) MIRROR=${MIRROR:-http://ports.ubuntu.com/ubuntu-ports} ;;
+esac
 
 say() { echo "[build-rootfs] $*"; }
 
@@ -159,15 +162,19 @@ for u in firecode-mounts.service firecode-agent.service; do
 		"$TREE/etc/systemd/system/multi-user.target.wants/$u"
 done
 
-# The console: autologin on ttyS0, which is how an interactive session lands
-# in a shell rather than at a login prompt nobody can answer.
-sudo -n install -d "$TREE/etc/systemd/system/serial-getty@ttyS0.service.d"
-sudo -n tee "$TREE/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" \
-	>/dev/null <<-'EOF'
-		[Service]
-		ExecStart=
-		ExecStart=-/sbin/agetty -o '-p -- \\u' --autologin root --keep-baud 115200,38400,9600 ttyS0 vt220
-	EOF
+# The console: autologin, which is how an interactive session lands in a
+# shell rather than at a login prompt nobody can answer. ttyS0 under
+# firecracker and qemu, hvc0 under Apple's Virtualization.framework - the same
+# image boots on either.
+for tty in ttyS0 hvc0; do
+	sudo -n install -d "$TREE/etc/systemd/system/serial-getty@$tty.service.d"
+	sudo -n tee "$TREE/etc/systemd/system/serial-getty@$tty.service.d/autologin.conf" \
+		>/dev/null <<-EOF
+			[Service]
+			ExecStart=
+			ExecStart=-/sbin/agetty -o '-p -- \\\\u' --autologin root --keep-baud 115200,38400,9600 $tty vt220
+		EOF
+done
 
 say "the initramfs that assembles the layered root"
 INITRD=/tmp/firecode-initrd

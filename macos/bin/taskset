@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# taskset for macOS, which has no way to pin a thread to a core - only hints
+# the scheduler is free to ignore. Runs the command unpinned, and says so once,
+# rather than failing a run over a measurement nicety.
+[[ ${1:-} == -c ]] && shift 2
+[[ ${1:-} =~ ^[0-9a-fx,-]+$ ]] && shift
+echo "[firecode] macOS cannot pin to cores - running unpinned" >&2
+exec "$@"

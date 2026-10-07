@@ -636,6 +636,9 @@ test_concurrent_runs() {
 	# Reported rather than silently passed: a check that skips without saying so
 	# is how a suite comes to mean nothing.
 	local free=0 tap slot lock
+	# A Mac has no taps to run out of: every VM is on vmnet's NAT, and a slot
+	# is a lock and a MAC.
+	[[ $(uname -s) == Darwin ]] && free=2
 	for tap in /sys/class/net/fccode*/carrier; do
 		[[ -r $tap ]] || continue
 		[[ $(cat "$tap" 2>/dev/null) == 0 ]] || continue
@@ -675,7 +678,12 @@ test_concurrent_runs() {
 	contains "the second one really ran" "B-DONE" "$(cat "$b")"
 
 	local taps
-	taps=$(grep -ho 'fccode[0-9]*' "$a" "$b" | sort -u | wc -l)
+	if [[ $(uname -s) == Darwin ]]; then
+		# No tap there; the slot is the MAC it gets.
+		taps=$(grep -ho 'mac 06:00:ac:10:[0-9a-f]*' "$a" "$b" | sort -u | wc -l)
+	else
+		taps=$(grep -ho 'fccode[0-9]*' "$a" "$b" | sort -u | wc -l)
+	fi
 	check "they used different tap devices" "2" "$taps"
 	contains "the second one is told its session is not resumable" \
 		"not be resumable" "$(cat "$b")"
@@ -1045,11 +1053,20 @@ vms_running() {
 	"$FIRECODE" list --ids 2>/dev/null | grep -c "$WORK" || true
 }
 
+# For wait_until, which runs its arguments again each time - so the count has
+# to be taken inside a function. `wait_until ... test "$(vms_running)" = 0`
+# expands the count once, at the call, and then re-tests that one number.
+no_vms_running() {
+	[[ $(vms_running) == 0 ]]
+}
+
 # Wait for a condition rather than sleeping a guessed amount.
 wait_until() {
 	local what=$1 secs=$2 waited=0
 	shift 2
-	while ((waited * 4 < secs * 4)); do
+	# Quarter-second steps, so secs * 4 of them. This compared waited * 4
+	# against it, which made every "45 seconds" about eleven.
+	while ((waited < secs * 4)); do
 		if "$@"; then return 0; fi
 		sleep 0.25
 		waited=$((waited + 1))
@@ -1076,7 +1093,7 @@ test_vm_stops_completely() {
 		"$(cd "$p" && "$FIRECODE" in 'echo alive' 2>/dev/null | tail -1)"
 
 	(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
-	if wait_until "gone" 30 test "$(vms_running)" = "0"; then
+	if wait_until "gone" 30 no_vms_running; then
 		ok "down leaves nothing running"
 	else
 		no "down leaves nothing running" "$("$FIRECODE" list 2>&1 | head -3)"
@@ -1120,11 +1137,11 @@ test_child_dies_with_parent() {
 	# The whole point: stopping the parent has to reach the child, which no
 	# process tree connects it to.
 	(cd "$parent" && "$FIRECODE" down --project "$parent" >/dev/null 2>&1)
-	if wait_until "child gone" 45 test "$(vms_running)" = "0"; then
+	if wait_until "child gone" 45 no_vms_running; then
 		ok "stopping the parent stops the child too"
 	else
 		no "stopping the parent stops the child too" \
-			"$("$FIRECODE" list 2>&1 | head -4)"
+			"still listed: $("$FIRECODE" list --ids 2>&1 | grep "$WORK")"
 		(cd "$child" && "$FIRECODE" down --project "$child" >/dev/null 2>&1)
 	fi
 }
@@ -1230,6 +1247,13 @@ test_add_dir_with_a_space() {
 # high-water mark until the VM stopped.
 test_freed_memory_returns_to_host() {
 	((QUICK)) && return 0
+	# Virtualization.framework has a balloon but no free page reporting, and
+	# the guest's memory lives in Apple's XPC service, not in a process this
+	# can name. A known limit there, said rather than failed.
+	if [[ $(uname -s) == Darwin ]]; then
+		ok "freed guest memory comes back (skipped: no free page reporting on macOS)"
+		return 0
+	fi
 	local p out="$WORK/balloon.log" pid run cg proc rss="" peak=0 i
 	p=$(make_project)
 	(cd "$p" && exec "$FIRECODE" exec --no-jail --no-net --mem 2048 -- bash -c \
@@ -1351,7 +1375,8 @@ test_killed_vm_is_reported_dead() {
 		return 0
 	fi
 	cg=$(cat "$ROOT/runs/$id/cgroup" 2>/dev/null)
-	pids=$(cat "$cg/vm/cgroup.procs" 2>/dev/null)
+	# The first column: on a Mac the file is firecode's own, "pid start-time".
+	pids=$(awk '{print $1}' "$cg/vm/cgroup.procs" 2>/dev/null)
 	if [[ -z $pids ]]; then
 		no "the VM this test started has a live process" "nothing in $cg/vm"
 		return 0
@@ -1359,7 +1384,7 @@ test_killed_vm_is_reported_dead() {
 	# shellcheck disable=SC2086  # a list of pids, deliberately word-split
 	kill -9 $pids 2>/dev/null || true
 
-	if wait_until "reported gone" 30 test "$(vms_running)" = "0"; then
+	if wait_until "reported gone" 30 no_vms_running; then
 		ok "a VM killed outright stops being listed"
 	else
 		no "a VM killed outright stops being listed" "$("$FIRECODE" list 2>&1 | head -3)"
@@ -1368,7 +1393,10 @@ test_killed_vm_is_reported_dead() {
 	# run's own. A cgroup that has been removed reads as empty, which is the
 	# answer we want anyway.
 	local left
-	left=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null | tr '\n' ' ')
+	# Live ones only. On Linux the kernel's file has nothing else in it; on
+	# a Mac firecode's keeps the dead too, so each is asked.
+	left=$(awk '{print $1}' "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null |
+		while read -r pid; do kill -0 "$pid" 2>/dev/null && echo "$pid"; done | tr '\n' ' ')
 	if [[ -z ${left// /} ]]; then
 		ok "and nothing of it is left running"
 	else
@@ -1383,7 +1411,15 @@ test_killed_vm_is_reported_dead() {
 # against. Both assert against numbers that cannot match by accident: a VM
 # booted with 1G against a host with rather more.
 
-host_memtotal() { awk '/MemTotal/{print $2}' /proc/meminfo; }
+# This machine's memory in kB, to tell the guest's figure from it. A Mac has
+# no /proc/meminfo; hw.memsize is the same fact.
+host_memtotal() {
+	if [[ $(uname -s) == Darwin ]]; then
+		echo $(($(sysctl -n hw.memsize) / 1024))
+	else
+		awk '/MemTotal/{print $2}' /proc/meminfo
+	fi
+}
 
 test_proc_mirror() {
 	((QUICK)) && return 0
