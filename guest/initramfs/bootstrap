@@ -1,0 +1,94 @@
+#!/bin/busybox sh
+# firecode bootstrap initramfs: build the first guest image with no image to
+# build it from, and no docker.
+#
+# `prepare --in-vm` builds an image inside a VM booted off the previous one.
+# The first image has no previous one, so this stands in for it: Ubuntu's
+# minimal base tarball is unpacked onto a scratch disk, given the few packages
+# build-rootfs.sh needs, and build-rootfs.sh is run in it as a chroot - the
+# same script, so the first image is what every later one is.
+#
+# Drives, by position:
+#   /dev/vda   scratch, ext4, empty - the builder's root and its /tmp
+#   /dev/vdb   blank, the image being written
+#   /dev/vdc   a plain tar: ubuntu-base.tar.gz, guest/, and tools (one line)
+#
+# The verdict is the last line on the console: BOOTSTRAP-OK or BOOTSTRAP-FAILED.
+set -u
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+say() { echo "[bootstrap] $*"; }
+
+# No RTC here: the clock is whatever the host said it was at boot.
+# shellcheck disable=SC2013  # /proc/cmdline is one line of words
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in firecode.epoch=*) date -s "@${arg#firecode.epoch=}" >/dev/null ;; esac
+done
+finish() {
+	sync
+	echo "BOOTSTRAP-$1"
+	poweroff -f
+}
+
+if [ -f /lib/modules/load ]; then
+	while read -r m; do insmod "/lib/modules/$m.ko"; done </lib/modules/load
+fi
+
+mkdir -p /work
+mount -t ext4 /dev/vda /work || { say "cannot mount the scratch disk"; finish FAILED; }
+mkdir -p /work/in /work/root
+tar -xf /dev/vdc -C /work/in || { say "cannot read the input drive"; finish FAILED; }
+
+say "network"
+cat >/bin/dhcp-script <<'EOF'
+#!/bin/sh
+case "$1" in
+bound | renew)
+	ip addr flush dev "$interface"
+	ip addr add "$ip/${mask:-24}" dev "$interface"
+	[ -n "$router" ] && ip route replace default via "${router%% *}" dev "$interface"
+	: >/etc/resolv.conf
+	for ns in ${dns:-1.1.1.1}; do echo "nameserver $ns" >>/etc/resolv.conf; done
+	;;
+esac
+EOF
+chmod +x /bin/dhcp-script
+mkdir -p /etc
+ip link set lo up
+ip link set eth0 up
+udhcpc -i eth0 -t 10 -T 1 -n -q -s /bin/dhcp-script || { say "no dhcp lease"; finish FAILED; }
+
+say "unpacking ubuntu-base"
+tar -xzf /work/in/ubuntu-base.tar.gz -C /work/root || finish FAILED
+rm -f /work/root/etc/resolv.conf
+cp /etc/resolv.conf /work/root/etc/resolv.conf
+mkdir -p /work/root/opt/guest
+cp -R /work/in/guest/. /work/root/opt/guest/
+
+mount -t proc proc /work/root/proc
+mount -t sysfs sys /work/root/sys
+mount -o bind /dev /work/root/dev
+mkdir -p /work/root/dev/pts
+mount -t devpts devpts /work/root/dev/pts
+
+say "the builder's own packages"
+chroot /work/root /bin/sh -c '
+	set -e
+	export DEBIAN_FRONTEND=noninteractive
+	apt-get update -qq
+	apt-get install -y -qq --no-install-recommends \
+		sudo mmdebstrap arch-test e2fsprogs ca-certificates curl gnupg >/dev/null
+' || { say "apt in the builder failed"; finish FAILED; }
+
+tools=$(cat /work/in/tools 2>/dev/null)
+say "build-rootfs.sh${tools:+ with $tools}"
+chroot /work/root /bin/bash /opt/guest/build-rootfs.sh /dev/vdb /opt/guest "$tools" ||
+	{ say "build-rootfs.sh failed"; finish FAILED; }
+
+finish OK

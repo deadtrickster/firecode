@@ -17,6 +17,39 @@ SELF=$(readlink -f "${BASH_SOURCE[0]}")
 # nothing now owns. Verifying a change to this file should not require editing
 # the one every agent is using.
 ROOT=${FIRECODE_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}
+
+# ON A MAC the VMM is firecode-vz (macos/), over Virtualization.framework, and
+# the rest of this file is the same program with GNU tools under it. It is
+# written against GNU coreutils, sed, find, awk and grep, and bash 5 - macOS
+# ships BSD tools and bash 3.2 - so Homebrew's go first on PATH, exported so
+# every script this runs gets them too. macos/bin holds the few commands that
+# have no macOS equivalent at all (setsid, ss, taskset), as shims.
+MACOS=0
+if [[ $(uname -s) == Darwin ]]; then
+	MACOS=1
+	if ((BASH_VERSINFO[0] < 5)); then
+		for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+			[[ -x $b ]] && exec "$b" "$SELF" "$@"
+		done
+		echo "[firecode] error: needs bash 5 - brew install bash" >&2
+		exit 1
+	fi
+	BREW=${HOMEBREW_PREFIX:-/opt/homebrew}
+	for d in "$BREW/opt/e2fsprogs/bin" "$BREW/opt/e2fsprogs/sbin" "$BREW/bin" \
+		"$BREW/opt/grep/libexec/gnubin" "$BREW/opt/gawk/libexec/gnubin" \
+		"$BREW/opt/findutils/libexec/gnubin" "$BREW/opt/gnu-sed/libexec/gnubin" \
+		"$BREW/opt/coreutils/libexec/gnubin" "$ROOT/macos/bin"; do
+		[[ -d $d ]] && PATH="$d:$PATH"
+	done
+	# A python with tarfile's data filter (3.12+, and 3.9.17+), which is what
+	# keeps an archive the guest wrote from writing outside its destination.
+	# Apple's /usr/bin/python3 is 3.9.6 and has none.
+	while IFS= read -r d; do
+		PATH="$d:$PATH"
+	done < <(printf '%s\n' "$BREW"/opt/python@3.*/libexec/bin | sort -t. -k2 -n)
+	export PATH
+fi
+
 IMAGES="$ROOT/images"
 # The image whose e2fsprogs does the ext4 conversion, as root inside a
 # container. Same trick prepare uses, and the reason none of this needs sudo.
@@ -45,6 +78,24 @@ PRIV_JAIL_BASE=""
 if ((EUID != 0)) && [[ -x $PRIV_LIBEXEC/jail && -r $PRIV_LIBEXEC/jail-base ]]; then
 	JAIL_WRAPPER=$PRIV_LIBEXEC/jail
 	PRIV_JAIL_BASE=$(<"$PRIV_LIBEXEC/jail-base")
+fi
+# A UNIX SOCKET PATH IS CAPPED AT 104 BYTES ON macOS, and a run's vsock
+# socket under the checkout is longer than that - python, curl and socat all
+# refuse it. So the jail base is reached through a short alias: a symlink in
+# /tmp, which is on the same volume, so drives still hardlink into it. Taken
+# only if it is ours and points here - /tmp is shared, and a link somebody
+# else planted would hand them the sockets.
+if ((MACOS)); then
+	short="/tmp/firecode-$(id -u)"
+	mkdir -p "$JAIL_BASE"
+	if [[ -L $short && -O $short && $(readlink "$short") == "$JAIL_BASE" ]]; then
+		JAIL_BASE=$short
+	elif [[ ! -e $short && ! -L $short ]] && ln -s "$JAIL_BASE" "$short" 2>/dev/null; then
+		JAIL_BASE=$short
+	else
+		echo "[firecode] warning: $short is not firecode's - vsock paths may be too long" >&2
+	fi
+	unset short
 fi
 USER_JAIL_BASE=$JAIL_BASE
 JAIL_FC=$FC
@@ -107,7 +158,14 @@ PARENT_RUN=""
 # Which hypervisor. firecracker for everything it can do - it starts in
 # milliseconds and restores a snapshot in sixty - and libvirt/qemu for the one
 # thing it cannot: there is no PCI bus in a firecracker VM, so no GPU either.
-VMM="${FIRECODE_VMM:-firecracker}"
+#
+# On a Mac there is only vz: firecode-vz, which speaks firecracker's config,
+# API and vsock protocol over Virtualization.framework.
+if ((MACOS)); then
+	VMM="${FIRECODE_VMM:-vz}"
+else
+	VMM="${FIRECODE_VMM:-firecracker}"
+fi
 VECTORIZED=0
 DELIVER=""
 # The command that decides whether the work is usable, run by the harness
@@ -185,6 +243,22 @@ SENSITIVE_HOME_DIRS=(
 	.config/BraveSoftware
 	.config/microsoft-edge
 	.config/vivaldi
+	# Where macOS keeps the same things: the keychains, and every browser's
+	# profile (cookies, saved passwords) under Application Support.
+	Library/Keychains
+	Library/Cookies
+	"Library/Application Support/Google/Chrome"
+	"Library/Application Support/Chromium"
+	"Library/Application Support/Firefox"
+	"Library/Application Support/BraveSoftware"
+	"Library/Application Support/Microsoft Edge"
+	"Library/Application Support/Vivaldi"
+	"Library/Application Support/Arc"
+	Library/Safari
+	"Library/Containers/com.apple.Safari"
+	"Library/Group Containers/group.com.apple.notes"
+	"Library/Messages"
+	"Library/Mail"
 )
 
 # Your own list, one path or glob per line, # for comments. For work that
@@ -326,7 +400,17 @@ INITRD=""
 WANT_KERNEL="${FIRECODE_KERNEL:-}"
 
 resolve_assets() {
-	[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firecode setup"
+	if [[ $VMM == vz ]]; then
+		FC="$VENDOR/firecode-vz"
+		JAIL_FC=$FC
+		[[ -x $FC ]] || die "firecode-vz not built - run: firecode setup"
+		# No jailer here, and none needed for the same job: the machine
+		# itself runs in Apple's own sandboxed XPC service, not in this
+		# process. The jail directory stays, as the VMM's working directory.
+		NOJAIL=1
+	else
+		[[ -x $FC && -x $JAILER ]] || die "firecracker not installed - run: firecode setup"
+	fi
 
 	local k
 	case "$WANT_KERNEL" in
@@ -334,12 +418,24 @@ resolve_assets() {
 		# Newest stock kernel. -debug ones are excluded rather than sorted
 		# around: "debug" sorts after any digit, so a plain glob would have
 		# silently made the traceable kernel the default for every run.
-		k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -not -name '*-debug' -type f |
-			sort -V | tail -1)
+		# An arm64 Image for vz, an x86 vmlinux for everything else; the
+		# two can share an images/ only by never picking up each other's.
+		if [[ $VMM == vz ]]; then
+			k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-arm64' -type f | sort -V | tail -1)
+		else
+			k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*' -not -name '*-debug' \
+				-not -name '*-arm64' -type f | sort -V | tail -1)
+		fi
 		[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
 		;;
 	debug)
-		k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-debug' -type f | sort -V | tail -1)
+		# Ubuntu's kernel, which is what vz boots, already has ftrace,
+		# kprobes, BPF and BTF.
+		[[ $VMM == vz ]] && {
+			k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-arm64' -type f | sort -V | tail -1)
+			[[ -n $k ]] || die "no guest kernel in $IMAGES - run: firecode setup"
+		}
+		[[ -n ${k:-} ]] || k=$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-debug' -type f | sort -V | tail -1)
 		[[ -n $k ]] || die "no debug kernel - run: firecode setup --debug-kernel"
 		;;
 	*)
@@ -685,15 +781,55 @@ size_for_dir() {
 	echo "$want"
 }
 
+# The host's Claude credentials, as the JSON a .credentials.json holds.
+#
+# Claude Code on a Mac keeps them in the login Keychain, not in a file, so
+# there is nothing under ~/.claude to copy. Reading the secret may make macOS
+# ask whether `security` may - "Always Allow" makes it stop asking.
+KEYCHAIN_SERVICE="Claude Code-credentials"
+host_claude_credentials() {
+	if [[ -f $CLAUDE_HOME/.credentials.json ]]; then
+		cat "$CLAUDE_HOME/.credentials.json"
+	elif ((MACOS)); then
+		security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null
+	else
+		return 1
+	fi
+}
+
+# When they last changed, without reading the secret - so noticing a rotation
+# does not ask for Keychain access on every run.
+host_claude_credentials_stamp() {
+	if [[ -f $CLAUDE_HOME/.credentials.json ]]; then
+		stat -Lc %Y "$CLAUDE_HOME/.credentials.json"
+	elif ((MACOS)); then
+		security find-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null |
+			sed -n 's/.*"mdat"<timedate>=[^"]*"\([0-9Z]*\).*/\1/p'
+	fi
+}
+
+# The binary the guest runs for an agent. The host's own on Linux; on a Mac,
+# a linux-arm64 build of the same version, fetched and cached.
+guest_agent_bin() {
+	local a=$1 bin
+	bin=$(command -v "$a" 2>/dev/null) || return 1
+	if ((MACOS)); then
+		"$SCRIPTS/guest-agent-bin.sh" "$a" "$bin"
+	else
+		echo "$bin"
+	fi
+}
+
 CFG_DRIVE="$IMAGES/agent-roconfig.ext4"
 CFG_STAMP="$IMAGES/.roconfig.stamp"
 
 config_fingerprint() {
 	local parts=() p bin
 	for p in "$CLAUDE_CONF" "$CLAUDE_HOME/settings.json" \
-		"$CLAUDE_HOME/settings.local.json" "$CLAUDE_HOME/.credentials.json"; do
+		"$CLAUDE_HOME/settings.local.json"; do
 		[[ -e $p ]] && parts+=("$p:$(stat -Lc %Y "$p" 2>/dev/null || echo 0)")
 	done
+	parts+=("credentials:$(host_claude_credentials_stamp 2>/dev/null || true)")
 	for p in claude opencode; do
 		bin=$(command -v "$p" 2>/dev/null || true)
 		[[ -n $bin ]] && parts+=("$p:$(stat -Lc '%Y:%s' "$bin" 2>/dev/null || echo 0)")
@@ -743,8 +879,10 @@ build_config_drive() {
 
 	local a bin
 	for a in claude opencode; do
-		bin=$(command -v "$a" 2>/dev/null || true)
-		if [[ -n $bin ]]; then
+		bin=$(guest_agent_bin "$a" 2>/dev/null || true)
+		if [[ -z $bin ]] && command -v "$a" >/dev/null 2>&1; then
+			log "  $a: no build for the guest, skipping"
+		elif [[ -n $bin ]]; then
 			cp -L "$bin" "$stage/bin/$a"
 			chmod +x "$stage/bin/$a"
 			log "  $a $(basename "$(readlink -f "$bin")")"
@@ -756,7 +894,16 @@ build_config_drive() {
 	# Only the parts of the host config that mean anything in a fresh VM. The
 	# rest is 1.6G of session history for projects that do not exist in there.
 	local item
-	for item in .credentials.json settings.json settings.local.json CLAUDE.md \
+	# Credentials by way of host_claude_credentials, which knows where this
+	# machine keeps them. 0600, as the client writes them.
+	if ((!AUTH_RELAY)); then
+		(
+			umask 077
+			host_claude_credentials >"$stage/claude/.credentials.json" 2>/dev/null
+		) || rm -f "$stage/claude/.credentials.json"
+		[[ -s $stage/claude/.credentials.json ]] || rm -f "$stage/claude/.credentials.json"
+	fi
+	for item in settings.json settings.local.json CLAUDE.md \
 		agents commands skills plugins output-styles; do
 		[[ -e $CLAUDE_HOME/$item ]] || continue
 		# With a relay in front, the guest authenticates through the host and
@@ -1201,6 +1348,17 @@ sys.exit(0 if reply.startswith(b"OK") else 1)
 ' "$addr" "$EXEC_PORT" 2>/dev/null
 }
 
+# Whether two paths name the same place. A run records its project as the
+# directory it was started in, and a caller names it however they reach it -
+# on a Mac /tmp and /var are links into /private, so the same project arrives
+# as /var/tmp/x from one side and /private/var/tmp/x from the other, and a
+# plain comparison made `down --project` stop nothing at all.
+same_path() {
+	[[ $1 == "$2" ]] && return 0
+	[[ -n $1 && -n $2 ]] || return 1
+	[[ $(realpath -m -- "$1" 2>/dev/null) == "$(realpath -m -- "$2" 2>/dev/null)" ]]
+}
+
 live_vm_socket() {
 	local want=${1:-}
 	local -a socks=() names=()
@@ -1227,7 +1385,7 @@ live_vm_socket() {
 		# a VM name, the run id, or the short form ps prints for a VM started
 		# before names existed. Anything displayed has to be usable, or the
 		# listing is telling you a name you cannot type.
-		if [[ -n $want && $proj != "$want" ]]; then
+		if [[ -n $want ]] && ! same_path "$proj" "$want"; then
 			local rid
 			rid=$(basename "${r%/}")
 			[[ $(cat "$r/name" 2>/dev/null) == "$want" || $rid == "$want" ||
@@ -1260,7 +1418,7 @@ live_vm_socket() {
 	if [[ -z $want ]] && ((${#socks[@]} > 1)); then
 		local i
 		for i in "${!socks[@]}"; do
-			[[ ${names[$i]} == "$PWD" ]] || continue
+			same_path "${names[$i]}" "$PWD" || continue
 			echo "${socks[$i]}"
 			return 0
 		done
@@ -1944,16 +2102,86 @@ link_unchanged() {
 # leaves a tree that is still identifiable and still killable.
 CG_DIR=""
 
+# ON A MAC THERE ARE NO CGROUPS, so the same tree is kept as plain files under
+# the checkout, with the same names, and these functions do by hand what the
+# kernel does on Linux. A leaf's cgroup.procs holds "pid start-time" lines -
+# the start time because a pid is reused and a run is not, and a recorded pid
+# that now names somebody else's process must not read as a live VM. What a
+# recorded process forked (socat's per-connection children) is found by
+# parentage when the tree is killed.
+#
+# Everything outside these functions asks cg_procs, cg_alive and cg_kill, and
+# never reads the files itself, so it is the same code on both.
 cg_root() {
+	if ((MACOS)); then
+		echo "$ROOT/.cgroup/firecode.slice"
+		return
+	fi
 	local uid
 	uid=$(id -u)
 	echo "/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/firecode.slice"
+}
+
+_cg_words() {
+	local -a w
+	read -ra w <<<"$1"
+	echo "${w[*]}"
+}
+
+# Live pids recorded in the given cgroup.procs files (macOS).
+_cg_live() {
+	local -A recorded=()
+	local pid start
+	while read -r pid start; do
+		[[ $pid =~ ^[0-9]+$ ]] && recorded[$pid]=$start
+	done < <(cat "$@" 2>/dev/null)
+	((${#recorded[@]})) || return 0
+	local pids
+	pids=$(
+		IFS=,
+		echo "${!recorded[*]}"
+	)
+	while read -r pid start; do
+		# The same ps produced both, but read keeps the inner spacing as it
+		# was, and the recorded line went through one more read - so compare
+		# word by word.
+		[[ -n $pid && $(_cg_words "${recorded[$pid]:-}") == "$(_cg_words "$start")" ]] && echo "$pid"
+	done < <(ps -o pid=,lstart= -p "$pids" 2>/dev/null)
+	return 0
+}
+
+# Everything a process forked, and what those forked, depth first (macOS).
+_cg_descendants() {
+	local p c
+	for p in "$@"; do
+		for c in $(pgrep -P "$p" 2>/dev/null); do
+			_cg_descendants "$c"
+			echo "$c"
+		done
+	done
+}
+
+# The processes in a cgroup and its immediate children - what every liveness
+# check here wants: a run directory's cgroup holds its processes one level
+# down, in vm/ and relays/.
+cg_procs() {
+	local cg=${1:-}
+	[[ -n $cg && -d $cg ]] || return 0
+	if ((MACOS)); then
+		_cg_live "$cg/cgroup.procs" "$cg"/*/cgroup.procs
+	else
+		cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null || true
+	fi
 }
 
 # systemd delegates this subtree to the user, so none of it needs root. Where
 # that is not true - no cgroup2, no delegation - everything still runs, and
 # lifetime falls back to what it was before: each VM tied to its launcher.
 cg_supported() {
+	if ((MACOS)); then
+		mkdir -p "$(cg_root)" 2>/dev/null
+		return
+	fi
 	[[ $(stat -fc %T /sys/fs/cgroup 2>/dev/null) == cgroup2fs ]] || return 1
 	local base
 	base=$(cg_root)
@@ -1978,12 +2206,23 @@ cg_make() {
 # the process lands in the cgroup before it is anything else.
 cg_join() {
 	[[ -n ${1:-} && -d $1 ]] || return 0
+	if ((MACOS)); then
+		echo "$BASHPID $(ps -o lstart= -p "$BASHPID")" >>"$1/cgroup.procs" 2>/dev/null || true
+		return 0
+	fi
 	echo "$BASHPID" >"$1/cgroup.procs" 2>/dev/null || true
 }
 
 # populated is recursive: it is 1 while anything in the subtree is alive.
 cg_alive() {
 	[[ -n ${1:-} && -d $1 ]] || return 1
+	if ((MACOS)); then
+		local -a procfiles
+		mapfile -t procfiles < <(find "$1" -name cgroup.procs 2>/dev/null)
+		((${#procfiles[@]})) || return 1
+		[[ -n $(_cg_live "${procfiles[@]}") ]]
+		return
+	fi
 	grep -qs '^populated 1' "$1/cgroup.events"
 }
 
@@ -1992,6 +2231,29 @@ cg_alive() {
 cg_kill() {
 	local dir=${1:-}
 	[[ -n $dir && -d $dir ]] || return 0
+	if ((MACOS)); then
+		local -a procfiles victims
+		mapfile -t procfiles < <(find "$dir" -name cgroup.procs 2>/dev/null)
+		if ((${#procfiles[@]})); then
+			mapfile -t victims < <(_cg_live "${procfiles[@]}")
+			if ((${#victims[@]})); then
+				# Children before parents, so nothing is reparented to launchd
+				# between being listed and being killed.
+				mapfile -t victims < <(
+					_cg_descendants "${victims[@]}"
+					printf '%s\n' "${victims[@]}"
+				)
+				kill -KILL "${victims[@]}" 2>/dev/null || true
+			fi
+		fi
+		local waited=0
+		while cg_alive "$dir" && ((waited < 50)); do
+			sleep 0.1
+			waited=$((waited + 1))
+		done
+		rm -rf "$dir"
+		return 0
+	fi
 	echo 1 >"$dir/cgroup.kill" 2>/dev/null || true
 	# A cgroup cannot be removed while it holds processes, and the kill is
 	# not instant, so give it a moment before tidying up.
@@ -2152,17 +2414,35 @@ memcheck_load() {
 	fc_api "$sock" PUT /snapshot/load \
 		'{"snapshot_path":"vmstate","mem_backend":{"backend_path":"mem","backend_type":"File"},"resume_vm":true}' || return 1
 	log "guest resumed in $(((${EPOCHREALTIME/[.,]/} - t0) / 1000))ms"
+	# A restored guest's clock is the checkpoint's. Without an RTC (vz) it
+	# has nothing to correct it by, and TLS, make and git all care - so it is
+	# told the time, once it answers. In the background: the restore is done.
+	if [[ $VMM == vz ]]; then
+		local vsock
+		vsock="$(dirname "$sock")/firecracker-vsock.sock"
+		(
+			local try
+			for try in $(seq 50); do
+				python3 "$SCRIPTS/vsock-exec.py" "$vsock" "$EXEC_PORT" - \
+					"sudo -n date -s @$(date +%s) >/dev/null" >/dev/null 2>&1 && exit 0
+				sleep 0.1
+			done
+		) &
+	fi
 }
 
 fc_api() {
 	local sock=$1 method=$2 path=$3 body=$4 out
-	out=$(curl -s -f --unix-socket "$sock" -X "$method" \
+	# Not -f: that throws away the body, and the body is the VMM saying why.
+	out=$(curl -s -w '\n%{http_code}' --unix-socket "$sock" -X "$method" \
 		-H 'Content-Type: application/json' \
 		-d "$body" "http://localhost$path" 2>&1) || {
-		log "firecracker refused $method $path: $out"
+		log "could not reach the VMM for $method $path: $out"
 		return 1
 	}
-	return 0
+	[[ ${out##*$'\n'} == 2?? ]] && return 0
+	log "the VMM refused $method $path: ${out%$'\n'*}"
+	return 1
 }
 
 # A VM that stays up. The point is a warm machine an agent can keep hitting -
@@ -2362,6 +2642,11 @@ cmd_grow() {
 	done
 	[[ -n $size ]] || die "usage: firecode grow [--drive upper|state|src] SIZE   (e.g. 64G, or +32G)"
 
+	# Before anything is touched: growing the file first and then being refused
+	# leaves an image bigger than the filesystem in it.
+	[[ $VMM == vz ]] &&
+		die "grow: Virtualization.framework cannot resize a drive under a running guest.
+       This VM keeps its size; nothing has been changed."
 	local sock jail
 	sock=$(require_vm_socket "$want")
 	jail=$(dirname "$sock")
@@ -2663,7 +2948,9 @@ cmd_prepare_in_vm() {
 		die "the image the guest wrote has no /sbin/init - refusing to install it
        over the working one. It is at $out if you want to look."
 
-	if [[ -s $work/.initrd.b64 ]]; then
+	# Not on a Mac: the initramfs there is built on the host by setup, around
+	# the modules Ubuntu's kernel needs, and the guest's would not have them.
+	if [[ -s $work/.initrd.b64 ]] && ((!MACOS)); then
 		base64 -d <"$work/.initrd.b64" >"$IMAGES/initrd.gz.next" &&
 			mv -f "$IMAGES/initrd.gz.next" "$INITRD"
 		log "initrd updated"
@@ -2674,6 +2961,60 @@ cmd_prepare_in_vm() {
 	((keep)) || rm -rf "$work"
 	log "rootfs built in a VM: $(du -h "$ROOTFS" | cut -f1)"
 	log "  the one it replaced is at $(basename "$ROOTFS").previous"
+}
+
+# prepare, on a Mac. There is no docker path: the first image is built by a
+# bootstrap VM from Ubuntu's minimal base (scripts/bootstrap-rootfs.sh), and
+# every later one in a VM booted off the previous image, as --in-vm does on
+# Linux. Both run guest/build-rootfs.sh, so the two produce the same thing.
+cmd_prepare_macos() {
+	local size=${FIRECODE_ROOTFS_SIZE:-6G} force=0 have_tools=0 tools=""
+	local tools_file="$IMAGES/.tools"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--in-vm) shift ;; # the only way here
+		--with)
+			tools="$2"
+			have_tools=1
+			shift 2
+			;;
+		--size)
+			size="$2"
+			shift 2
+			;;
+		-f | --force)
+			force=1
+			shift
+			;;
+		--full)
+			log "--full is the docker build's; on macOS name the tools: --with 'rust go zig'"
+			shift
+			;;
+		--no-cache) shift ;;
+		*) die "usage: firecode prepare [--with 'dotnet@10 uv'] [--size 6G] [--force]" ;;
+		esac
+	done
+	((have_tools)) || tools=$(cat "$tools_file" 2>/dev/null || true)
+	mkdir -p "$IMAGES"
+	printf '%s' "$tools" >"$tools_file"
+
+	local rootfs="$IMAGES/agent-firecode.ext4"
+	if [[ ! -f $rootfs ]]; then
+		log "no guest image yet - building the first one in a bootstrap VM"
+		"$SCRIPTS/bootstrap-rootfs.sh" "$rootfs" "$size" "$tools" ||
+			die "the bootstrap failed"
+		return 0
+	fi
+	if ((!force && !have_tools)); then
+		log "there is a guest image already: $rootfs"
+		log "  --force rebuilds it (in a VM booted off this one), --with changes its tools"
+		return 0
+	fi
+	if [[ -n $tools ]]; then
+		cmd_prepare_in_vm --size "$size" --with "$tools"
+	else
+		cmd_prepare_in_vm --size "$size"
+	fi
 }
 
 # The room.
@@ -2770,6 +3111,36 @@ cmd_chat() {
 		# thing a shared room must not be is as short-lived as its most
 		# talkative member. A user unit outlives sessions, reboots and the
 		# person who set it up, and needs no root.
+		# On a Mac the thing that outlives sessions and reboots is launchd: a
+		# LaunchAgent, loaded at login, restarted if it exits.
+		if ((MACOS)); then
+			local plist="$HOME/Library/LaunchAgents/com.firecode.chat.plist"
+			mkdir -p "$(dirname "$plist")" "$RUNS"
+			cat >"$plist" <<-EOF
+				<?xml version="1.0" encoding="UTF-8"?>
+				<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+				<plist version="1.0">
+				<dict>
+					<key>Label</key><string>com.firecode.chat</string>
+					<key>ProgramArguments</key>
+					<array>
+						<string>$(command -v python3)</string>
+						<string>$SCRIPTS/chat.py</string>
+						<string>--port</string><string>$port</string>
+						<string>--log</string><string>$RUNS/chat.log</string>
+					</array>
+					<key>RunAtLoad</key><true/>
+					<key>KeepAlive</key><true/>
+					<key>StandardErrorPath</key><string>$RUNS/chat.err</string>
+				</dict>
+				</plist>
+			EOF
+			launchctl bootout "gui/$(id -u)/com.firecode.chat" 2>/dev/null || true
+			launchctl bootstrap "gui/$(id -u)" "$plist" ||
+				die "launchd would not load $plist"
+			log "chat runs as a LaunchAgent now: launchctl print gui/$(id -u)/com.firecode.chat"
+			return 0
+		fi
 		local unit_dir="$HOME/.config/systemd/user"
 		mkdir -p "$unit_dir" "$RUNS"
 		cat >"$unit_dir/firecode-chat.service" <<-EOF
@@ -3453,6 +3824,19 @@ cmd_state() {
 
 NET_SLOT=""
 TAP_DEV=""
+VZ_MAC=""
+
+# The address vmnet's DHCP server gave a MAC, from its lease file. It writes
+# the MAC without leading zeros (6:0:ac:10:1:2), so compare it that way.
+vz_guest_ip() {
+	local mac=$1 want
+	want=$(awk -F: '{for (i = 1; i <= NF; i++) printf "%s%x", (i > 1 ? ":" : ""), strtonum("0x" $i)}' <<<"$mac")
+	awk -v want="1,$want" '
+		/ip_address=/ { ip = substr($0, index($0, "=") + 1) }
+		/hw_address=/ { if (substr($0, index($0, "=") + 1) == want) found = ip }
+		END { if (found) print found }
+	' /var/db/dhcpd_leases 2>/dev/null
+}
 NET_ADOPTED=0
 NET_FD=""
 
@@ -3496,7 +3880,9 @@ alloc_net_slot() {
 	local preferred=1
 	local -a ready=()
 	for ((s = 1; s <= 250; s++)); do
-		[[ -e /sys/class/net/fccode$s ]] && ready+=("$s")
+		# vz has no taps: a slot is only a lock and a MAC, so every one is
+		# ready.
+		[[ $VMM == vz || -e /sys/class/net/fccode$s ]] && ready+=("$s")
 	done
 	if [[ -n ${SLUG:-} && ${#ready[@]} -gt 0 ]]; then
 		local h
@@ -3590,6 +3976,16 @@ net_create_tap() {
 
 net_up() {
 	alloc_net_slot || die "no free network slot (250 VMs already running?)"
+
+	# Under Virtualization.framework the link is vmnet's NAT: no tap, no
+	# iptables, no root. The slot still matters - it is the MAC, and vmnet's
+	# DHCP server hands a MAC the same address it had last time - so a
+	# project keeps its guest address the way it does on Linux.
+	if [[ $VMM == vz ]]; then
+		VZ_MAC=$(printf '06:00:ac:10:%02x:02' "$NET_SLOT")
+		log "network: vmnet NAT, guest address by dhcp (mac $VZ_MAC)"
+		return 0
+	fi
 	TAP_DEV="fccode$NET_SLOT"
 
 	if ip link show "$TAP_DEV" >/dev/null 2>&1; then
@@ -3604,8 +4000,8 @@ net_up() {
 }
 
 net_down() {
-	[[ -n $TAP_DEV ]] || return 0
-	if ((NET_ADOPTED == 0)); then
+	[[ -n $TAP_DEV || -n $NET_FD ]] || return 0
+	if [[ -n $TAP_DEV ]] && ((NET_ADOPTED == 0)); then
 		priv iptables -t nat -D POSTROUTING -s "172.16.$NET_SLOT.0/30" \
 			! -o "$TAP_DEV" -j MASQUERADE 2>/dev/null || true
 		priv iptables -D FORWARD -i "$TAP_DEV" -j ACCEPT 2>/dev/null || true
@@ -3620,6 +4016,10 @@ net_down() {
 # Pre-create taps so ordinary runs need no privileges for networking. One
 # sudo now instead of one per run.
 cmd_net_setup() {
+	((MACOS)) && {
+		log "nothing to set up on macOS: guests use vmnet's NAT, which needs no taps and no root"
+		return 0
+	}
 	local count=4 s dev
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
@@ -3737,7 +4137,20 @@ massage_args() {
 	done
 
 	if [[ $agent == claude ]]; then
-		((has_print)) || out+=(-p)
+		# -p goes IMMEDIATELY BEFORE THE TASK, not first. The entrypoint
+		# moves "the argument after -p" onto stdin as the first turn, and
+		# with -p first that argument was --dangerously-skip-permissions:
+		# every auto-flagged run was told the flag was its task, and the
+		# task itself went nowhere.
+		if ((!has_print)); then
+			local at
+			at=$(prompt_index ${in+"${in[@]}"})
+			if [[ -n $at ]]; then
+				in=("${in[@]:0:at}" -p "${in[@]:at}")
+			else
+				out+=(-p)
+			fi
+		fi
 		# The whole point of the VM is that the agent does not need to ask.
 		((has_perm)) || out+=(--dangerously-skip-permissions)
 
@@ -3802,6 +4215,12 @@ print(g.get("n_ctx") or d.get("n_ctx") or "")' 2>/dev/null || true)}
 # and treating it as a task produced `claude -p --resume <id>` with nothing to
 # respond to - which fails on its first line.
 has_prompt() {
+	[[ -n $(prompt_index "$@") ]]
+}
+
+# Where the task is in an agent's arguments, as an index; nothing if there is
+# none. A flag's value is not a task, whatever it looks like.
+prompt_index() {
 	local -a in=("$@")
 	local i skip=0
 
@@ -3819,10 +4238,13 @@ has_prompt() {
 			skip=1
 			;;
 		-*) ;;
-		*) return 0 ;;
+		*)
+			echo "$i"
+			return 0
+			;;
 		esac
 	done
-	return 1
+	return 0
 }
 
 # ---------------------------------------------------------------- launch
@@ -4017,13 +4439,19 @@ launch() {
 			;;
 		--vmm)
 			VMM="$2"
-			[[ $VMM == firecracker || $VMM == libvirt ]] ||
-				die "--vmm takes firecracker or libvirt"
+			if ((MACOS)); then
+				[[ $VMM == vz ]] ||
+					die "--vmm: on macOS there is only vz (Virtualization.framework) - no KVM, so no firecracker or libvirt"
+			else
+				[[ $VMM == firecracker || $VMM == libvirt ]] ||
+					die "--vmm takes firecracker or libvirt"
+			fi
 			shift 2
 			;;
 		--gpu)
 			# A PCI address, or "auto" for the discrete card. Implies libvirt:
 			# firecracker has no PCI bus to put it on.
+			((MACOS)) && die "--gpu: Virtualization.framework cannot pass a device through to a guest"
 			GPU_PCI="$2"
 			[[ $GPU_PCI == auto ]] && GPU_PCI=$(gpu_auto)
 			[[ -n $GPU_PCI ]] || die "--gpu auto found no discrete GPU"
@@ -4724,7 +5152,9 @@ launch() {
 		# a repo-local identity wins the same way it would on the host.
 		env_line FIRECODE_GIT_NAME "$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)"
 		env_line FIRECODE_GIT_EMAIL "$(git -C "$WORKDIR" config --get user.email 2>/dev/null || true)"
-		if [[ $NONET -eq 0 ]]; then
+		if [[ $NONET -eq 0 && $VMM == vz ]]; then
+			env_line FIRECODE_GUEST_IP dhcp
+		elif [[ $NONET -eq 0 ]]; then
 			env_line FIRECODE_GUEST_IP "172.16.SLOT.2/30"
 			env_line FIRECODE_GATEWAY "172.16.SLOT.1"
 			env_line FIRECODE_DNS "1.1.1.1 8.8.8.8"
@@ -4865,7 +5295,7 @@ launch() {
 			# worktree run exited 2 before booting, and the safety check was
 			# the thing breaking runs. A liveness probe must never be able to
 			# fail louder than what it protects.
-			owner=$(cat "$cgp/cgroup.procs" "$cgp"/*/cgroup.procs 2>/dev/null || true)
+			owner=$(cg_procs "$cgp")
 			[[ -n ${owner//[[:space:]]/} ]] && busy=1 && break
 		done
 		local main_copy=0 main_source=$main_layer
@@ -5109,7 +5539,9 @@ launch() {
 	done
 
 	local net_ifaces="[]"
-	if [[ -n $TAP_DEV ]]; then
+	if [[ -n $VZ_MAC ]]; then
+		net_ifaces="[{\"iface_id\":\"eth0\",\"guest_mac\":\"$VZ_MAC\",\"host_dev_name\":\"vmnet\"}]"
+	elif [[ -n $TAP_DEV ]]; then
 		local mac
 		mac=$(printf '06:00:ac:10:%02x:02' "$NET_SLOT")
 		net_ifaces="[{\"iface_id\":\"eth0\",\"guest_mac\":\"$mac\",\"host_dev_name\":\"$TAP_DEV\"}]"
@@ -5222,7 +5654,11 @@ launch() {
 		# under a load average of 9. The minimum of several runs is the number
 		# to keep, because interference only ever adds time.
 		local load
-		load=$(cut -d' ' -f1 /proc/loadavg)
+		if ((MACOS)); then
+			load=$(sysctl -n vm.loadavg | awk '{print $2}')
+		else
+			load=$(cut -d' ' -f1 /proc/loadavg)
+		fi
 		if awk -v l="$load" 'BEGIN{exit !(l > 2)}'; then
 			log "host load is $load - timings will be noisy; take the minimum of several runs"
 		fi
@@ -5239,6 +5675,11 @@ launch() {
 	# up unable to see its own root disk. Same kernel, opposite argument.
 	local boot_args="console=ttyS0 reboot=k panic=1"
 	[[ $VMM == firecracker ]] && boot_args="$boot_args pci=off"
+	# Virtualization.framework: the console is virtio, so hvc0, and there is
+	# no i8042 for reboot=k to go through - an arm64 guest resets by PSCI,
+	# which the framework reports as the guest stopping. Its NIC is PCI, so
+	# classic names, as under qemu.
+	[[ $VMM == vz ]] && boot_args="console=hvc0 panic=1 net.ifnames=0 firecode.vmm=vz"
 	# Under QEMU the NIC is a PCI device and systemd names it enp0sN, and the
 	# guest configures eth0 - so a libvirt VM came up with no network at all
 	# ("no eth0") while its tap waited on the host. Classic names back.
@@ -5318,6 +5759,17 @@ EOF
 	if [[ -n $TAP_DEV ]]; then
 		log "guest is 172.16.$NET_SLOT.2 - a server it starts on PORT is at"
 		log "  http://172.16.$NET_SLOT.2:PORT"
+	elif [[ -n $VZ_MAC ]]; then
+		# Not known until the guest has asked for it, so said once it has.
+		# Usually the address it had last time, which is printed now.
+		local known
+		known=$(vz_guest_ip "$VZ_MAC")
+		if [[ -n $known ]]; then
+			log "guest is $known (its last lease) - a server it starts on PORT is at"
+			log "  http://$known:PORT"
+		else
+			log "guest address comes by dhcp - firecode info prints it once it is up"
+		fi
 	fi
 
 	local -a jargs=(
@@ -5395,7 +5847,10 @@ EOF
 			echo "${pin_cpus[*]}"
 		)")
 		if ((NOJAIL)); then
-			log "WARNING: --no-jail, the VMM runs unconfined on the host"
+			# vz has no jailer, but the machine runs inside Apple's sandboxed
+			# Virtualization XPC service, not in firecode-vz itself.
+			[[ $VMM == vz ]] ||
+				log "WARNING: --no-jail, the VMM runs unconfined on the host"
 			if ((restoring)); then
 				cmd=(${pin_prefix+"${pin_prefix[@]}"} "$FC" --api-sock firecracker.socket)
 			else
@@ -5867,7 +6322,7 @@ PY
 cmd_ps_json() {
 	local want=$1 id proj parent vmname backend quiet rows=()
 	while IFS=$'\t' read -r id proj parent vmname; do
-		[[ -n $want && $proj != "$want" && $vmname != "$want" ]] && continue
+		[[ -n $want && $vmname != "$want" ]] && ! same_path "$proj" "$want" && continue
 		backend="firecracker"
 		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
 		quiet=""
@@ -5930,7 +6385,7 @@ cmd_ps() {
 
 	local vmname
 	while IFS=$'\t' read -r id proj parent vmname; do
-		[[ -n $want && $proj != "$want" && $vmname != "$want" ]] && continue
+		[[ -n $want && $vmname != "$want" ]] && ! same_path "$proj" "$want" && continue
 		any=1
 		addr=$(cat "$RUNS/$id/vsock" 2>/dev/null)
 		local backend="firecracker"
@@ -6046,7 +6501,7 @@ cmd_logs() {
 	for d in "$RUNS"/*/; do
 		[[ -f $d/console.log ]] || continue
 		proj=$(cat "$d/project" 2>/dev/null)
-		if [[ -n $want && $proj != "$want" ]]; then
+		if [[ -n $want ]] && ! same_path "$proj" "$want"; then
 			[[ $(cat "$d/name" 2>/dev/null) == "$want" ]] || continue
 		fi
 		t=$(stat -c %Y "$d/console.log" 2>/dev/null || echo 0)
@@ -6200,7 +6655,16 @@ sweep_results() {
 		read -r -a roots <<<"$FIRECODE_RESULT_ROOTS"
 	else
 		roots=(/tmp "$HOME/Projects")
+		# Where macOS puts mktemp -d, which is where a scratch project goes.
+		((MACOS)) && [[ -n ${TMPDIR:-} ]] && roots+=("${TMPDIR%/}")
 	fi
+	# Resolved: /tmp is a symlink on a Mac, and find does not follow a
+	# starting point that is one - so it looked at nothing and said so by
+	# removing nothing.
+	local i
+	for i in "${!roots[@]}"; do
+		roots[i]=$(readlink -f "${roots[i]}" 2>/dev/null || echo "${roots[i]}")
+	done
 
 	while IFS= read -r dir; do
 		name=$(basename "$dir")
@@ -6225,7 +6689,7 @@ sweep_results() {
 		if [[ -d $rundir ]]; then
 			rcg=$(cat "$rundir/cgroup" 2>/dev/null || true)
 			if [[ -n $rcg ]]; then
-				rprocs=$(cat "$rcg/cgroup.procs" "$rcg"/*/cgroup.procs 2>/dev/null || true)
+				rprocs=$(cg_procs "$rcg")
 				# Still running: leave it entirely alone, whatever its age.
 				[[ -n ${rprocs//[[:space:]]/} ]] && continue
 			fi
@@ -6275,12 +6739,7 @@ sweep_results() {
 			grep -cv 'web/node_modules' || true)
 		((dirty == 0)) || continue
 
-		held=0
-		for proc in /proc/[0-9]*; do
-			target=$(readlink "$proc/cwd" 2>/dev/null) || continue
-			[[ $target == "$dir" || $target == "$dir"/* ]] && held=1 && break
-		done
-		((held)) && continue
+		dir_in_use "$dir" && continue
 
 		rm -rf "$dir" 2>/dev/null && swept=$((swept + 1))
 		# Every candidate is considered; the run-finished test above decides.
@@ -6369,7 +6828,7 @@ sweep_scratch() {
 		[[ -f $rd/project && -f $rd/cgroup ]] || continue
 		cg=$(cat "$rd/cgroup" 2>/dev/null) || continue
 		[[ -n $cg ]] || continue
-		procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null || true)
+		procs=$(cg_procs "$cg")
 		[[ -n ${procs//[[:space:]]/} ]] || continue
 		project=$(cat "$rd/project" 2>/dev/null) || continue
 		busy_projects+=("$project")
@@ -6386,14 +6845,7 @@ sweep_scratch() {
 		((held)) && continue
 		# Open by anything at all - cwd or descriptor. A directory listing
 		# cannot see this and that is the whole lesson of tonight.
-		for proc in /proc/[0-9]*; do
-			target=$(readlink "$proc/cwd" 2>/dev/null) || continue
-			[[ $target == "$dir" || $target == "$dir"/* ]] && held=1 && break
-		done
-		((held)) && continue
-		if grep -qs -- "$dir" /proc/[0-9]*/maps 2>/dev/null; then
-			continue
-		fi
+		dir_in_use "$dir" && continue
 		# AGE IS THE NEWEST THING IN THE TREE, not the directory's own mtime.
 		# That changes only when a top-level entry is added or removed - a
 		# commit, an edit in src/, a whole day of work changes nothing it
@@ -6420,6 +6872,47 @@ sweep_scratch() {
 		log "  df -i $root, and lower FIRECODE_SCRATCH_DAYS (now $days) to reclaim more."
 	fi
 	return 0
+}
+
+# Is anything using this directory - a working directory in it, or a file in
+# it mapped? A listing cannot tell; only the process table can.
+dir_in_use() {
+	local dir=$1 target proc
+	if ((MACOS)); then
+		# cwd and txt (mapped files) of every process, by name.
+		while IFS= read -r target; do
+			[[ $target == "$dir" || $target == "$dir"/* ]] && return 0
+		done < <(lsof -nP -d cwd,txt -Fn 2>/dev/null | sed -n 's/^n//p')
+		return 1
+	fi
+	for proc in /proc/[0-9]*; do
+		target=$(readlink "$proc/cwd" 2>/dev/null) || continue
+		[[ $target == "$dir" || $target == "$dir"/* ]] && return 0
+	done
+	grep -qs -- "$dir" /proc/[0-9]*/maps 2>/dev/null
+}
+
+# socat processes that have been orphaned, as "pid cwd": a relay by its own
+# name (not a command line somebody could match by accident), reparented to
+# init - or to the user manager that adopts what init would, or launchd.
+socat_orphans() {
+	local proc pid ppid comm cwd
+	if ((MACOS)); then
+		while read -r pid ppid comm; do
+			[[ ${comm##*/} == socat && $ppid == 1 ]] || continue
+			cwd=$(lsof -nP -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+			[[ -n $cwd ]] && echo "$pid $cwd"
+		done < <(ps -axo pid=,ppid=,comm=)
+		return 0
+	fi
+	for proc in /proc/[0-9]*; do
+		comm=$(cat "$proc/comm" 2>/dev/null) || continue
+		[[ $comm == socat ]] || continue
+		cwd=$(readlink "$proc/cwd" 2>/dev/null) || continue
+		ppid=$(awk '{print $4}' "$proc/stat" 2>/dev/null || echo 0)
+		((ppid == 1)) || [[ $(cat "/proc/$ppid/comm" 2>/dev/null) == systemd ]] || continue
+		echo "${proc#/proc/} $cwd"
+	done
 }
 
 cmd_gc() {
@@ -6467,7 +6960,7 @@ cmd_gc() {
 		# has been reaping nothing at all: 92 run directories had accumulated
 		# and every "gc clears them" this file prints was a promise it did not
 		# keep. A guard that cannot fail loudly fails quietly instead.
-		[[ -n $cg ]] && procs=$(cat "$cg/cgroup.procs" "$cg"/*/cgroup.procs 2>/dev/null || true)
+		[[ -n $cg ]] && procs=$(cg_procs "$cg")
 		if [[ -n ${procs//[[:space:]]/} ]]; then
 			# NOTHING AT ALL, not even the drives. The first version of this
 			# guard kept the directory and still removed *.ext4, which is the
@@ -6524,7 +7017,7 @@ cmd_gc() {
 			local ocg oprocs
 			ocg=$(cat "$owner_run/cgroup" 2>/dev/null) || continue
 			[[ -n $ocg ]] || continue
-			oprocs=$(cat "$ocg/cgroup.procs" "$ocg"/*/cgroup.procs 2>/dev/null || true)
+			oprocs=$(cg_procs "$ocg")
 			[[ -n ${oprocs//[[:space:]]/} ]] && live=1 && break
 		done
 		((live)) && continue
@@ -6562,21 +7055,15 @@ cmd_gc() {
 	# command line somebody could match by accident), its jail is gone, AND it
 	# has been reparented away - a process still owned by a running firecode is
 	# part of a run in progress, whatever its cwd says.
-	local reaped=0 proc pid cwd comm ppid
-	for proc in /proc/[0-9]*; do
-		comm=$(cat "$proc/comm" 2>/dev/null) || continue
-		[[ $comm == socat ]] || continue
-		cwd=$(readlink "$proc/cwd" 2>/dev/null) || continue
+	local reaped=0 pid cwd
+	while read -r pid cwd; do
 		[[ $cwd == "$USER_JAIL_BASE"/firecracker/* ||
+			$cwd == "$(readlink -f "$USER_JAIL_BASE")"/firecracker/* ||
 			(-n $PRIV_JAIL_BASE && $cwd == "$PRIV_JAIL_BASE"/firecracker/*) ]] || continue
 		cwd=${cwd% (deleted)}
 		[[ -d $cwd ]] && continue
-		ppid=$(awk '{print $4}' "$proc/stat" 2>/dev/null || echo 0)
-		# Orphaned: init, or the user manager that adopts what init would.
-		((ppid == 1)) || [[ $(cat "/proc/$ppid/comm" 2>/dev/null) == systemd ]] || continue
-		pid=${proc#/proc/}
 		kill "$pid" 2>/dev/null && reaped=$((reaped + 1))
-	done
+	done < <(socat_orphans)
 	((reaped > 0)) && log "reaped $reaped process(es) left behind by a dead run, freeing their network slots"
 
 	sweep_scratch
@@ -6632,9 +7119,61 @@ doc_check() {
 
 doc_info() { printf '  --    %-38s %s\n' "$1" "$2"; }
 
-cmd_doctor() {
-	echo "firecode doctor"
+# The host half of doctor on a Mac, where none of KVM, taps, iptables, the
+# jailer or cgroups exist, and what stands in for them is checked instead.
+doctor_host_macos() {
+	echo " virtualisation"
+	doc_check fail "Apple silicon" "test \"\$(uname -m)\" = arm64" "$(sysctl -n machdep.cpu.brand_string 2>/dev/null)" \
+		"an Intel Mac cannot run arm64 guests, and these are arm64"
+	doc_check fail "macOS 14 or later" "test \"\$(sw_vers -productVersion | cut -d. -f1)\" -ge 14" \
+		"$(sw_vers -productVersion 2>/dev/null)" "checkpoints (save/restore) need macOS 14"
+	doc_check fail "Virtualization.framework" "test \"\$(sysctl -n kern.hv_support)\" = 1" "" \
+		"this Mac reports no hypervisor support"
+
 	echo
+	echo " firecode's own pieces"
+	doc_check fail "firecode-vz" "test -x '$VENDOR/firecode-vz'" \
+		"$(codesign -d --entitlements - "$VENDOR/firecode-vz" 2>/dev/null | grep -q virtualization &&
+			echo "signed with the virtualization entitlement")" \
+		"firecode setup   # builds it from macos/ with swiftc"
+	doc_check fail "guest kernel (arm64)" "compgen -G '$IMAGES/vmlinux-*-arm64'" \
+		"$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-arm64' 2>/dev/null | sort -V | tail -1 | xargs -r basename)" \
+		"firecode setup"
+	doc_check fail "initramfs" "test -f '$IMAGES/initrd.gz'" "" "firecode setup"
+	doc_check fail "guest rootfs" "test -f '$IMAGES/agent-firecode.ext4'" \
+		"$(du -h "$IMAGES/agent-firecode.ext4" 2>/dev/null | cut -f1)" \
+		"firecode prepare        # in a VM, no docker, no root"
+	doc_check warn "short jail alias" "test -L /tmp/firecode-$(id -u)" "/tmp/firecode-$(id -u)" \
+		"something else owns /tmp/firecode-$(id -u) - vsock socket paths will be too long for macOS"
+
+	echo
+	echo " host tools (Homebrew)"
+	doc_check fail "bash 5" "test ${BASH_VERSINFO[0]} -ge 5" "$BASH_VERSION" "brew install bash"
+	doc_check fail "GNU coreutils" "stat --version" "" "brew install coreutils"
+	doc_check fail "GNU sed, find, awk, grep" "sed --version && find --version && awk --version && grep --version" \
+		"" "brew install gnu-sed findutils gawk grep"
+	doc_check fail "mkfs.ext4, debugfs" "command -v mkfs.ext4 && command -v debugfs" "" "brew install e2fsprogs"
+	doc_check fail "socat" "command -v socat" "" "brew install socat"
+	doc_check fail "flock" "command -v flock" "" "brew install flock"
+	doc_check fail "rsync 3" "[[ \$(rsync --version) == *'version 3'* ]]" "" "brew install rsync"
+	doc_check fail "python 3.12+" "python3 -c 'import tarfile; tarfile.data_filter'" \
+		"$(python3 -V 2>&1 | cut -d' ' -f2)" \
+		"brew install python@3.13   # its tarfile filter is what keeps a guest's archive in its destination"
+	doc_check warn "zstd (setup only)" "command -v zstd" "" "brew install zstd"
+	doc_check warn "swiftc (setup only)" "command -v swiftc" "" "xcode-select --install"
+	doc_check warn "tmux" "command -v tmux" "" "brew install tmux   # interactive sessions live in it"
+	doc_check warn "a FUSE (vmprocfs only)" \
+		"test -e /usr/local/lib/libfuse-t.dylib -o -e /usr/local/lib/libfuse.2.dylib" "" \
+		"brew install macos-fuse-t/homebrew-cask/fuse-t   # no kernel extension; only to mount a guest's /proc"
+
+	echo
+	echo " what stands in for Linux here"
+	doc_info "network" "vmnet NAT, no taps and no root - a project keeps its address by MAC"
+	doc_info "lifetime" "run trees kept in $ROOT/.cgroup (no cgroups on macOS)"
+	doc_info "isolation" "the VM runs in Apple's sandboxed Virtualization XPC service (no jailer)"
+}
+
+doctor_host_linux() {
 	echo " virtualisation"
 	doc_check fail "kvm usable (/dev/kvm)" "test -r /dev/kvm -a -w /dev/kvm" \
 		"" "sudo usermod -aG kvm $(id -un)   # then log out and back in"
@@ -6726,18 +7265,32 @@ cmd_doctor() {
 	doc_check warn "cgroup delegation" "test -w '$cg/cgroup.subtree_control'" \
 		"$(basename "$cg")" \
 		"systemd should delegate this to your user session - without it a child VM can outlive its parent"
+}
+
+cmd_doctor() {
+	echo "firecode doctor"
+	echo
+	if ((MACOS)); then
+		doctor_host_macos
+	else
+		doctor_host_linux
+	fi
 
 	echo
 	echo " agents"
 	doc_check warn "claude" "command -v claude" "$(claude --version 2>/dev/null)" \
-		"install Claude Code on the host - the VM runs the host's binary"
+		"install Claude Code on the host - the VM runs the host's binary$( ((MACOS)) && echo "'s version, built for linux-arm64")"
 	doc_check warn "opencode" "command -v opencode" "$(opencode --version 2>/dev/null)" \
 		"install opencode on the host if you want to run it in a VM"
 	doctor_credentials
 
 	echo
 	echo " capacity"
-	doc_info "memory" "$(free -g 2>/dev/null | awk '/^Mem:/{print $7" GB available of "$2" GB"}')"
+	if ((MACOS)); then
+		doc_info "memory" "$(($(sysctl -n hw.memsize) / 1073741824)) GB"
+	else
+		doc_info "memory" "$(free -g 2>/dev/null | awk '/^Mem:/{print $7" GB available of "$2" GB"}')"
+	fi
 	doc_info "disk for images and state" \
 		"$(df -h "$IMAGES" 2>/dev/null | awk 'NR==2{print $4" free of "$2}')"
 	# The same test the rest of the harness uses: the kernel publishes a
@@ -6769,12 +7322,14 @@ cmd_doctor() {
 # Credentials are the one part where "present" is not the same as "usable",
 # and where the wrong arrangement is silent until a run has already burned it.
 doctor_credentials() {
-	if [[ -f $CLAUDE_HOME/.credentials.json ]]; then
+	local creds
+	creds=$(host_claude_credentials 2>/dev/null) || creds=""
+	if [[ -n $creds ]]; then
 		local exp
 		exp=$(python3 -c '
 import json, sys, time
 try:
-    d = json.load(open(sys.argv[1])).get("claudeAiOauth") or {}
+    d = json.load(sys.stdin).get("claudeAiOauth") or {}
 except Exception:
     print("unreadable")
     raise SystemExit
@@ -6785,7 +7340,7 @@ elif at / 1000 < time.time():
     print("EXPIRED")
 else:
     print("valid for %d min" % ((at / 1000 - time.time()) / 60))
-' "$CLAUDE_HOME/.credentials.json" 2>/dev/null || echo unknown)
+' <<<"$creds" 2>/dev/null || echo unknown)
 		if [[ $exp == EXPIRED ]]; then
 			printf '  warn  %-38s %s\n' "claude credentials" "expired on the host"
 			DOC_WARN=$((DOC_WARN + 1))
@@ -6950,11 +7505,17 @@ EOF
 case "${1:-}" in
 setup)
 	shift
-	"$SCRIPTS/setup.sh" "$@"
+	if ((MACOS)); then
+		"$SCRIPTS/setup-macos.sh" "$@"
+	else
+		"$SCRIPTS/setup.sh" "$@"
+	fi
 	;;
 prepare)
 	shift
-	if [[ ${1:-} == --in-vm ]]; then
+	if ((MACOS)); then
+		cmd_prepare_macos "$@"
+	elif [[ ${1:-} == --in-vm ]]; then
 		shift
 		cmd_prepare_in_vm "$@"
 	else

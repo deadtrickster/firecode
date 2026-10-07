@@ -55,6 +55,52 @@ firecode prepare --with "dotnet@10 uv"     # first guest image, via docker
 firecode doctor                            # check the host is ready
 ```
 
+### On a Mac
+
+Apple silicon and macOS 14 or later. There is no KVM, so no firecracker: the
+VMM is `firecode-vz`, a small Swift program in `macos/` over Apple's
+Virtualization.framework that speaks firecracker's config file, API socket
+and vsock protocol - everything above it is the same code. The guest is
+arm64 Ubuntu, and needs no docker and no root at any step:
+
+```sh
+xcode-select --install                     # swiftc, to build firecode-vz
+brew install bash coreutils gnu-sed findutils gawk grep e2fsprogs \
+  socat flock rsync tmux zstd python@3.13
+
+firecode setup                             # builds firecode-vz, fetches the arm64 kernel
+firecode prepare --with "uv"               # first image, built in a VM
+firecode doctor
+```
+
+`firecode setup` compiles `firecode-vz` and ad-hoc signs it with the
+`com.apple.security.virtualization` entitlement - a local signature, no
+certificate or Apple account. The kernel is Ubuntu's arm64 generic one: under
+Virtualization.framework every device is on PCI, which firecracker's kernels
+do not support. `prepare` boots Ubuntu's minimal base tarball in a VM and runs
+the same `guest/build-rootfs.sh` as `prepare --in-vm`.
+
+What is different, and why:
+
+| Linux | macOS |
+| --- | --- |
+| a tap and a /30 per VM, iptables NAT | vmnet's NAT; the guest takes an address by DHCP, and keeps it run to run because its MAC is derived from the project |
+| the jailer | none - the machine runs in Apple's own sandboxed Virtualization XPC service, not in `firecode-vz` |
+| cgroups for lifetime | the same tree kept as files under `.cgroup/`, pid plus start time, so a recycled pid never reads as a live run |
+| the host's `claude` binary | a linux-arm64 build of the same version, fetched and checksummed into `vendor/guest/` |
+| `~/.claude/.credentials.json` | read from the login Keychain (macOS may ask once whether `security` may) |
+| `firecode chat install` as a systemd user unit | a LaunchAgent |
+
+Nothing needs `net-setup` or `install-privileged.sh`; both say so and exit.
+
+Not available on a Mac: `--gpu` and `--vmm libvirt` (no passthrough),
+hardware counters in a guest, pinning to cores (`--vectorized` runs unpinned
+and says so), `firecode grow` on a running VM (the framework cannot resize
+a drive under a live guest), and memory going back: its balloon has no free
+page reporting, so a guest that freed memory still costs its high-water mark
+until it stops. `vmprocfs.py` needs FUSE-T or macFUSE, and with
+no `/proc` on the host there is nothing to fall through to.
+
 Once you have an image, the next one is built **inside a VM** - no docker, no
 export, no copy-out:
 
@@ -786,4 +832,4 @@ doctor` checks). `LIBVIRT_DEFAULT_URI` overrides either.
   the host is left holding a spent one and needs a re-auth. `--auth-relay`
   is the way out: the model is reached through this host and the VM holds no
   credential for that provider at all.
-- x86_64 only.
+- x86_64 Linux, or Apple silicon macOS 14+ (see [On a Mac](#on-a-mac)).

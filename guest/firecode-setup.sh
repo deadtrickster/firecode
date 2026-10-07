@@ -111,6 +111,10 @@ setup_network() {
 		log "no eth0, running without network"
 		return 0
 	fi
+	if [[ $FIRECODE_GUEST_IP == dhcp ]]; then
+		setup_network_dhcp
+		return 0
+	fi
 	ip addr add "$FIRECODE_GUEST_IP" dev eth0 2>/dev/null
 	ip link set eth0 up
 	[[ -n ${FIRECODE_GATEWAY:-} ]] && ip route add default via "$FIRECODE_GATEWAY" 2>/dev/null
@@ -122,6 +126,36 @@ setup_network() {
 		echo "nameserver $ns" >>/etc/resolv.conf
 	done
 	log "network up: $FIRECODE_GUEST_IP via ${FIRECODE_GATEWAY:-none}"
+}
+
+# The host has no tap to hand an address on: under Virtualization.framework
+# the link is vmnet's NAT, which runs its own DHCP server. The MAC is fixed
+# per project, so the lease - and the address a dev server is reachable at -
+# is the same from one run to the next.
+setup_network_dhcp() {
+	local script=/run/firecode-udhcpc.sh
+	cat >"$script" <<-'EOF'
+		#!/bin/sh
+		case "$1" in
+		bound | renew)
+			ip addr flush dev "$interface"
+			ip addr add "$ip/${mask:-24}" dev "$interface"
+			[ -n "$router" ] && ip route replace default via "${router%% *}" dev "$interface"
+			rm -f /etc/resolv.conf
+			for ns in ${dns:-1.1.1.1}; do echo "nameserver $ns" >>/etc/resolv.conf; done
+			;;
+		esac
+	EOF
+	chmod 0755 "$script"
+	ip link set eth0 up
+	# Backgrounded after the first lease, so renewals keep happening for a VM
+	# that stays up longer than the lease does.
+	if busybox udhcpc -i eth0 -t 10 -T 1 -b -p /run/firecode-udhcpc.pid \
+		-s "$script" >/dev/null 2>&1; then
+		log "network up: $(ip -4 -o addr show eth0 | awk '{print $4}') by dhcp"
+	else
+		log "WARNING: no dhcp lease on eth0"
+	fi
 }
 
 # Services the host keeps on its loopback - MCP servers, a local llama-server,
@@ -293,6 +327,17 @@ main() {
 		export FIRECODE_REEXEC=1
 		log "using the harness scripts from the control drive"
 		exec "$CTL_MNT/firecode-setup.sh"
+	fi
+
+	# Every way this guest ends is `systemctl reboot`, because a firecracker
+	# VMM exits when its guest resets and has nothing a poweroff can press.
+	# Apple's Virtualization.framework is the other way round: a reset boots
+	# the machine again - the agent with it - and only a poweroff ends it. So
+	# there, for this boot only, reboot.target is poweroff.target.
+	if grep -qw 'firecode.vmm=vz' /proc/cmdline; then
+		mkdir -p /run/systemd/system
+		ln -sf /lib/systemd/system/poweroff.target /run/systemd/system/reboot.target
+		systemctl daemon-reload 2>/dev/null || true
 	fi
 
 	# shellcheck source=/dev/null
@@ -490,7 +535,9 @@ PY
 	# the agent is skipped for want of an args file, the getty is stopped for a
 	# unit that never runs and the console is left dead. Start it back.
 	if [[ ${FIRECODE_MODE:-} != auto ]]; then
-		systemctl start --no-block serial-getty@ttyS0.service 2>/dev/null ||
+		local console
+		console=$(sed -n 's/.*console=\([^ ]*\).*/\1/p' /proc/cmdline)
+		systemctl start --no-block "serial-getty@${console:-ttyS0}.service" 2>/dev/null ||
 			log "WARNING: could not start the console getty"
 	fi
 

@@ -24,6 +24,12 @@
 #   sudo ./scripts/install-privileged.sh [--user NAME] [--uninstall]
 set -euo pipefail
 
+[[ $(uname -s) == Darwin ]] && {
+	echo "install-privileged: nothing to install on macOS - there is no jailer, and the" >&2
+	echo "  VM already runs inside Apple's sandboxed Virtualization service." >&2
+	exit 0
+}
+
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 VENDOR="$ROOT/vendor/bin"
 LIBEXEC=/usr/local/libexec/firecode

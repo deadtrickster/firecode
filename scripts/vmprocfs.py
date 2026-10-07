@@ -12,7 +12,9 @@ guest and nothing needs root.
 
 Anything the guest does not have falls through to the host's real /proc. That
 is what lets an unmodified tool work: /proc/self, /proc/version and the rest
-still answer, while the pid you care about comes from the VM.
+still answer, while the pid you care about comes from the VM. A Mac has no
+/proc, so there the mount is the guest's and nothing else - and needs a FUSE:
+FUSE-T (no kernel extension) or macFUSE.
 
     vmprocfs.py <uds> <port> <mountpoint> [--ttl 1.0] [--foreground]
 
@@ -32,10 +34,23 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# fusepy looks for macFUSE's library on a Mac. FUSE-T needs no kernel
+# extension and ships a compatible one under another name, so it is pointed at
+# that when macFUSE is not there.
+if sys.platform == "darwin" and "FUSE_LIBRARY_PATH" not in os.environ:
+    for lib in ("/usr/local/lib/libfuse.2.dylib", "/usr/local/lib/libfuse-t.dylib",
+                "/opt/homebrew/lib/libfuse-t.dylib"):
+        if os.path.exists(lib):
+            os.environ["FUSE_LIBRARY_PATH"] = lib
+            break
+
 try:
     from fuse import FUSE, FuseOSError, Operations
 except ImportError:
     sys.exit("vmprocfs: needs fusepy (pip install fusepy)")
+except (EnvironmentError, OSError) as exc:
+    sys.exit(f"vmprocfs: no FUSE library ({exc}) - on a Mac: "
+             "brew install macos-fuse-t/homebrew-cask/fuse-t, or the macFUSE cask")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VSOCK_EXEC = os.path.join(HERE, "vsock-exec.py")

@@ -206,10 +206,13 @@ class Config:
         """
         try:
             cores = os.cpu_count() or 2
-            with open("/proc/meminfo") as fh:
-                avail_mb = next(
-                    int(line.split()[1]) // 1024 for line in fh
-                    if line.startswith("MemAvailable:"))
+            if sys.platform == "darwin":
+                avail_mb = _macos_available_mb()
+            else:
+                with open("/proc/meminfo") as fh:
+                    avail_mb = next(
+                        int(line.split()[1]) // 1024 for line in fh
+                        if line.startswith("MemAvailable:"))
         except Exception:
             self.concurrency_reason = "could not read the machine, assuming small"
             return 2
@@ -226,6 +229,15 @@ class Config:
                         if n.startswith("fccode")])
         except OSError:
             taps = 0
+        # A Mac has no taps to run out of: every VM is on vmnet's NAT, and a
+        # slot is only a lock and a MAC. Not the constraint there.
+        if sys.platform == "darwin":
+            by_cpu = max(1, (cores - 2) // 2)
+            by_mem = max(1, int(avail_mb * 0.7) // max(1, self.mem_per_run_mb))
+            self.concurrency_reason = (
+                f"{cores} cores, {avail_mb // 1024}G free: {by_cpu} by cpu, "
+                f"{by_mem} by memory at {self.mem_per_run_mb}M - the smaller wins")
+            return max(1, min(by_cpu, by_mem, 12))
 
         by_cpu = max(1, (cores - 2) // 2)
         by_mem = max(1, int(avail_mb * 0.7) // max(1, self.mem_per_run_mb))
@@ -1807,6 +1819,8 @@ def _peer(client_address, server_port):
     it, and the host - which includes any web page a browser here is showing -
     has to present a token instead.
     """
+    if sys.platform == "darwin":
+        return _peer_macos(client_address[1], server_port)
     try:
         peer_port = client_address[1]
         want = None
@@ -1847,6 +1861,91 @@ def _peer(client_address, server_port):
     except Exception:
         return None, None
     return None, None
+
+
+def _macos_available_mb():
+    """MemAvailable's nearest equivalent: free, inactive and purgeable pages,
+    which the kernel hands out without swapping anything."""
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    pages = 0
+    for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+        m = re.search(rf"{key}:\s+(\d+)", out)
+        if m:
+            pages += int(m.group(1))
+    return pages * page // (1024 * 1024)
+
+
+def _ps(pid, field):
+    out = subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)],
+                         capture_output=True, text=True).stdout
+    return " ".join(out.split())
+
+
+def _peer_macos(peer_port, server_port):
+    """_peer on a Mac, which has no /proc and no cgroups.
+
+    The same two questions, asked differently. Which process holds the other
+    end of this connection: lsof. Which run that process belongs to: bin/firecode
+    keeps the cgroup tree as files there (.cgroup/, "pid start-time" per line),
+    and a relay is recorded in its run's relays/ leaf before it is anything
+    else. socat forks a child per connection, so the recorded process is the
+    holder's parent, not the holder - the chain is walked up to launchd. The
+    start time is checked, because a pid is reused and a run is not.
+
+    Anything that cannot be worked out is (None, None) and refused, as on
+    Linux. Only a process found in no run at all is the host.
+    """
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", "-a", f"-iTCP:{peer_port}", "-sTCP:ESTABLISHED", "-Fpn"],
+            capture_output=True, text=True, timeout=10).stdout
+        holder = None
+        pid = None
+        for line in out.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:])
+            elif line.startswith("n") and pid is not None:
+                # local->remote, from the holder's side: ours is the end whose
+                # local port is the peer's and whose remote is this server.
+                local, _, remote = line[1:].partition("->")
+                if (local.rsplit(":", 1)[-1] == str(peer_port)
+                        and remote.rsplit(":", 1)[-1] == str(server_port)):
+                    holder = pid
+                    break
+        if holder is None:
+            return None, None
+
+        recorded = {}
+        cgroot = os.path.join(ROOT, ".cgroup")
+        for dirpath, _, files in os.walk(cgroot):
+            if "cgroup.procs" not in files:
+                continue
+            with open(os.path.join(dirpath, "cgroup.procs")) as fh:
+                for line in fh:
+                    parts = line.split(None, 1)
+                    if parts and parts[0].isdigit():
+                        recorded[int(parts[0])] = (" ".join(parts[1].split())
+                                                   if len(parts) > 1 else "", dirpath)
+
+        pid = holder
+        for _ in range(64):
+            if pid <= 1:
+                break
+            if pid in recorded:
+                start, dirpath = recorded[pid]
+                if start and start == _ps(pid, "lstart"):
+                    rel = os.path.relpath(dirpath, cgroot)
+                    found = [p[len("run-"):] for p in rel.split(os.sep)
+                             if p.startswith("run-")]
+                    return ("vm", found[-1]) if found else ("host", None)
+            ppid = _ps(pid, "ppid")
+            if not ppid.isdigit():
+                return None, None
+            pid = int(ppid)
+        return ("host", None)
+    except Exception:
+        return None, None
 
 
 class Handler(BaseHTTPRequestHandler):

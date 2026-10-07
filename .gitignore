@@ -4,6 +4,7 @@ runs/
 state/
 vendor/
 .jail/
+.cgroup/
 
 *.ext4
 *.squashfs
