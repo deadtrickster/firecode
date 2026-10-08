@@ -125,8 +125,16 @@ jail_remove() {
 # entrypoint, and the qemu guest agent - which is how this was found, one
 # level down, where `firecode doctor` died on line 32 before printing a word.
 # The passwd entry is the answer the shell would have given anyway.
+#
+# macOS has no getent, and under pipefail the missing command was the script's
+# exit status: `firecode in` from a program that clears its environment (letibot
+# runs every job that way) died with 127 and printed nothing. The directory
+# service has the same answer there.
 if [[ -z ${HOME:-} ]]; then
-	HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+	HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)
+	if [[ -z $HOME ]] && command -v dscl >/dev/null 2>&1; then
+		HOME=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)
+	fi
 	export HOME="${HOME:-/root}"
 fi
 
