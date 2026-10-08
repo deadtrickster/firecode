@@ -1578,6 +1578,38 @@ print(type(d["vms"]).__name__, len(d["vms"]))
 # Two programs reading one config file disagree the day its shape changes, and
 # the second one finds out in production - so the contract asserted here is the
 # VERB, and it has to keep answering even when the caller is a machine.
+# A copy of a project inherits the layers its source has attached - what
+# letibot asks for when it boots a subagent's VM on a copy of the workspace.
+# Host-side only: the attachments are a file, and inheriting needs no docker.
+test_layer_inherit() {
+	local src copy attached_src attached_copy out
+	src=$(make_project)
+	copy="$WORK/testproj-copy"
+	rm -rf "$copy"
+	cp -R "$src" "$copy"
+	attached_src="$ROOT/state/$(bash -c '
+		dir=$1; h=$(printf "%s" "$dir" | sha256sum | cut -c1-8)
+		echo "$(basename "$dir" | tr -c "A-Za-z0-9._-" "-")-$h"' _ "$(cd "$src" && pwd)").layers"
+	attached_copy="$ROOT/state/$(bash -c '
+		dir=$1; h=$(printf "%s" "$dir" | sha256sum | cut -c1-8)
+		echo "$(basename "$dir" | tr -c "A-Za-z0-9._-" "-")-$h"' _ "$(cd "$copy" && pwd)").layers"
+	mkdir -p "$ROOT/state"
+	rm -f "$attached_src" "$attached_copy"
+
+	out=$("$FIRECODE" layer inherit "$src" --project "$copy" 2>&1)
+	check "a source with no layers is an answer, not a failure" 0 $?
+	contains "and it says so" "inherits none" "$out"
+
+	printf 'sha256:aaaa\ttoolchain:1\nsha256:bbbb\tllama:2\n' >"$attached_src"
+	"$FIRECODE" layer inherit "$src" --project "$copy" >/dev/null 2>&1
+	check "the copy carries the source's layers" "$(cat "$attached_src")" "$(cat "$attached_copy" 2>/dev/null)"
+	"$FIRECODE" layer inherit "$src" --project "$copy" >/dev/null 2>&1
+	check "inheriting twice leaves one entry per image" 2 "$(wc -l <"$attached_copy" | tr -d ' ')"
+	out=$("$FIRECODE" layer bogus --project "$copy" 2>&1)
+	contains "the usage names inherit" "inherit <source-dir>" "$out"
+	rm -f "$attached_src" "$attached_copy"
+}
+
 test_projects_is_a_registry_not_a_config_file() {
 	local prose json shape
 	prose=$("$FIRECODE" projects 2>&1)
@@ -1617,6 +1649,7 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 run_test shellcheck
 run_test ps_json_is_not_the_prose
 run_test projects_is_a_registry_not_a_config_file
+run_test layer_inherit
 run_test denylist
 run_test arg_massaging
 run_test terminal_escapes

@@ -2028,6 +2028,35 @@ cmd_layer() {
 				"$([[ -f $f ]] && du -sh "$f" | cut -f1 || echo "MISSING - re-add it")"
 		done <"$attached"
 		;;
+	inherit)
+		# A copy of a project has a path of its own, and layers are attached to a
+		# path - so a copy boots without the toolchain its source installed.
+		# letibot places a subagent in a VM on a copy of the workspace and calls
+		# this; it was called for weeks before it existed, and every VM placement
+		# failed with this usage line. The images are already imported (by digest),
+		# so this only copies the source's attachments: no docker, no download.
+		[[ -n $image ]] || die "usage: firecode layer inherit <source-dir> [--project DIR]"
+		local src src_attached d i n=0
+		src=$(cd "$image" && pwd) || die "no such directory: $image"
+		src_attached=$(layers_of_project "$(project_slug "$src")")
+		if [[ ! -s $src_attached ]]; then
+			log "$src has no layers; $dir inherits none"
+			return 0
+		fi
+		mkdir -p "$STATE_DIR"
+		while IFS=$'\t' read -r d i; do
+			[[ -n $d && -n $i ]] || continue
+			# Replaced by image, the way add replaces it: inheriting twice, or after
+			# an add of the same image, leaves one entry.
+			if [[ -f $attached ]]; then
+				grep -v "	$i\$" "$attached" >"$attached.tmp" 2>/dev/null || true
+				mv -f "$attached.tmp" "$attached"
+			fi
+			printf '%s\t%s\n' "$d" "$i" >>"$attached"
+			n=$((n + 1))
+		done <"$src_attached"
+		log "$dir inherits $n layer(s) from $src"
+		;;
 	rm)
 		[[ -n $image ]] || die "usage: firecode layer rm <docker-image> [--project DIR]"
 		[[ -f $attached ]] || die "no imported layers for $dir"
@@ -2035,7 +2064,7 @@ cmd_layer() {
 		mv -f "$attached.tmp" "$attached"
 		log "$image detached from $dir (the image itself is kept - firecode gc drops unused ones)"
 		;;
-	*) die "usage: firecode layer [add <image>|ls|rm <image>] [--project DIR]" ;;
+	*) die "usage: firecode layer [add <image>|ls|rm <image>|inherit <source-dir>] [--project DIR]" ;;
 	esac
 }
 
