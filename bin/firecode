@@ -2529,12 +2529,25 @@ cmd_up() {
 		return 0
 	fi
 
+	# THIS RUN'S OWN LOG. It used to be runs/up.log, one file every `up`
+	# truncated and wrote to: two starting together interleaved into it (a
+	# writer whose file was truncated under it keeps its offset, so the file
+	# grew a hole of NULs), grep answered "binary file matches", and one run
+	# reported "the VM failed to start" with another run's error while its own
+	# VM was booting. The verdict below reads only this file and this child.
+	# Not even a "latest" link at runs/up.log: anything still writing there
+	# would write through it into this run's log, which is the same bug.
+	mkdir -p "$RUNS" || die "cannot create $RUNS"
+	local uplog
+	uplog=$(mktemp "$RUNS/up.XXXXXX.log") || die "cannot create a log in $RUNS"
+
 	# Held open by a process that does nothing, so the VM stays up until it is
 	# told to stop.
-	log "starting a VM and leaving it up"
+	log "starting a VM and leaving it up (log: $uplog)"
 	nohup setsid "$SELF" exec ${passthru+"${passthru[@]}"} --timeout 0 -- \
 		sh -c 'while :; do sleep 3600; done' \
-		>"$RUNS/up.log" 2>&1 &
+		>"$uplog" 2>&1 &
+	local child=$!
 	disown 2>/dev/null || true
 
 	# Firecracker's socket accepts a connection the moment the VMM starts,
@@ -2597,19 +2610,36 @@ cmd_up() {
 		# line is ever reworded again, tail is still something rather than
 		# nothing - a reader who is shown the end of the log can work; a reader
 		# shown a colon cannot.
+		#
+		# -a: a console log can carry binary bytes, and without it grep
+		# answers "binary file matches" - a status that is neither "no" nor a
+		# line anybody can read.
 		local failed='Firecracker exiting with error|VM exited|\[firecode\] error:'
-		if grep -qE "$failed" "$RUNS/up.log" 2>/dev/null; then
+		if grep -aqE "$failed" "$uplog" 2>/dev/null; then
 			log "the VM failed to start:"
-			grep -E "$failed|Error|error:" "$RUNS/up.log" | tail -3 >&2 ||
-				tail -5 "$RUNS/up.log" >&2
-			die "see $RUNS/up.log"
+			grep -aE "$failed|Error|error:" "$uplog" | tail -3 >&2 ||
+				tail -5 "$uplog" >&2
+			die "see $uplog"
+		fi
+		# The process that holds the VM up is gone and nothing answered: this
+		# run is over, whatever its log says. Without this a run that ended
+		# quietly was waited on for fifteen minutes.
+		if ! kill -0 "$child" 2>/dev/null; then
+			# One last look: it may have answered just before it went.
+			if sock=$(live_vm_socket "$here" 2>/dev/null) &&
+				python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - true >/dev/null 2>&1; then
+				continue
+			fi
+			log "the VM run ended before the VM answered:"
+			tail -5 "$uplog" >&2
+			die "see $uplog"
 		fi
 		sleep "$nap"
 		waited=$((waited + 1))
 		((waited == 40)) && nap=0.25
 		((waited == 100)) && nap=1
 	done
-	die "the VM did not come up - see $RUNS/up.log"
+	die "the VM did not come up - see $uplog"
 }
 
 # A VM that just booted is the best thing to checkpoint: nothing has run in it
@@ -7001,6 +7031,9 @@ cmd_gc() {
 	local keep=${1:-5} n=0 d
 	local -a stuck=()
 	[[ -d $RUNS ]] || return 0
+	# Each `up` keeps its own log beside the runs. One a day untouched belongs
+	# to a VM long gone - a running one is still writing to its own.
+	find "$RUNS" -maxdepth 1 -name 'up.*.log' -mtime +1 -delete 2>/dev/null || true
 	# Newest first; anything past the keep count goes entirely.
 	while IFS= read -r d; do
 		# A RUN, AND NOT EVERY DIRECTORY THAT HAPPENS TO SIT HERE. runs/spawn

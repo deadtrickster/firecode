@@ -946,6 +946,41 @@ test_cp_into_guest_replaces_files() {
 	((rc == 0)) || [[ $out == *NO\ * ]] || no "the cp-into-guest test ran" "$(tail -3 <<<"$out")"
 }
 
+# `up` decides whether ITS VM failed from its own run, not from a file every
+# run writes to. It used to read runs/up.log, which a concurrent `up` was
+# appending to: grep hit "binary file matches" and another run's error, and
+# reported "the VM failed to start" while its own VM was booting. Here a
+# writer plays the other run, and this `up` is a dry run - it boots nothing
+# and ends - so the only true verdict is "ended without a VM", with its own
+# output.
+test_up_verdict_is_its_own() {
+	local p out rc writer
+	p=$(make_project)
+	mkdir -p "$ROOT/runs"
+	(while :; do
+		printf '\0\0\377\376\n[firecode] error: ANOTHER RUN failed here\n' >>"$ROOT/runs/up.log"
+		sleep 0.05
+	done) &
+	writer=$!
+	out=$(timeout 60 "$FIRECODE" up --project "$p" --no-jail --no-net --dry-run 2>&1)
+	rc=$?
+	kill "$writer" 2>/dev/null
+	wait "$writer" 2>/dev/null
+	rm -f "$ROOT/runs/up.log"
+	if ((rc == 124)); then
+		no "up gives a verdict on a run that ended" "still waiting after 60s"
+	else
+		ok "up gives a verdict on a run that ended"
+	fi
+	if ((rc != 0)); then ok "and it is a failure"; else no "and it is a failure" "exit 0"; fi
+	if [[ $out == *"ANOTHER RUN"* || $out == *"binary file matches"* ]]; then
+		no "another run's log does not decide it" "$(head -5 <<<"$out")"
+	else
+		ok "another run's log does not decide it"
+	fi
+	contains "it shows its own run's output" "dry run: nothing built" "$out"
+}
+
 # `firecode cp` unpacks what a guest sends. A refused archive used to leave
 # what came before the bad member on disk, and some refusals were tracebacks.
 test_cp_from_guest_is_all_or_nothing() {
@@ -1713,6 +1748,7 @@ run_test relay_stays_on_upstream
 run_test spawn_server_scopes_callers
 run_test cp_from_guest_is_all_or_nothing
 run_test cp_into_guest_replaces_files
+run_test up_verdict_is_its_own
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
