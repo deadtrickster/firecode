@@ -978,7 +978,7 @@ test_up_verdict_is_its_own() {
 	else
 		ok "another run's log does not decide it"
 	fi
-	contains "it shows its own run's output" "dry run: nothing built" "$out"
+	contains "it shows its own run's output" "[firecode] dry run:" "$out"
 }
 
 # `list` and `ps` tell a VM that does not answer from one that is busy. ps
