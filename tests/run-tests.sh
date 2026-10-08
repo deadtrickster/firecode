@@ -1043,6 +1043,67 @@ PY
 	rm -rf "$ROOT/runs/firecode-00000000-000000-fake"*
 }
 
+# `up --help` prints usage and starts nothing. It used to pass --help through
+# to the launcher and boot a VM, which ran past a caller's 60s deadline with
+# no usage printed. Run against a root with no VMM and no images, so that if
+# it does try to boot, the attempt fails at once instead of booting.
+test_up_help_boots_nothing() {
+	local fake="$WORK/helproot" out rc d
+	mkdir -p "$fake/runs"
+	for d in bin scripts guest macos; do ln -sfn "$ROOT/$d" "$fake/$d"; done
+	out=$(FIRECODE_ROOT=$fake timeout 30 "$FIRECODE" up --help 2>&1)
+	rc=$?
+	check "up --help exits 0" 0 "$rc"
+	contains "and prints usage" "usage: firecode up" "$out"
+	if [[ $out == *"starting a VM"* ]] || compgen -G "$fake/runs/*" >/dev/null; then
+		no "and starts nothing" "$(head -3 <<<"$out")"
+	else
+		ok "and starts nothing"
+	fi
+}
+
+# Two live runs for one project: whichever `in`, `cp` and `down` pick, they
+# say which. The newest used to win silently, so `down` stopped one run and
+# reported "stopped" while the other kept its drives and its work.
+test_shared_project_names_the_run() {
+	[[ $(uname -s) == Darwin ]] || return 0
+	local base="$WORK/sharedruns" sleeper srv r out lstart
+	mkdir -p "$base/proj" "$base/jail-a" "$base/jail-b" "$base/cg/vm"
+	sleep 60 &
+	sleeper=$!
+	lstart=$(ps -o lstart= -p "$sleeper")
+	echo "$sleeper $lstart" >"$base/cg/vm/cgroup.procs"
+	python3 - "$base/jail-a/v.sock" "$base/jail-b/v.sock" <<'PY' &
+import socket, sys, threading
+def serve(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path); s.listen(8)
+    while True:
+        c, _ = s.accept()
+        c.recv(64); c.sendall(b"OK 1\n"); c.close()
+for p in sys.argv[1:]:
+    threading.Thread(target=serve, args=(p,), daemon=True).start()
+threading.Event().wait()
+PY
+	srv=$!
+	for r in a b; do
+		local rd="$ROOT/runs/firecode-00000000-000000-shared$r"
+		mkdir -p "$rd"
+		echo "$base/jail-$r" >"$rd/jail"
+		echo "$base/proj" >"$rd/project"
+		echo "shared$r" >"$rd/name"
+		echo "$base/cg" >"$rd/cgroup"
+		echo "$base/jail-$r/v.sock" >"$rd/vsock"
+	done
+	sleep 0.5
+	out=$(timeout 30 "$FIRECODE" in --project "$base/proj" true 2>&1)
+	contains "in names the run it chose" "firecode-00000000-000000-sharedb" "$out"
+	contains "and says there was more than one" "2 VMs" "$out"
+	kill "$srv" "$sleeper" 2>/dev/null
+	wait "$srv" "$sleeper" 2>/dev/null
+	rm -rf "$ROOT/runs/firecode-00000000-000000-shared"*
+}
+
 # `firecode cp` unpacks what a guest sends. A refused archive used to leave
 # what came before the bad member on disk, and some refusals were tracebacks.
 test_cp_from_guest_is_all_or_nothing() {
@@ -1841,6 +1902,8 @@ run_test cp_from_guest_is_all_or_nothing
 run_test cp_into_guest_replaces_files
 run_test up_verdict_is_its_own
 run_test list_and_ps_tell_unresponsive_from_busy
+run_test up_help_boots_nothing
+run_test shared_project_names_the_run
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
