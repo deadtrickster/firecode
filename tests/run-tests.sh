@@ -981,6 +981,68 @@ test_up_verdict_is_its_own() {
 	contains "it shows its own run's output" "dry run: nothing built" "$out"
 }
 
+# `list` and `ps` tell a VM that does not answer from one that is busy. ps
+# called every silent VM "(not answering - busy, or shutting down)", including
+# a live one that `in` was using, and list printed VMs whose vsock had gone
+# quiet as plainly running - so `down` got aimed at the wrong run. Two fake
+# runs whose VMM "process" is a sleep: one with no socket at all, one whose
+# socket completes the handshake and then never answers a command.
+#
+# Mac only: the run's liveness is its cgroup, and only on a Mac is that a file
+# this test can write.
+test_list_and_ps_tell_unresponsive_from_busy() {
+	[[ $(uname -s) == Darwin ]] || return 0
+	local base="$WORK/fakeruns" sleeper srv r out
+	mkdir -p "$base/unresp/jail" "$base/busy/jail" "$base/cg-unresp/vm" "$base/cg-busy/vm"
+	sleep 120 &
+	sleeper=$!
+	local lstart
+	lstart=$(ps -o lstart= -p "$sleeper")
+	echo "$sleeper $lstart" >"$base/cg-unresp/vm/cgroup.procs"
+	echo "$sleeper $lstart" >"$base/cg-busy/vm/cgroup.procs"
+	python3 - "$base/busy/jail/firecracker-vsock.sock" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1]); s.listen(8)
+held = []
+while True:
+    c, _ = s.accept()
+    c.recv(64)
+    c.sendall(b"OK 1\n")
+    held.append(c)            # and never a word more
+PY
+	srv=$!
+	for r in unresp busy; do
+		local rd="$ROOT/runs/firecode-00000000-000000-fake$r"
+		mkdir -p "$rd"
+		echo "$base/$r/jail" >"$rd/jail"
+		echo "$base/$r" >"$rd/project"
+		echo "fake$r" >"$rd/name"
+		echo "$base/cg-$r" >"$rd/cgroup"
+		echo "$base/$r/jail/firecracker-vsock.sock" >"$rd/vsock"
+	done
+	sleep 0.5
+	out=$("$FIRECODE" list 2>&1)
+	contains "list marks a VM whose vsock is silent" "unresponsive" "$(grep fakeunresp <<<"$out")"
+	if grep fakebusy <<<"$out" | grep -q unresponsive; then
+		no "and does not mark one that answers the handshake" "$(grep fakebusy <<<"$out")"
+	else
+		ok "and does not mark one that answers the handshake"
+	fi
+	out=$(FIRECODE_PS_TIMEOUT=2 "$FIRECODE" ps --project "$base/unresp" 2>&1)
+	contains "ps calls the silent one unresponsive" "unresponsive" "$out"
+	out=$(FIRECODE_PS_TIMEOUT=2 "$FIRECODE" ps --project "$base/busy" 2>&1)
+	contains "ps calls the one that answers busy" "busy" "$out"
+	if [[ $out == *"shutting down"* ]]; then
+		no "and does not say it may be shutting down" "$out"
+	else
+		ok "and does not say it may be shutting down"
+	fi
+	kill "$srv" "$sleeper" 2>/dev/null
+	wait "$srv" "$sleeper" 2>/dev/null
+	rm -rf "$ROOT/runs/firecode-00000000-000000-fake"*
+}
+
 # `firecode cp` unpacks what a guest sends. A refused archive used to leave
 # what came before the bad member on disk, and some refusals were tracebacks.
 test_cp_from_guest_is_all_or_nothing() {
@@ -1778,6 +1840,7 @@ run_test spawn_server_scopes_callers
 run_test cp_from_guest_is_all_or_nothing
 run_test cp_into_guest_replaces_files
 run_test up_verdict_is_its_own
+run_test list_and_ps_tell_unresponsive_from_busy
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique

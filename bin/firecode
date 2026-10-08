@@ -6454,6 +6454,33 @@ cmd_extract() {
 # reused and a socket file outlives the process that made it, but a cgroup is
 # populated exactly while something in it is alive. That is what lets a run
 # whose launcher was killed outright still be recognised - and cleaned up.
+# Where a run's VM listens, whichever backend recorded it.
+run_sock() {
+	if [[ -f $1/vsock ]]; then
+		cat "$1/vsock"
+	else
+		echo "$(cat "$1/jail" 2>/dev/null)/firecracker-vsock.sock"
+	fi
+}
+
+# What a live run's VM answers, in the words list and ps use. The process
+# being alive says the VM exists; only something listening says it can be
+# used - the rule cmd_cp already applies ("The file outlives the VM. Only
+# something listening counts").
+#   up            the vsock completes its handshake
+#   unresponsive  the VMM is alive and nothing answers on its vsock: wedged,
+#                 or on its way down
+# "busy" is the third state and only ps can tell it: the handshake works and a
+# command does not come back in time.
+vm_answer() {
+	local rd=${1%/}
+	[[ -f $rd/domain ]] && {
+		echo up
+		return
+	}
+	if vm_reachable "$(run_sock "$rd")"; then echo up; else echo unresponsive; fi
+}
+
 live_runs() {
 	local d id proj parent cg sock
 	[[ -d $RUNS ]] || return 0
@@ -6566,7 +6593,7 @@ PY
 cmd_ps_json() {
 	local want=$1 id proj parent vmname backend quiet rows=()
 	while IFS=$'\t' read -r id proj parent vmname; do
-		[[ -n $want && $vmname != "$want" ]] && ! same_path "$proj" "$want" && continue
+		[[ -n $want && $vmname != "$wantname" ]] && ! same_path "$proj" "$want" && continue
 		backend="firecracker"
 		((MACOS)) && backend="vz"
 		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
@@ -6608,10 +6635,13 @@ sys.stdout.write("\n")
 # running, what is it listening on, and is it busy or wedged - the things you
 # would otherwise get by opening a shell in each one in turn.
 cmd_ps() {
-	local want="" id proj parent addr any=0 json=0
+	local want="" wantname="" id proj parent addr any=0 json=0
 	while (($#)); do
 		case $1 in
 		--project)
+			# A path or the VM's name, as `in` and `down` take it. The name
+			# was realpath'd into a path under the cwd and never matched.
+			wantname=$2
 			want=$(realpath -m "$2")
 			shift 2
 			;;
@@ -6628,11 +6658,11 @@ cmd_ps() {
 		return
 	}
 
-	local vmname
+	local vmname probe_s=${FIRECODE_PS_TIMEOUT:-25}
 	while IFS=$'\t' read -r id proj parent vmname; do
 		[[ -n $want && $vmname != "$want" ]] && ! same_path "$proj" "$want" && continue
 		any=1
-		addr=$(cat "$RUNS/$id/vsock" 2>/dev/null)
+		addr=$(run_sock "$RUNS/$id")
 		local backend="firecracker"
 		((MACOS)) && backend="vz"
 		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
@@ -6650,7 +6680,7 @@ cmd_ps() {
 			# anyone still wants to say something, and saying "stuck" about a
 			# run that is counting down to its own shutdown is just wrong.
 			local finished=""
-			[[ -n $addr ]] && finished=$(python3 "$SCRIPTS/vsock-exec.py" "$addr" "$EXEC_PORT" - \
+			[[ -n $addr ]] && finished=$(timeout "$probe_s" python3 "$SCRIPTS/vsock-exec.py" "$addr" "$EXEC_PORT" - \
 				'test -p /tmp/firecode-agent-inbox &&
 				 tail -c 4000 /tmp/firecode-agent-stream.jsonl 2>/dev/null |
 				 grep -q "\"type\":\"result\"" && echo waiting' 2>/dev/null || true)
@@ -6672,7 +6702,7 @@ cmd_ps() {
 		# say that rather than reporting it as gone.
 		local snap
 		# shellcheck disable=SC2016  # runs in the guest, expanded there
-		snap=$(timeout 25 python3 "$SCRIPTS/vsock-exec.py" "$addr" "$EXEC_PORT" - '
+		snap=$(timeout "$probe_s" python3 "$SCRIPTS/vsock-exec.py" "$addr" "$EXEC_PORT" - '
 up=$(cut -d" " -f1 /proc/uptime | cut -d. -f1)
 printf "  up %sm, load%s\n" "$((up / 60))" "$(cut -d" " -f1-3 /proc/loadavg | sed "s/^/ /")"
 free -m | awk "/Mem:/{printf \"  memory %s of %s MB\\n\", \$3, \$2}"
@@ -6696,8 +6726,14 @@ true' 2>/dev/null) || snap=""
 			# guess it should not have to make: firecode knows which runs it
 			# never probed, so it should say so.
 			echo "  (no exec channel on this backend - not probed)"
+		elif vm_reachable "$addr"; then
+			# Something is listening, so this is not a dying VM: a guest
+			# under load can take longer than the probe to run a command,
+			# and `in` keeps working. Saying "or shutting down" about it got
+			# a live VM taken for a dead one and `down` aimed elsewhere.
+			echo "  (busy: its vsock answers, but the status probe took over ${probe_s}s - firecode in still reaches it)"
 		else
-			echo "  (not answering - busy, or shutting down)"
+			echo "  (unresponsive: its vsock does not answer - wedged, or shutting down)"
 		fi
 	done < <(live_runs)
 
@@ -6794,7 +6830,10 @@ cmd_list() {
 	local any=0 id proj parent vmname
 	while IFS=$'\t' read -r id proj parent vmname; do
 		any=1
-		printf '  %-20s %s\n' "${vmname:-$id}" "$proj"
+		local note=""
+		[[ $(vm_answer "$RUNS/$id") == unresponsive ]] &&
+			note="  (unresponsive: its vsock does not answer - wedged, or shutting down)"
+		printf '  %-20s %s%s\n' "${vmname:-$id}" "$proj" "$note"
 		[[ $parent != "-" && -n $parent ]] &&
 			printf '  %-20s   stops when %s does\n' "" "$parent"
 	done < <(live_runs)
