@@ -3707,24 +3707,51 @@ cmd_sessions() {
 }
 
 cmd_cp() {
-	local src=${1:-} dst=${2:-}
-	[[ -n $src && -n $dst ]] || die "usage: firecode cp <src> <dst>   (vm:/path for the guest side)"
+	local want="" named=0
+	local -a args=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project)
+			want=$(realpath -m "$2")
+			named=1
+			shift 2
+			;;
+		--vm)
+			want=$2
+			named=1
+			shift 2
+			;;
+		*)
+			args+=("$1")
+			shift
+			;;
+		esac
+	done
+	local src=${args[0]:-} dst=${args[1]:-}
+	[[ -n $src && -n $dst ]] ||
+		die "usage: firecode cp [--project DIR | --vm NAME] <src> <dst>   (vm:/path for the guest side; vm:/dir/ copies into dir)"
 
-	# Whichever VM is running right now. One at a time is the common case; be
-	# explicit about it rather than guessing between several.
 	local -a socks=() bases=()
 	local d b
-	mapfile -t bases < <(jail_bases)
-	for b in "${bases[@]}"; do
-		for d in "$b"/firecracker/*/root; do
-			[[ -S $d/firecracker-vsock.sock ]] || continue
-			# The file outlives the VM. Only something listening counts.
-			vm_reachable "$d/firecracker-vsock.sock" &&
-				socks+=("$d/firecracker-vsock.sock")
+	if ((named)); then
+		# Named, so exactly that VM - the same lookup `in` and `down` use.
+		socks=("$(require_vm_socket "$want")") || exit 1
+	else
+		# Whichever VM is running right now. One at a time is the common
+		# case; be explicit about it rather than guessing between several.
+		mapfile -t bases < <(jail_bases)
+		for b in "${bases[@]}"; do
+			for d in "$b"/firecracker/*/root; do
+				[[ -S $d/firecracker-vsock.sock ]] || continue
+				# The file outlives the VM. Only something listening counts.
+				vm_reachable "$d/firecracker-vsock.sock" &&
+					socks+=("$d/firecracker-vsock.sock")
+			done
 		done
-	done
-	((${#socks[@]} > 0)) || die "no VM is running"
-	((${#socks[@]} == 1)) || die "${#socks[@]} VMs are running - stop all but one"
+		((${#socks[@]} > 0)) || die "no VM is running"
+		((${#socks[@]} == 1)) ||
+			die "${#socks[@]} VMs are running - name one with --project DIR or --vm NAME"
+	fi
 
 	if [[ $src == vm:* ]]; then
 		python3 "$SCRIPTS/vsock-cp.py" "${socks[0]}" "$FILES_PORT" get "${src#vm:}" "$dst"
@@ -7455,7 +7482,9 @@ firecode - run a coding agent in a Firecracker microVM
   firecode shell                 interactive root shell in a VM
   firecode keys                  show what the guest receives for each keypress
   firecode cp SRC DST            move files in or out of a running VM,
-                                with vm: naming the guest side
+                                with vm: naming the guest side. A file
+                                replaces a file; vm:/dir/ copies into dir.
+                                --project DIR or --vm NAME picks the VM
   firecode exec CMD [args...]    run any command in a VM over this directory
 
   firecode attach [project]      reattach to a running session

@@ -7,7 +7,7 @@ through it, in either direction.
 
 usage:
   vsock-cp.py <uds> <port> get <guest-path> <host-path> [--limit MB]
-  vsock-cp.py <uds> <port> put <host-path> <guest-path>
+  vsock-cp.py <uds> <port> put <host-path> <guest-path>   (guest-path/ = into that directory)
 """
 
 import os
@@ -90,26 +90,60 @@ def get(sock, guest_path, host_path, limit):
     print(f"{n // 1024}K from {guest_path} into {host_path}")
 
 
-def put(sock, host_path, guest_path):
-    sock.sendall(f"PUT {guest_path}\n".encode())
-    if os.path.isdir(host_path):
-        cmd = ["tar", "-C", host_path, "-cf", "-", "."]
-    else:
-        cmd = ["tar", "-C", os.path.dirname(host_path) or ".", "-cf", "-",
-               os.path.basename(host_path)]
-    tar = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    n = 0
-    while True:
-        data = tar.stdout.read(BUF)
-        if not data:
-            break
-        sock.sendall(data)
-        n += len(data)
-    tar.stdout.close()
-    tar.wait()
-    # Let the guest finish unpacking before the socket goes away.
+def confirmation(sock):
+    """The guest's one-line answer to a PUT. Nothing at all is a failure: a
+    guest that took the bytes and said nothing - an older file server, or one
+    that died - has confirmed nothing, and saying "copied" then is how stale
+    files got run."""
     sock.shutdown(socket.SHUT_WR)
-    sock.recv(BUF)
+    reply = b""
+    while not reply.endswith(b"\n"):
+        chunk = sock.recv(BUF)
+        if not chunk:
+            break
+        reply += chunk
+    line = reply.decode(errors="replace").strip()
+    if line == "OK":
+        return
+    if line.startswith("ERR "):
+        raise SystemExit(f"refused by the guest: {line[4:]}")
+    raise SystemExit("the guest did not confirm the write - assume nothing was written"
+                     + (f" (it said {line!r})" if line else ""))
+
+
+def put(sock, host_path, guest_path):
+    """A file becomes a file and a directory's contents go into a directory.
+    The guest decides against what is actually there (see guest/fileserver.sh
+    for the rules); a destination ending in a slash means "into this
+    directory", the way cp and rsync read it."""
+    if os.path.isdir(host_path):
+        sock.sendall(f"PUTDIR {guest_path}\n".encode())
+        tar = subprocess.Popen(["tar", "-C", host_path, "-cf", "-", "."],
+                               stdout=subprocess.PIPE)
+        n = 0
+        while True:
+            data = tar.stdout.read(BUF)
+            if not data:
+                break
+            sock.sendall(data)
+            n += len(data)
+        tar.stdout.close()
+        if tar.wait() != 0:
+            raise SystemExit(f"reading {host_path} failed - the guest may hold part of it")
+    else:
+        if guest_path.endswith("/"):
+            guest_path += os.path.basename(host_path)
+        st = os.stat(host_path)
+        sock.sendall(f"PUTFILE {st.st_size} {st.st_mode & 0o777:o} {guest_path}\n".encode())
+        n = 0
+        with open(host_path, "rb") as fh:
+            while True:
+                data = fh.read(BUF)
+                if not data:
+                    break
+                sock.sendall(data)
+                n += len(data)
+    confirmation(sock)
     print(f"{n // 1024}K from {host_path} into {guest_path}")
 
 

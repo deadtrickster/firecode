@@ -928,6 +928,24 @@ test_deliver_never_overwrites() {
 	contains "and the work goes beside the project instead" "not delivering on top of it" "$out"
 }
 
+# `firecode cp host vm:path` against the real guest file server, over a
+# stand-in socket. It used to treat every destination as a directory: a file
+# copied onto an existing file left the old contents and exited 0, and onto a
+# missing path it made a directory of that name with the file inside. Three
+# runs executed a stale script because of it.
+test_cp_into_guest_replaces_files() {
+	local line out rc
+	out=$(python3 "$ROOT/tests/cp_into_guest.py" 2>&1)
+	rc=$?
+	while IFS= read -r line; do
+		case "$line" in
+		ok\ *) ok "${line#ok }" ;;
+		NO\ *) no "${line#NO }" ;;
+		esac
+	done <<<"$out"
+	((rc == 0)) || [[ $out == *NO\ * ]] || no "the cp-into-guest test ran" "$(tail -3 <<<"$out")"
+}
+
 # `firecode cp` unpacks what a guest sends. A refused archive used to leave
 # what came before the bad member on disk, and some refusals were tracebacks.
 test_cp_from_guest_is_all_or_nothing() {
@@ -1346,6 +1364,44 @@ test_second_shell_leaves_vm_running() {
 	grep -qE '^(ok|NO) ' <<<"$out" || no "the second-session test ran" "$(tail -3 <<<"$out")"
 }
 
+# The same rules as cp_into_guest_replaces_files, end to end through a real
+# guest: copy a file in, copy a changed version over it, and look at what the
+# guest has. This is the case that ran a stale script three times.
+test_cp_overwrites_in_vm() {
+	((QUICK)) && return 0
+	local p f sum want kind
+	p=$(make_project)
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
+		return 0
+	fi
+	ok "a VM starts"
+	f="$WORK/03-mirror.sh"
+	echo 'echo one' >"$f"
+	"$FIRECODE" cp --project "$p" "$f" vm:/tmp/cpt/03-mirror.sh >/dev/null 2>&1
+	check "a first copy lands" "echo one" \
+		"$("$FIRECODE" in --project "$p" cat /tmp/cpt/03-mirror.sh 2>/dev/null | tail -1)"
+	echo 'echo two, changed' >"$f"
+	if "$FIRECODE" cp --project "$p" "$f" vm:/tmp/cpt/03-mirror.sh >/dev/null 2>&1; then
+		ok "a copy over it exits 0"
+	else
+		no "a copy over it exits 0"
+	fi
+	want=$(md5sum <"$f" 2>/dev/null || md5 -q "$f")
+	want=${want%% *}
+	sum=$("$FIRECODE" in --project "$p" md5sum /tmp/cpt/03-mirror.sh 2>/dev/null | tail -1)
+	check "the guest has the new content" "$want" "${sum%% *}"
+	kind=$("$FIRECODE" in --project "$p" stat -c %F /tmp/cpt/03-mirror.sh 2>/dev/null | tail -1)
+	check "and it is a regular file" "regular file" "$kind"
+	if "$FIRECODE" cp --project "$p" "$f" vm:/tmp/cpt >/dev/null 2>&1; then
+		no "a file onto a directory is refused"
+	else
+		ok "a file onto a directory is refused"
+	fi
+	(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1656,6 +1712,7 @@ run_test terminal_escapes
 run_test relay_stays_on_upstream
 run_test spawn_server_scopes_callers
 run_test cp_from_guest_is_all_or_nothing
+run_test cp_into_guest_replaces_files
 run_test result_git_is_inert
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
@@ -1687,6 +1744,7 @@ run_test gate_cannot_be_forged_cheaply
 run_test add_dir_with_a_space
 run_test freed_memory_returns_to_host
 run_test libvirt_backend
+run_test cp_overwrites_in_vm
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted
