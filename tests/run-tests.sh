@@ -1437,6 +1437,35 @@ test_cp_overwrites_in_vm() {
 	(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
 }
 
+# `down` after a direct `up` delivers the work and says where. It used to
+# print "stopped" and return while the copy-out had not even started - in
+# another process - so a caller looking once for the result found nothing and
+# declared the work lost. The run's copy_out record is what a caller waits on.
+test_down_delivers_the_work() {
+	((QUICK)) && return 0
+	local p out id rec dest
+	p=$(make_project)
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
+		return 0
+	fi
+	ok "a VM starts"
+	id=$("$FIRECODE" list --ids 2>/dev/null | awk -v p="$p" '$2 == p {print $1; exit}')
+	"$FIRECODE" in --project "$p" --cwd "$p" sh -c 'echo made-in-the-vm >from-vm.txt' >/dev/null 2>&1
+	out=$("$FIRECODE" down --project "$p" 2>&1)
+	dest=$(sed -n 's/.*work delivered: //p' <<<"$out" | tail -1)
+	if [[ -n $dest ]]; then
+		ok "down says where the work went"
+	else
+		no "down says where the work went" "$(tail -3 <<<"$out")"
+	fi
+	check "and it is there when down returns" "made-in-the-vm" "$(cat "$dest/from-vm.txt" 2>/dev/null)"
+	rec=$(cat "$ROOT/runs/$id/copy_out" 2>/dev/null)
+	check "the run records it as done, with the path" "done $dest" "$rec"
+	rm -rf "$dest"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -1781,6 +1810,7 @@ run_test add_dir_with_a_space
 run_test freed_memory_returns_to_host
 run_test libvirt_backend
 run_test cp_overwrites_in_vm
+run_test down_delivers_the_work
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted

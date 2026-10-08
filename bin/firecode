@@ -2500,13 +2500,18 @@ fc_api() {
 cmd_up() {
 	local here=$PWD
 	local -a passthru=()
-	local fast=0
+	local fast=0 nosync=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--workdir | --project)
 			here=$(cd "$2" && pwd) || die "no such directory: $2"
 			passthru+=(--workdir "$here")
 			shift 2
+			;;
+		--no-sync)
+			nosync=1
+			passthru+=(--no-sync)
+			shift
 			;;
 		--fast)
 			fast=1
@@ -2584,6 +2589,13 @@ cmd_up() {
 					log "layer: NOT applied - the guest is up and is missing what firecode.layer asks for"
 			fi
 			log "up. firecode in <command>, firecode enter, firecode down"
+			# Which lifecycle this is, said up front: whether stopping it
+			# brings the work back is not something to find out afterwards.
+			if ((nosync)); then
+				log "ephemeral: --no-sync, nothing is copied out when it stops"
+			else
+				log "the work is copied out when it stops: firecode down waits for it and prints where"
+			fi
 			return 0
 		fi
 		# A VM that died is not a VM that is slow. Without this the loop waits
@@ -3678,26 +3690,113 @@ fi
 	esac
 }
 
+# The run directory a VM's socket belongs to, for the commands that are
+# handed a socket and need the run.
+run_of_socket() {
+	local sock=$1 r
+	for r in "$RUNS"/*/; do
+		[[ -f $r/jail ]] || continue
+		if [[ -f $r/vsock ]]; then
+			[[ $(cat "$r/vsock") == "$sock" ]] || continue
+		else
+			[[ "$(cat "$r/jail")/firecracker-vsock.sock" == "$sock" ]] || continue
+		fi
+		echo "${r%/}"
+		return 0
+	done
+	return 1
+}
+
+# Stop a VM, and do not say it is over until its work is out.
+#
+# The copy-out is done by the process that held the VM up, after the guest
+# has unmounted the project drive - so it starts after "stopped", in another
+# process. This used to return at "stopped", and the work appeared minutes
+# later, or (with nothing changed) never, with nothing to tell those apart.
+# Now `down` waits for the run's copy_out record and prints where the work is.
+# --no-wait stops it and returns; the record still tells a caller later.
 cmd_down() {
-	local want=""
-	[[ ${1:-} == --project ]] && want=$(realpath -m "$2")
-	local sock
+	local want="" nowait=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project)
+			want=$(realpath -m "$2")
+			shift 2
+			;;
+		--no-wait)
+			nowait=1
+			shift
+			;;
+		-h | --help)
+			echo "usage: firecode down [--project DIR | NAME] [--no-wait]"
+			return 0
+			;;
+		*)
+			want=$1
+			shift
+			;;
+		esac
+	done
+	local sock rd name
 	sock=$(require_vm_socket "$want")
-	log "stopping the VM"
+	rd=$(run_of_socket "$sock" || true)
+	name=$(cat "$rd/name" 2>/dev/null || true)
+	log "stopping the VM${name:+ $name}${rd:+ (${rd##*/})}"
 	# Asking it to shut down cleanly is what unmounts the project drive and
 	# lets the work be copied back.
 	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
 		"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
 	local waited=0
-	while ((waited < 60)); do
-		vm_reachable "$sock" || {
-			log "stopped"
+	while vm_reachable "$sock"; do
+		if ((waited >= 60)); then
+			log "it is taking its time; still shutting down"
+			[[ -n $rd ]] && log "  the copy-out will be recorded in $rd/copy_out"
 			return 0
-		}
+		fi
 		sleep 1
 		waited=$((waited + 1))
 	done
-	log "it is taking its time; still shutting down"
+	log "stopped"
+	[[ -n $rd ]] || return 0
+	if ((nowait)); then
+		log "the copy-out will be recorded in $rd/copy_out"
+		return 0
+	fi
+	down_wait_copy_out "$rd"
+}
+
+# Wait for a stopped run's copy-out and say how it ended. Waits while the
+# launcher that does it is alive, however long that is - a big tree takes
+# minutes, and giving up early is how work got declared lost.
+down_wait_copy_out() {
+	local rd=$1 state launcher waited=0
+	launcher=$(cat "$rd/launcher" 2>/dev/null || true)
+	while :; do
+		state=$(cat "$rd/copy_out" 2>/dev/null || true)
+		[[ -n $state && $state != pending ]] && break
+		if [[ -z $launcher ]] || ! kill -0 "$launcher" 2>/dev/null; then
+			# Gone. One last read: it may have finished as it went.
+			state=$(cat "$rd/copy_out" 2>/dev/null || true)
+			[[ -n $state && $state != pending ]] && break
+			if [[ -z $launcher ]]; then
+				log "this run records no copy-out (started by an older firecode) - look for ${rd##*/}'s result yourself"
+				return 0
+			fi
+			die "the run ended without finishing its copy-out (${state:-not started}) - see $rd/console.log"
+		fi
+		((waited > 0 && waited % 20 == 0)) && log "copying the work out ($((waited / 2))s)"
+		sleep 0.5
+		waited=$((waited + 1))
+	done
+	case "$state" in
+	done\ *)
+		log "work delivered: ${state#done }"
+		echo "${state#done }"
+		;;
+	none) log "nothing to deliver: the guest changed nothing (or the run had --no-sync)" ;;
+	failed*) die "copy-out ${state}" ;;
+	*) die "copy-out: unreadable record '$state' in $rd/copy_out" ;;
+	esac
 }
 
 cmd_enter() {
@@ -4401,6 +4500,25 @@ env_line() {
 	printf '%s=%q\n' "$1" "$2"
 }
 
+# THE COPY-OUT, AS A FACT ON THE RUN rather than a log line. A VM started by
+# `up` copies its work out when it stops, in the background process that held
+# it up - so `down` used to return "stopped" while the copy had not started,
+# and a caller that looked once for the result decided the work was lost. Now
+# runs/<id>/copy_out says, in one line:
+#
+#   pending              the copy-out has started and is not finished
+#   done <path>          the work is delivered, complete, at <path>
+#   none                 no directory delivered: nothing changed, or --no-sync
+#   failed <reason>      the copy-out did not finish
+#
+# Absent means the run has not got that far. Written to a temp file and
+# renamed, so a reader sees a whole line, never half of one.
+copy_out_mark() {
+	[[ -n ${RUN_DIR:-} && -d ${RUN_DIR:-} ]] || return 0
+	printf '%s\n' "$*" >"$RUN_DIR/.copy_out.$BASHPID" 2>/dev/null &&
+		mv -f "$RUN_DIR/.copy_out.$BASHPID" "$RUN_DIR/copy_out" 2>/dev/null || true
+}
+
 cancel_marker() {
 	local sig=${1:-unknown}
 	[[ -n ${RUN_DIR:-} && -d ${RUN_DIR:-} ]] || return 0
@@ -4416,6 +4534,11 @@ cancel_marker() {
 cleanup_run() {
 	local status=$?
 	trap - EXIT INT TERM PIPE HUP
+	# A copy-out that was interrupted is a failure, and has to say so: a
+	# "pending" nobody will ever finish is a caller waiting forever.
+	if [[ -n ${RUN_DIR:-} && $(cat "$RUN_DIR/copy_out" 2>/dev/null) == pending ]]; then
+		copy_out_mark "failed the run ended (status $status) before the copy-out finished"
+	fi
 	# The VM is a child, and a child outlives a parent that was killed. A
 	# closed pipe is enough to do that - which is how a stray VM per run got
 	# left behind by anything reading our output with head.
@@ -4897,6 +5020,9 @@ launch() {
 
 	printf '%s\n' "$WORKDIR" >"$RUN_DIR/project"
 	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
+	# The process that will do the copy-out once the VM stops. `down` waits on
+	# copy_out while this is alive, and knows not to once it is not.
+	printf '%s\n' "$BASHPID" >"$RUN_DIR/launcher"
 	# How to reach this VM's channels, whichever backend started it.
 	if [[ $VMM == libvirt ]]; then
 		alloc_libvirt_cid
@@ -6043,6 +6169,7 @@ EOF
 	fi
 	echo >&2
 	log "VM exited (status $rc)"
+	((SYNC_BACK)) || copy_out_mark none
 
 	if ((SYNC_BACK)) && [[ -n $WORKTREE ]]; then
 		# A worktree firecode made is scratch by construction - a branch to
@@ -6051,6 +6178,7 @@ EOF
 		# cd into it, diff it, merge it, delete it.
 		local tmp
 		tmp=$(mktemp -d "$RUNS/incoming.XXXXXX")
+		copy_out_mark pending
 		log "returning the work to the worktree at $WORKDIR"
 		extract_image "$src_drive" "$tmp"
 		rm -f "$tmp/.firecode-exit-status"
@@ -6067,6 +6195,7 @@ EOF
 		# Then whatever it did not commit.
 		rsync -a --delete --exclude=.git "$tmp"/ "$WORKDIR"/ 2>/dev/null || true
 		rm -rf "$tmp"
+		copy_out_mark "done $WORKDIR"
 
 		echo
 		echo "  worktree: $WORKDIR  (branch $WORKTREE)"
@@ -6085,6 +6214,7 @@ EOF
 			log "WARNING: $DELIVER exists and is not empty - not delivering on top of it"
 			log "  the work is in $out_dir instead"
 		fi
+		copy_out_mark pending
 		log "copying the project out to $out_dir"
 		# The copy-out is thousands of small files and it is the last thing a
 		# run does, so it is where inode exhaustion lands - and an empty result
@@ -6161,6 +6291,7 @@ EOF
 		# project is just litter to work out the meaning of later.
 		if [[ -z $DELIVER ]] && diff -rq --exclude=.git "$WORKDIR" "$out_dir" >/dev/null 2>&1; then
 			rm -rf "$out_dir"
+			copy_out_mark none
 			log "nothing changed, so no result directory"
 			echo
 			[[ -f $RUN_DIR/console.log ]] && echo "  console: $RUN_DIR/console.log"
@@ -6169,6 +6300,9 @@ EOF
 		fi
 		local saved
 		saved=$(link_unchanged "$WORKDIR" "$out_dir")
+		# The same string as runs/<id>/result, so the two never disagree.
+		[[ $out_dir == /* ]] || out_dir=$(realpath -m -- "$out_dir")
+		copy_out_mark "done $out_dir"
 
 		echo
 		echo "  result:  $out_dir"
