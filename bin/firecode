@@ -8307,6 +8307,38 @@ VM, so a later run can pick up where the last one stopped:
   firecode state sessions
   firecode claude --resume 3f9a1c2e "and update the docs"
 
+WHAT A PROJECT CAN PUT IN THE GUEST, AND PAY FOR ONCE.
+
+A VM's root is a stack, and the writable layer on top is PER PROJECT and
+KEPT - one sparse disk, made the first time a project boots and mounted
+into every VM over it afterwards. An install is therefore paid once and
+stays; and a project can DECLARE what should be there, in
+<project>/firecode.layer, where it sits in the repository and is versioned
+and reviewed with the code it provisions:
+
+  ENV KEY=value    exported for every RUN below it
+  RUN  <shell>     run in the guest as root, in the project directory
+  # comment
+
+No FROM: the base is the image `prepare` built. No COPY: the project is
+already mounted in the guest at the same absolute path, so a COPY would be
+a second and staler way to say what a path already says. It is applied
+BEFORE anybody is told the VM is up, and once per version of the file - an
+unchanged layer costs one exec and runs nothing, so a prepared project
+never reinstalls anything.
+
+Two things to know when writing one. A line that FAILS names itself, is not
+stamped, and is retried at the next boot, and the VM still comes up: a typo
+costs a retry rather than a project. And every line must be safe to RE-RUN,
+because the stamp is per FILE rather than per line - any edit re-runs every
+line below it, so guard a `git clone` with a directory test instead of
+letting it fail the second time.
+
+Because the layer is cached, an expensive step belongs HERE rather than in
+a setup script somebody remembers to run: a toolchain, or a library built
+from source. `--fresh-root` is what throws those away, and it takes what
+they installed with them.
+
 examples:
   firecode claude "add tests for the parser"
   firecode claude --timeout 3600 -- -p "fix the failing build" --model opus
