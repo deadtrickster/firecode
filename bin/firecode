@@ -8327,6 +8327,13 @@ BEFORE anybody is told the VM is up, and once per version of the file - an
 unchanged layer costs one exec and runs nothing, so a prepared project
 never reinstalls anything.
 
+One thing about ENV that is easy to get wrong and costs a probe to find:
+an ENV line is exported for the RUN lines BELOW IT IN THIS FILE and for
+nothing later. A variable a session needs after the VM is up - RUSTUP_HOME,
+say, when the toolchain lives outside $HOME - is not set by an ENV line; the
+layer has to write it where a login shell will read it, such as
+/etc/profile.d/.
+
 Two things to know when writing one. A line that FAILS names itself, is not
 stamped, and is retried at the next boot, and the VM still comes up: a typo
 costs a retry rather than a project. And every line must be safe to RE-RUN,
