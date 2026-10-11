@@ -57,7 +57,10 @@ firecode doctor                            # check the host is ready
 
 ### On a Mac
 
-Apple silicon and macOS 14 or later. There is no KVM, so no firecracker: the
+Apple silicon and macOS 14 or later. For step-by-step setup from a bare Mac - including putting
+`firecode` on PATH and driving it from letibot - see
+[letibot's firecode-on-macos.md](https://github.com/deadtrickster/letibot/blob/main/docs/firecode-on-macos.md);
+what follows is what is different here and why. There is no KVM, so no firecracker: the
 VMM is `firecode-vz`, a small Swift program in `macos/` over Apple's
 Virtualization.framework that speaks firecracker's config file, API socket
 and vsock protocol - everything above it is the same code. The guest is
@@ -68,6 +71,7 @@ xcode-select --install                     # swiftc, to build firecode-vz
 brew install bash coreutils gnu-sed findutils gawk grep e2fsprogs \
   socat flock rsync tmux zstd python@3.13
 
+ln -sf "$PWD/bin/firecode" /opt/homebrew/bin/firecode   # on PATH; links resolve
 firecode setup                             # builds firecode-vz, fetches the arm64 kernel
 firecode prepare --with "uv"               # first image, built in a VM
 firecode doctor
