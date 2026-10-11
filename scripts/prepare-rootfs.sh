@@ -7,7 +7,11 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-IMAGES="$ROOT/images"
+# The built artifacts are a per-host CACHE rather than source: gitignored, and
+# read by every checkout that boots a guest. FIRECODE_CACHE names one; unset, it
+# is this checkout, which is where a plain build puts them. See bin/firecode.
+CACHE=${FIRECODE_CACHE:-$ROOT}
+IMAGES="$CACHE/images"
 GUEST="$ROOT/guest"
 
 IMAGE_TAG=firecode/rootfs:latest
@@ -132,7 +136,14 @@ build_image() {
 # things to stop working - and --network=host steps around it without changing
 # what gets built.
 NET=""
-if ! bridge_resolves; then
+if [[ ${FIRECODE_PREPARE_HOST_NET:-0} == 1 ]]; then
+	# The DNS probe below only catches a dead resolver. A bridge whose DNS
+	# resolves but whose bandwidth to the release CDNs is broken (measured
+	# ~8 KB/s here against the host's ~14 MB/s) passes the probe and then
+	# stalls mid-download. Force host networking to step around both.
+	echo "[prepare] FIRECODE_PREPARE_HOST_NET=1 - building on the host network"
+	NET=host
+elif ! bridge_resolves; then
 	echo "[prepare] the docker bridge cannot resolve names - building on the host network"
 	NET=host
 fi
@@ -202,6 +213,20 @@ echo
 	exit 1
 }
 mv -f "$NEXT" "$OUT"
+
+# WHAT THE IMAGE WAS BUILT FROM, recorded beside it.
+#
+# Most of the harness rides along at run time, but what is baked into the image
+# does not: a checkout that has changed guest/ boots the image as it was, and
+# passes while testing none of the change. This is the stamp tests/run-tests.sh
+# compares against.
+#
+# Content, not mtime. A worktree is a fresh checkout, so every file in it is
+# newer than any image ever built, and an mtime comparison would fail every
+# branch. The paths are relative to the checkout so the hash is the same from a
+# worktree as from the tree that built it.
+( cd "$ROOT" && find guest -type f -print0 | sort -z | xargs -0 sha256sum ) |
+	sha256sum | cut -d' ' -f1 >"$IMAGES/.guest-inputs.sha256"
 echo "[prepare] rootfs ready:"
 ls -lh "$OUT"
 echo

@@ -9,9 +9,13 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-IMAGES="$ROOT/images"
+# The built artifacts are a per-host CACHE rather than source: gitignored, and
+# read by every checkout that boots a guest. FIRECODE_CACHE names one; unset, it
+# is this checkout, which is where a plain build puts them. See bin/firecode.
+CACHE=${FIRECODE_CACHE:-$ROOT}
+IMAGES="$CACHE/images"
 MAC="$IMAGES/macos"
-VZ="$ROOT/vendor/bin/firecode-vz"
+VZ="$CACHE/vendor/bin/firecode-vz"
 OUT=${1:?usage: bootstrap-rootfs.sh <out.ext4> [size] [tools]}
 SIZE=${2:-6G}
 TOOLS=${3:-}

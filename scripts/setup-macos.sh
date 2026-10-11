@@ -18,8 +18,12 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-IMAGES="$ROOT/images"
-VENDOR="$ROOT/vendor/bin"
+# The built artifacts are a per-host CACHE rather than source: gitignored, and
+# read by every checkout that boots a guest. FIRECODE_CACHE names one; unset, it
+# is this checkout, which is where a plain build puts them. See bin/firecode.
+CACHE=${FIRECODE_CACHE:-$ROOT}
+IMAGES="$CACHE/images"
+VENDOR="$CACHE/vendor/bin"
 MAC="$IMAGES/macos"
 PORTS=${FIRECODE_UBUNTU_PORTS:-http://ports.ubuntu.com/ubuntu-ports}
 SUITE=${FIRECODE_KERNEL_SUITE:-noble-updates}

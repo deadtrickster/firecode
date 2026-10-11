@@ -124,6 +124,40 @@ PY
 	echo "$home"
 }
 
+# A tree of its own with nothing in it: no runs, no state, no registry.
+#
+# firecode resolves all of those relative to ROOT, so this is how a test asks a
+# question about an empty host while a fleet runs on the real one. Read it
+# against the real ROOT and the answer depends on whatever else is up - a
+# subagent's VM, another session's - which is not what any of these are about.
+make_empty_root() {
+	local root="$WORK/emptyroot"
+	rm -rf "$root"
+	mkdir -p "$root"
+	echo "$root"
+}
+
+# A throwaway project registry: a tree of its own carrying a spawn.json, so a
+# test reads a registry it made rather than whatever this checkout happens to
+# have - which, on a host that never configured the spawn door, is nothing at
+# all, and `projects` then refuses.
+#
+# FIRECODE_ROOT is how a copy of the script is pointed at another tree; it is
+# what lets the registry live under $WORK instead of in the checkout.
+make_spawn_root() {
+	local root="$WORK/spawnroot"
+	rm -rf "$root"
+	mkdir -p "$root/projects/here" "$root/scratch/kid"
+	# `gone` is registered with no directory behind it on purpose: exists is
+	# reported rather than filtered, so a name whose directory has gone has to
+	# stay on the list - dropped, it reads as a name nobody ever registered.
+	cat >"$root/spawn.json" <<EOF
+{"projects": {"here": "$root/projects/here", "gone": "$root/projects/gone"},
+ "scratch_root": "$root/scratch"}
+EOF
+	echo "$root"
+}
+
 # Run a shell command inside a VM and print its output.
 in_vm() {
 	local project=$1
@@ -202,11 +236,14 @@ test_denylist() {
 		--add-dir "$WORK/secret" true 2>&1)
 	contains "denied as --add-dir" "refusing" "$out"
 
-	# The built-in list stands on its own, with no deny file at all.
-	mkdir -p "$HOME/.aws"
-	out=$(FIRECODE_DENY_FILE=/nonexistent "$FIRECODE" exec --workdir "$HOME/.aws" true 2>&1)
+	# The built-in list stands on its own, with no deny file at all. Asked in
+	# a home of its own: this used to create and remove it in the real one, and
+	# keeping it separate leaves the fixture the later checks count alone.
+	local creds="$WORK/credentialhome"
+	mkdir -p "$creds/.aws"
+	out=$(HOME="$creds" FIRECODE_DENY_FILE=/nonexistent \
+		"$FIRECODE" exec --workdir "$creds/.aws" true 2>&1)
 	contains "credential directories refused without any config" "refusing" "$out"
-	rmdir "$HOME/.aws" 2>/dev/null
 
 	# Credential spots beyond the original list, in a fake home so nothing
 	# real is created or removed.
@@ -1216,6 +1253,37 @@ test_shellcheck() {
 	fi
 }
 
+# The guest image is a cache shared by every checkout, and most of the harness
+# rides along at run time - but what is BAKED IN does not. A checkout that has
+# changed guest/ boots the image as it was built and passes while testing none
+# of the change, which is the one way a shared cache can lie.
+#
+# `prepare` records what it built from; this compares. Content, not mtime: a
+# worktree is a fresh checkout, so every file in it is newer than any image
+# ever built, and an mtime check would fail every branch.
+#
+# Skipped, and said so, when there is no stamp: an image built before this
+# existed is not evidence of anything, and failing every host that has one
+# would make this a rebuild demand rather than a check.
+test_cached_image_matches_guest() {
+	local cache stamp want got
+	cache=${FIRECODE_CACHE:-$ROOT}
+	stamp="$cache/images/.guest-inputs.sha256"
+	if [[ ! -f $stamp ]]; then
+		ok "the cached image matches this guest/ (skipped: no stamp - firecode prepare records one)"
+		return
+	fi
+	want=$(cat "$stamp")
+	got=$(cd "$ROOT" && find guest -type f -print0 | sort -z |
+		xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+	if [[ $want == "$got" ]]; then
+		ok "the cached image was built from this guest/"
+	else
+		no "the cached image was built from this guest/" \
+			"guest/ has changed since it was built, so the image is stale and this run tested the old one: run firecode prepare"
+	fi
+}
+
 # ------------------------------------------------------------- lifetime
 #
 # What a VM's lifetime has to guarantee, stated as behaviour rather than as
@@ -1906,9 +1974,14 @@ test_proc_mounted() {
 # answers must DIFFER. One reading could never tell "honoured it" from "never
 # looked at it".
 test_ps_json_is_not_the_prose() {
-	local prose json parsed
-	prose=$("$FIRECODE" ps 2>&1)
-	json=$("$FIRECODE" ps --json 2>&1)
+	local root prose json parsed
+	# Against a tree with no runs of its own. This read the real runs/ and so
+	# asserted about the whole host: the roster had to be empty, and went red
+	# the moment anything was up that this suite did not start. The empty case
+	# is the thing being checked, so the test brings its own.
+	root=$(make_empty_root)
+	prose=$(FIRECODE_ROOT="$root" "$FIRECODE" ps 2>&1)
+	json=$(FIRECODE_ROOT="$root" "$FIRECODE" ps --json 2>&1)
 
 	if [[ $prose == "$json" ]]; then
 		no "--json changes the answer" "both arms printed [$prose]"
@@ -1929,7 +2002,7 @@ print(type(d["vms"]).__name__, len(d["vms"]))
 	# An unknown flag must refuse rather than be swallowed, for the same
 	# reason: silently accepting one is how a caller believes it asked for
 	# something it did not get.
-	if "$FIRECODE" ps --nonsense >/dev/null 2>&1; then
+	if FIRECODE_ROOT="$root" "$FIRECODE" ps --nonsense >/dev/null 2>&1; then
 		no "an unknown ps flag is refused" "exited 0"
 	else
 		ok "an unknown ps flag is refused"
@@ -1942,6 +2015,10 @@ print(type(d["vms"]).__name__, len(d["vms"]))
 # Two programs reading one config file disagree the day its shape changes, and
 # the second one finds out in production - so the contract asserted here is the
 # VERB, and it has to keep answering even when the caller is a machine.
+#
+# It reads a registry the test made, not the one this checkout may or may not
+# have: a test that needs the host to have configured a spawn door fails on
+# every host that has not, which says nothing about the verb.
 # A copy of a project inherits the layers its source has attached - what
 # letibot asks for when it boots a subagent's VM on a copy of the workspace.
 # Host-side only: the attachments are a file, and inheriting needs no docker.
@@ -1975,9 +2052,10 @@ test_layer_inherit() {
 }
 
 test_projects_is_a_registry_not_a_config_file() {
-	local prose json shape
-	prose=$("$FIRECODE" projects 2>&1)
-	json=$("$FIRECODE" projects --json 2>&1)
+	local root prose json shape
+	root=$(make_spawn_root)
+	prose=$(FIRECODE_ROOT="$root" "$FIRECODE" projects 2>&1)
+	json=$(FIRECODE_ROOT="$root" "$FIRECODE" projects --json 2>&1)
 
 	if [[ $prose == "$json" ]]; then
 		no "projects --json changes the answer" "both arms printed the same"
@@ -1999,7 +2077,19 @@ print(",".join(keys))
 	check "each project says its name, its path and whether it is there" \
 		"exists,name,path" "$shape"
 
-	if "$FIRECODE" projects --nope >/dev/null 2>&1; then
+	# The roster, not one row: a registered name, a name whose directory has
+	# gone and is marked rather than dropped, and one made under the scratch
+	# root - what is on disk is the truth, the same way the spawn server reads
+	# it.
+	contains "a registered project is listed" '"name": "here"' "$json"
+	contains "a project whose directory has gone is still listed" \
+		'"name": "gone"' "$json"
+	contains "and is marked gone rather than dropped" '"exists": false' "$json"
+	contains "a directory under the scratch root is in the roster" \
+		'"name": "kid"' "$json"
+	contains "the prose marks the missing one" "(MISSING)" "$prose"
+
+	if FIRECODE_ROOT="$root" "$FIRECODE" projects --nope >/dev/null 2>&1; then
 		no "an unknown projects flag is refused" "exited 0"
 	else
 		ok "an unknown projects flag is refused"
@@ -2011,6 +2101,7 @@ print(",".join(keys))
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
 
 run_test shellcheck
+run_test cached_image_matches_guest
 run_test ps_json_is_not_the_prose
 run_test projects_is_a_registry_not_a_config_file
 run_test layer_inherit

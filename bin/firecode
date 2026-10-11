@@ -50,13 +50,31 @@ if [[ $(uname -s) == Darwin ]]; then
 	export PATH
 fi
 
-IMAGES="$ROOT/images"
+# The built artifacts - the guest rootfs image, its initrd, the kernel and the
+# firecracker binaries - are a CACHE rather than source. They are gitignored
+# because no branch owns them and building one is twenty minutes to an hour, and
+# they are per HOST rather than per checkout: every VM attaches that same 6G
+# image as a read-only lower drive.
+#
+# FIRECODE_CACHE points at a cache laid out the way a checkout that has built
+# one is (`<cache>/images`, `<cache>/vendor`). Left unset it is the checkout
+# itself, which is where `firecode prepare` and `firecode setup` put them - so a
+# plain checkout reads exactly what it always did.
+#
+# It exists for a git worktree: that is a separate working directory, so it
+# inherits none of the ignored files, and anything that boots a guest there
+# finds no image, no kernel and no firecracker.
+#
+# RUNS, STATE_DIR and JAIL_BASE are deliberately NOT cached. A run and a jail
+# belong to the checkout that made them.
+CACHE=${FIRECODE_CACHE:-$ROOT}
+IMAGES="$CACHE/images"
 # The image whose e2fsprogs does the ext4 conversion, as root inside a
 # container. Same trick prepare uses, and the reason none of this needs sudo.
 CONVERTER_IMAGE="${FIRECODE_CONVERTER_IMAGE:-firecode/rootfs:latest}"
 GUEST="$ROOT/guest"
 SCRIPTS="$ROOT/scripts"
-VENDOR="$ROOT/vendor/bin"
+VENDOR="$CACHE/vendor/bin"
 RUNS="$ROOT/runs"
 STATE_DIR="$ROOT/state"
 JAIL_BASE="$ROOT/.jail"
@@ -3118,6 +3136,13 @@ cmd_prepare_in_vm() {
 
 	mv -f "$ROOTFS" "$ROOTFS.previous"
 	mv -f "$out" "$ROOTFS"
+
+	# What this image was built from, so a checkout can tell whether the image it
+	# is about to boot still matches its own guest/. Same stamp as the docker
+	# path in scripts/prepare-rootfs.sh, and the same reasons: content rather
+	# than mtime, and paths relative to the checkout.
+	( cd "$ROOT" && find guest -type f -print0 | sort -z | xargs -0 sha256sum ) |
+		sha256sum | cut -d' ' -f1 >"$IMAGES/.guest-inputs.sha256"
 	((keep)) || rm -rf "$work"
 	log "rootfs built in a VM: $(du -h "$ROOTFS" | cut -f1)"
 	log "  the one it replaced is at $(basename "$ROOTFS").previous"

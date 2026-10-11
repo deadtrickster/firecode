@@ -10,7 +10,11 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-CACHE="$ROOT/vendor/guest"
+# These belong with the other built artifacts and follow the same cache root.
+# The local name is not CACHE: tree-wide that is the cache root itself, in
+# bin/firecode and the other scripts.
+CACHE_ROOT=${FIRECODE_CACHE:-$ROOT}
+AGENT_CACHE="$CACHE_ROOT/vendor/guest"
 agent=${1:?usage: guest-agent-bin.sh claude|opencode <host-binary>}
 host=${2:?}
 
@@ -23,13 +27,13 @@ version=$("$host" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | he
 	true
 [[ -n $version ]] || die "could not tell which version $host is"
 
-out="$CACHE/$agent-$version-linux-arm64"
+out="$AGENT_CACHE/$agent-$version-linux-arm64"
 if [[ -x $out ]]; then
 	echo "$out"
 	exit 0
 fi
-mkdir -p "$CACHE"
-tmp=$(mktemp "$CACHE/.$agent.XXXXXX")
+mkdir -p "$AGENT_CACHE"
+tmp=$(mktemp "$AGENT_CACHE/.$agent.XXXXXX")
 trap 'rm -f "$tmp" "$tmp.tgz"' EXIT
 
 case $agent in
