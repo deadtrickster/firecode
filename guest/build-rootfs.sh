@@ -53,6 +53,10 @@ BASE=$BASE,file,bash-completion,busybox-static,cpio
 # FUSE: the kernel has always had it, and without the userspace half a
 # filesystem written in a VM cannot be mounted there.
 BASE=$BASE,fuse3,libfuse3-dev,libfuse-dev,python3-fusepy,python3-pyfuse3
+# A container runtime, because the projects that most need isolating are the
+# ones whose test stack is a compose file. iptables for its NAT; the modules
+# both need come from the modules drive, not from here.
+BASE=$BASE,docker.io,docker-compose-v2,docker-buildx,iptables
 # Postgres is NOT in this list on purpose - see the PGDG step below. Noble
 # ships PostgreSQL 16, and a gate that tests against a version nobody runs is
 # testing a hypothetical.
@@ -147,6 +151,17 @@ sudo -n chroot "$TREE" /bin/bash -s "$PGVERSION" <<-'PGDG'
 		;;
 	esac
 PGDG
+
+say "docker on demand, not at boot"
+# Socket-activated: dockerd and containerd start on the first docker command,
+# so a VM that never uses them pays nothing at boot - which is every VM that
+# is not building a container stack. Deleting the .wants links is what
+# `systemctl disable` does, and works in a chroot.
+sudo -n rm -f "$TREE/etc/systemd/system/multi-user.target.wants/docker.service" \
+	"$TREE/etc/systemd/system/multi-user.target.wants/containerd.service"
+sudo -n install -d "$TREE/etc/systemd/system/sockets.target.wants"
+sudo -n ln -sf /lib/systemd/system/docker.socket \
+	"$TREE/etc/systemd/system/sockets.target.wants/docker.socket"
 
 say "installing the harness"
 sudo -n install -d "$TREE/opt/firecode"

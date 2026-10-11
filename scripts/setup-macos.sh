@@ -159,6 +159,39 @@ else
 	printf '%s\n' "$ver" >"$MAC/kernel-version"
 fi
 
+# EVERY MODULE, on a drive of its own. The initramfs carries the four the root
+# needs, which is all a guest ever had - so modprobe found nothing by name, and
+# docker died on its bridge, its netfilter and its conntrack, none of which are
+# built in. The whole tree is ~170M as Ubuntu ships it (compressed .ko.zst), so
+# rather than a hand-kept list that the next capability would extend again, the
+# guest gets all of it: read-only, shared by every VM, built once per kernel.
+#
+# No modules.dep: that is depmod's, which has no macOS build. The guest makes
+# the indices on a layer over this drive and keeps them per project.
+ver=$(cat "$MAC/kernel-version")
+MODDRIVE="$IMAGES/modules-$ver.ext4"
+if [[ -f $MODDRIVE ]] && ((!FORCE)); then
+	say "modules drive already present: $(basename "$MODDRIVE")"
+else
+	command -v mkfs.ext4 >/dev/null || {
+		echo "setup: mkfs.ext4 is missing - brew install e2fsprogs" >&2
+		exit 1
+	}
+	if [[ ! -d $TMP/mod/lib/modules/$ver ]]; then
+		fetch_index
+		say "linux-modules-$ver"
+		fetch_deb "linux-modules-$ver" "$TMP/mod"
+	fi
+	tree="$TMP/mod/lib/modules/$ver"
+	# The drive is the version's directory itself: it mounts at
+	# /lib/modules/<ver>. Sized from what is in it, with room for the
+	# indices that a layer adds on top rather than on this drive.
+	kb=$(du -sk "$tree" | cut -f1)
+	mkfs.ext4 -q -F -L firecode-modules -d "$tree" "$MODDRIVE.new" "$((kb * 5 / 4 + 32768))k"
+	mv -f "$MODDRIVE.new" "$MODDRIVE"
+	say "modules drive: $(basename "$MODDRIVE") ($(du -h "$MODDRIVE" | cut -f1) on disk)"
+fi
+
 # An initramfs: busybox, the modules, and an init. Owned by root inside the
 # archive whatever owns the files out here.
 make_initrd() {

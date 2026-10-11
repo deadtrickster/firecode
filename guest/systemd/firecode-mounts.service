@@ -3,6 +3,12 @@ Description=firecode guest setup (drives, network, MCP relays)
 After=systemd-udevd.service local-fs.target
 Wants=systemd-udevd.service
 Before=firecode-agent.service serial-getty@ttyS0.service serial-getty@hvc0.service
+# Its storage is put on the workspace layer here, and the modules it loads
+# made reachable - both before either daemon can start. The services, not
+# docker.socket: that is in sockets.target, which basic.target - and so this
+# unit - comes after, and ordering before it would be a cycle systemd breaks by
+# dropping a job. The socket only starts the service on first use anyway.
+Before=docker.service containerd.service
 
 [Service]
 Type=oneshot

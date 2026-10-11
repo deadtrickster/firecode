@@ -404,6 +404,10 @@ priv() {
 KERNEL=""
 ROOTFS=""
 INITRD=""
+# Every module of a distribution kernel, on a read-only drive of its own (see
+# setup-macos.sh). Empty where the kernel has what it needs built in.
+MODULES_DRIVE=""
+MODULES_VERSION=""
 # "" the stock kernel, "debug" the traceable one, or a path.
 WANT_KERNEL="${FIRECODE_KERNEL:-}"
 
@@ -473,6 +477,19 @@ resolve_assets() {
 	# Assembles the layered root before handing over to the guest's init.
 	INITRD="$IMAGES/initrd.gz"
 	[[ -f $INITRD ]] || asset_missing "no initrd - rebuild with: firecode prepare --force"
+
+	# The modules that go with this kernel, named by its version. Optional:
+	# without them a guest still boots, it just cannot modprobe anything -
+	# which is how docker comes to die on its bridge.
+	MODULES_DRIVE="" MODULES_VERSION=""
+	if [[ $(basename "$KERNEL") =~ ^vmlinux-(.+)-arm64$ ]]; then
+		MODULES_VERSION=${BASH_REMATCH[1]}
+		MODULES_DRIVE="$IMAGES/modules-$MODULES_VERSION.ext4"
+		if [[ ! -f $MODULES_DRIVE ]]; then
+			log "no modules drive for $MODULES_VERSION - modprobe will find nothing (firecode setup builds it)"
+			MODULES_DRIVE="" MODULES_VERSION=""
+		fi
+	fi
 }
 
 # ---------------------------------------------------------------- host MCP
@@ -2567,10 +2584,13 @@ USAGE
 	uplog=$(mktemp "$RUNS/up.XXXXXX.log") || die "cannot create a log in $RUNS"
 
 	# Held open by a process that does nothing, so the VM stays up until it is
-	# told to stop.
+	# told to stop. Named, so `down` can end it rather than reboot the guest
+	# out from under it: ending the "agent" is what lets the entrypoint go on to
+	# a --verify gate, and exiting 0 on TERM keeps the run's status the gate's
+	# rather than a 143 that means only "it was stopped".
 	log "starting a VM and leaving it up (log: $uplog)"
 	nohup setsid "$SELF" exec ${passthru+"${passthru[@]}"} --timeout 0 -- \
-		sh -c 'while :; do sleep 3600; done' \
+		sh -c 'trap "exit 0" TERM; while :; do sleep 3600 & wait $!; done' firecode-idle \
 		>"$uplog" 2>&1 &
 	local child=$!
 	disown 2>/dev/null || true
@@ -3762,10 +3782,40 @@ cmd_down() {
 	rd=$(run_of_socket "$sock" || true)
 	name=$(cat "$rd/name" 2>/dev/null || true)
 	log "stopping the VM${name:+ $name}${rd:+ (${rd##*/})}"
-	# Asking it to shut down cleanly is what unmounts the project drive and
-	# lets the work be copied back.
-	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
-		"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
+
+	# A VM that `up` started is held by an idle loop. Ending that loop rather
+	# than rebooting the guest lets the entrypoint finish the way an
+	# unattended run does: agent exited, then the --verify gate if there is
+	# one, then the verdict written into the tree, then shutdown and copy-out.
+	# A reboot killed the loop and the entrypoint together, so a gate given to
+	# `up` never ran - a placed agent's "done" was only its word.
+	#
+	# [f]irecode-idle so the pattern does not match the shell running pkill.
+	local verify=""
+	[[ -n $rd && -f $rd/ctl/env ]] &&
+		verify=$(
+			set +u
+			# shellcheck disable=SC1091  # the run's own env, written by this host
+			. "$rd/ctl/env" 2>/dev/null
+			printf '%s' "${FIRECODE_VERIFY:-}"
+		)
+	if python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+		"sudo pkill -TERM -f '[f]irecode-idle'" >/dev/null 2>&1; then
+		if [[ -n $verify ]]; then
+			log "running its gate before it stops: $verify"
+			[[ -n $rd ]] && ((!nowait)) && {
+				down_wait_copy_out "$rd"
+				down_report_verdict "$rd"
+				return
+			}
+		fi
+	else
+		# Not an idle `up` VM, or started by an older firecode: the guest is
+		# asked to shut down, which is what unmounts the project drive and
+		# lets the work be copied back.
+		python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+			"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
+	fi
 	local waited=0
 	while vm_reachable "$sock"; do
 		if ((waited >= 60)); then
@@ -3783,6 +3833,21 @@ cmd_down() {
 		return 0
 	fi
 	down_wait_copy_out "$rd"
+	down_report_verdict "$rd"
+}
+
+# The gate's verdict, as the run recorded it - not as anybody described it.
+# Said, not returned: down's status is whether the VM stopped and its work came
+# out. The verdict is a file on the run (verify-status) for anything to read.
+down_report_verdict() {
+	local rd=$1 v
+	v=$(cat "$rd/verify-status" 2>/dev/null || true)
+	case "$v" in
+	"") ;;
+	0) log "verify passed" ;;
+	missing) log "VERIFY GAVE NO VERDICT - the gate never reported; counted as a failure" ;;
+	*) log "VERIFY FAILED (exit $v) - its output is .firecode-verify.log in the delivered work" ;;
+	esac
 }
 
 # Wait for a stopped run's copy-out and say how it ended. Waits while the
@@ -5252,7 +5317,9 @@ launch() {
 	# rebuilt one no longer means a stale checkpoint. What remains is the
 	# substrate the guest's memory actually describes - kernel, base image,
 	# the layers under it - plus the agent binary, handled inside.
-	memstamp=$(memcheck_stamp "$WORKDIR" "$KERNEL" "$INITRD" "$ROOTFS" \
+	# The modules drive is in the stamp because it is in the machine: a
+	# checkpoint taken with it cannot be restored into a VM without it.
+	memstamp=$(memcheck_stamp "$WORKDIR" "$KERNEL" "$INITRD" "$ROOTFS" ${MODULES_DRIVE:+"$MODULES_DRIVE"} \
 		"$(layers_of_project "$SLUG")" ${early_layer:+"$early_layer"})
 	((REFRESH)) && rm -rf "$memdir"
 	((FAST)) && memcheck_valid "$memdir" "$memstamp" && restoring=1
@@ -5404,6 +5471,9 @@ launch() {
 		# file is already inside an image. The guest pairs them with the last
 		# N virtio disks, which is exactly where these are attached.
 		env_line FIRECODE_DISKS "$(disk_mounts)"
+		# Which kernel the modules drive is for, so the guest mounts it only
+		# when there is one - and never waits for a label that is not coming.
+		env_line FIRECODE_MODULES "$MODULES_VERSION"
 		# Read from the project, not from wherever firecode happens to live, so
 		# a repo-local identity wins the same way it would on the host.
 		env_line FIRECODE_GIT_NAME "$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)"
@@ -5764,7 +5834,8 @@ launch() {
 	# The read-only drives are shared with the live project either way - the
 	# guest never writes to them, so there is nothing to diverge. A restore
 	# brings its own copies of the rest, and building them would be wasted.
-	local -a into_jail=("$KERNEL" "$INITRD" ${lower_drives+"${lower_drives[@]}"})
+	local -a into_jail=("$KERNEL" "$INITRD" ${lower_drives+"${lower_drives[@]}"}
+		${MODULES_DRIVE:+"$MODULES_DRIVE"})
 	((restoring)) || into_jail+=(
 		"$workspace_layer" "$src_drive" "$ctl_drive"
 		"$state_drive" ${extra_drives+"${extra_drives[@]}"}
@@ -5847,6 +5918,12 @@ launch() {
 	add_drive "control" "$ctl_drive" true
 	next_dev
 	add_drive "state" "$state_drive" false
+	# Found by label, like the ones above; before the extras and the --disk
+	# drives, which the guest counts from the end.
+	if [[ -n $MODULES_DRIVE ]]; then
+		next_dev
+		add_drive "modules" "$MODULES_DRIVE" true
+	fi
 	local xi=0
 	for f in ${extra_drives+"${extra_drives[@]}"}; do
 		xi=$((xi + 1))

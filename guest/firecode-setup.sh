@@ -158,6 +158,70 @@ setup_network_dhcp() {
 	fi
 }
 
+# The kernel's whole module tree, from a read-only drive shared by every VM,
+# so modprobe works the way it does on any machine - docker loads bridge,
+# br_netfilter, nf_tables and the rest by name, and the kernel asks for more by
+# alias as they are used.
+#
+# The drive has no indices: those are made by depmod, which only runs here.
+# They go on a tmpfs layer over the drive, and are kept on the state drive
+# keyed by kernel version, so a project pays depmod's second once rather than
+# every boot.
+setup_modules() {
+	local ver=${FIRECODE_MODULES:-}
+	[[ -n $ver ]] || return 0
+	[[ $ver == "$(uname -r)" ]] || {
+		log "WARNING: modules drive is for $ver, this kernel is $(uname -r) - not mounted"
+		return 0
+	}
+	local dir=/lib/modules/$ver ro=/run/firecode/modules-ro rw=/run/firecode/modules-rw
+	mkdir -p "$ro" "$rw" "$dir"
+	mount_label firecode-modules "$ro" -o ro || return 0
+	mount -t tmpfs -o mode=0755 tmpfs "$rw"
+	mkdir -p "$rw/upper" "$rw/work"
+	mount -t overlay overlay -o "lowerdir=$ro,upperdir=$rw/upper,workdir=$rw/work" "$dir" || {
+		log "WARNING: could not layer the module indices over $ro"
+		return 0
+	}
+	local cache=$STATE/modules-index/$ver
+	if [[ -f $cache/modules.dep.bin ]]; then
+		cp -a "$cache/." "$dir/"
+	elif depmod -a "$ver" 2>/dev/null; then
+		mkdir -p "$cache"
+		cp -a "$dir"/modules.*.bin "$dir"/modules.dep "$dir"/modules.alias \
+			"$dir"/modules.symbols "$dir"/modules.softdep "$dir"/modules.devname \
+			"$cache/" 2>/dev/null || true
+	else
+		log "WARNING: depmod failed - modprobe will not resolve modules by name"
+		return 0
+	fi
+	log "kernel modules available ($ver)"
+}
+
+# Where docker and containerd keep images and layers.
+#
+# Not on the root: it is an overlay, and their overlay2/overlayfs drivers
+# cannot mount an overlay whose upper directory is itself on one ("failed to
+# mount overlay: invalid argument"). The workspace layer is a real ext4 under
+# that overlay - mounted at /firecode/upper - so their state lives there, beside
+# the layer's own upper/: pulled images survive the VM the way installed
+# packages do, per workspace, and a checkpoint captures them with the layer.
+setup_container_storage() {
+	[[ -d /firecode/upper/upper ]] || return 0
+	local d
+	for d in docker containerd; do
+		mkdir -p "/firecode/upper/$d" "/var/lib/$d"
+		mountpoint -q "/var/lib/$d" ||
+			mount --bind "/firecode/upper/$d" "/var/lib/$d" ||
+			log "WARNING: could not put /var/lib/$d on the workspace layer"
+	done
+	# Without sudo, as on a workstation. The group exists once docker is
+	# installed, whether baked into the image or apt-installed in a run.
+	if getent group docker >/dev/null && [[ ${FIRECODE_USER:-root} != root ]]; then
+		usermod -aG docker "$FIRECODE_USER" 2>/dev/null || true
+	fi
+}
+
 # Services the host keeps on its loopback - MCP servers, a local llama-server,
 # anything else asked for with --host-port. Firecracker forwards a guest vsock
 # connection to CID 2 port N onto the host unix socket <uds_path>_N, where a
@@ -388,6 +452,9 @@ main() {
 	# Must be mounted before the overlays: it holds their upper layers, which
 	# is what makes the agent's sessions survive the VM.
 	mount_label firecode-state "$STATE"
+
+	setup_modules
+	setup_container_storage
 
 	overlay_home claude
 	overlay_home opencode

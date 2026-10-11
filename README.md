@@ -496,6 +496,52 @@ could not start are different things. Several VMs can be up at once, one per
 project; `--project DIR` says which, and asking ambiguously lists them rather
 than guessing.
 
+A VM that stays up can be held to a gate too. `firecode up --verify 'CMD'`
+runs `CMD` when the VM is brought down - after whatever was done in it, before
+the guest stops, in the project as it will be delivered - and `down` says the
+verdict beside where the work went:
+
+```
+[firecode] running its gate before it stops: make e2e
+[firecode] work delivered: /home/you/Projects/thing-20261011-194613-30065
+[firecode] VERIFY FAILED (exit 2) - its output is .firecode-verify.log in the delivered work
+```
+
+The verdict is also a file on the run, `runs/<id>/verify-status`, for whatever
+placed the VM to read rather than parse. This is what makes a VM driven with
+`up`/`in`/`down` - an agent on the host using the guest as its hands - as
+checkable as an unattended run: before it, `down` rebooted the guest out from
+under the gate, so a `--verify` given to `up` never ran.
+
+## Containers inside a guest
+
+The projects that most need isolating are often the ones whose test stack is a
+compose file, so a guest runs docker:
+
+```sh
+firecode up --mem 16384 --vcpu 8
+firecode in 'docker compose up -d --wait && make e2e'
+```
+
+docker, compose and buildx are in the image, socket-activated: nothing starts
+at boot, and the first docker command starts the daemon. Your account is in the
+`docker` group. Two things make it work, and both are worth knowing when it
+does not:
+
+- **Every kernel module is there.** A guest used to have only the four its root
+  needs, so docker died on its bridge, its netfilter and its conntrack. The
+  whole module tree now comes on a read-only drive shared by every VM
+  (`images/modules-<ver>.ext4`, built by `setup`), and `modprobe` works by name.
+  `depmod`'s indices are made in the guest and kept per project. This is the
+  Mac's kernel, Ubuntu's. On Linux the guest boots firecracker's kernel, which
+  has no loadable modules: whether it has docker's bridge and netfilter built
+  in has not been checked, and if it has not, `scripts/build-kernel.sh`'s
+  config list is the place to add them.
+- **Its storage is not on the root.** The root is an overlay, and docker's
+  overlay2 cannot mount inside one. `/var/lib/docker` and `/var/lib/containerd`
+  are on the workspace layer's own filesystem instead - so pulled and built
+  images survive the VM, per workspace, like anything else it installs.
+
 ## Delegating a job, and staying in the conversation
 
 An unattended run is not a black box. It says what it is doing as it does it,

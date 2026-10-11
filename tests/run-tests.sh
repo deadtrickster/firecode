@@ -1256,6 +1256,61 @@ start_vm() {
 	(cd "$dir" && "$FIRECODE" up --no-jail --no-net --mem 1024 "$@" >/dev/null 2>&1)
 }
 
+# A gate given to `up` runs at `down`. `down` used to reboot the guest out from
+# under the idle loop that holds an `up` VM, which killed the entrypoint before
+# it reached the gate - so the check was accepted and never run, and anything
+# driving a VM with up/in/down had only its own word for "done".
+test_up_gate_runs_at_down() {
+	((QUICK)) && return 0
+	local p rd out
+	p=$(make_project)
+	if ! start_vm "$p" --verify 'test -f gate-ok'; then
+		no "a VM with a gate starts"
+		return 0
+	fi
+	out=$(cd "$p" && "$FIRECODE" down --project "$p" 2>&1)
+	contains "down runs the gate and says it failed" "VERIFY FAILED (exit 1)" "$out"
+	contains "and says where the work went" "work delivered:" "$out"
+	# The run this project just had: run directories are named by start time,
+	# so the last one naming the project is it.
+	rd=$(grep -lx -- "$p" "$ROOT"/runs/*/project 2>/dev/null | tail -1)
+	check "the verdict is a file on the run" "1" "$(cat "${rd%/project}/verify-status" 2>/dev/null)"
+
+	if ! start_vm "$p" --verify 'test -f gate-ok'; then
+		no "a second VM with a gate starts"
+		return 0
+	fi
+	(cd "$p" && "$FIRECODE" in 'touch gate-ok' >/dev/null 2>&1)
+	out=$(cd "$p" && "$FIRECODE" down --project "$p" 2>&1)
+	contains "a gate that holds is said to pass" "verify passed" "$out"
+}
+
+# What docker needs from a guest, short of pulling an image (the suite runs
+# without a network): modules found by name, storage that is not on the overlay
+# root, and a daemon that starts. Each of these was the one docker died on.
+test_containers_have_what_they_need() {
+	((QUICK)) && return 0
+	if [[ $(uname -s) != Darwin ]]; then
+		ok "containers in a guest (skipped: checked on the Mac's kernel, which has modules)"
+		return 0
+	fi
+	local p out
+	p=$(make_project)
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		return 0
+	fi
+	out=$(cd "$p" && "$FIRECODE" in --project "$p" '
+		sudo modprobe bridge && sudo modprobe br_netfilter && sudo modprobe nf_tables && echo MODULES-OK
+		findmnt -no FSTYPE /var/lib/docker
+		docker info --format "{{.ServerVersion}} {{.Driver}}" 2>&1 | tail -1
+	' 2>&1)
+	contains "bridge, br_netfilter and nf_tables load by name" "MODULES-OK" "$out"
+	contains "docker's storage is a real filesystem, not the overlay root" "ext4" "$out"
+	contains "the daemon starts, on overlay2" "overlay2" "$out"
+	(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
+}
+
 test_vm_stops_completely() {
 	((QUICK)) && return 0
 	local p
@@ -1928,6 +1983,8 @@ run_test jailed
 run_test interactive
 run_test second_shell_leaves_vm_running
 run_test vm_stops_completely
+run_test up_gate_runs_at_down
+run_test containers_have_what_they_need
 run_test child_dies_with_parent
 run_test cancel_stops_the_run
 run_test env_survives_quotes
