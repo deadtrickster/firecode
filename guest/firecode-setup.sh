@@ -215,6 +215,15 @@ setup_container_storage() {
 			mount --bind "/firecode/upper/$d" "/var/lib/$d" ||
 			log "WARNING: could not put /var/lib/$d on the workspace layer"
 	done
+	# host.docker.internal is Docker Desktop's name for the machine docker runs
+	# on, and projects written against it point their tests there - PeerDB's
+	# .env sends every e2e connection to it, and compose publishes the ports
+	# on the docker host. In a guest the docker host is the guest itself, so
+	# the name is this machine. Containers get the same answer from compose's
+	# own host-gateway mapping.
+	if command -v docker >/dev/null && ! grep -qw host.docker.internal /etc/hosts; then
+		echo "127.0.0.1 host.docker.internal" >>/etc/hosts
+	fi
 	# Without sudo, as on a workstation. The group exists once docker is
 	# installed, whether baked into the image or apt-installed in a run.
 	if getent group docker >/dev/null && [[ ${FIRECODE_USER:-root} != root ]]; then

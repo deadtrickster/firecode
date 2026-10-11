@@ -1304,10 +1304,12 @@ test_containers_have_what_they_need() {
 		sudo modprobe bridge && sudo modprobe br_netfilter && sudo modprobe nf_tables && echo MODULES-OK
 		findmnt -no FSTYPE /var/lib/docker
 		docker info --format "{{.ServerVersion}} {{.Driver}}" 2>&1 | tail -1
+		getent hosts host.docker.internal
 	' 2>&1)
 	contains "bridge, br_netfilter and nf_tables load by name" "MODULES-OK" "$out"
 	contains "docker's storage is a real filesystem, not the overlay root" "ext4" "$out"
 	contains "the daemon starts, on overlay2" "overlay2" "$out"
+	contains "host.docker.internal is the guest, its own docker host" "127.0.0.1" "$out"
 	(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
 }
 
