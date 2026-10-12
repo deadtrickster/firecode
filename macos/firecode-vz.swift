@@ -301,7 +301,7 @@ struct Config {
 		// way, which is how a guest reset is noticed.
 		let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
 		serial.attachment = VZFileHandleSerialPortAttachment(
-			fileHandleForReading: FileHandle.standardInput,
+			fileHandleForReading: consoleInput(),
 			fileHandleForWriting: consoleWatch.pipe.fileHandleForWriting)
 		c.serialPorts = [serial]
 
@@ -315,6 +315,20 @@ struct Config {
 }
 
 // MARK: - the console, and resets
+
+/// What the guest console reads from: the terminal, opened afresh.
+///
+/// Not our stdin itself. The framework makes the handle it reads non-blocking,
+/// and O_NONBLOCK belongs to the open file - which a terminal's stdin shares
+/// with the stdout of everything else writing to it. Handed fd 0, it made the
+/// whole pane non-blocking, and the console filter writing to that pane died
+/// on EAGAIN in the middle of a run. A fresh open is a file of its own.
+func consoleInput() -> FileHandle {
+	guard isatty(0) != 0, let name = ttyname(0) else { return FileHandle.standardInput }
+	let fd = open(name, O_RDONLY | O_NOCTTY)
+	guard fd >= 0 else { return FileHandle.standardInput }
+	return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+}
 
 /// Firecracker exits when its guest resets; Virtualization.framework boots
 /// it again, and says nothing - a reboot meant "this run is over" and would

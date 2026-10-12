@@ -25,6 +25,8 @@ and needs none, so nothing but text gets through.
 usage: termfilter.py [--strict] < in > out
 """
 
+import os
+import select
 import sys
 
 ESC = 0x1B
@@ -144,16 +146,33 @@ class Filter:
         return i + 2, "keep"
 
 
+def write_all(fd, data):
+    """Write everything, waiting when the terminal is not ready for more.
+
+    A terminal can be left in non-blocking mode by anything else that has it
+    open - the flag belongs to the open file, which a pane's stdin and stdout
+    share - and then a write that would wait fails with EAGAIN instead. That
+    used to end this filter mid-run, and with it the run's reported status.
+    """
+    view = memoryview(data)
+    while view:
+        try:
+            n = os.write(fd, view)
+        except BlockingIOError:
+            select.select([], [fd], [])
+            continue
+        view = view[n:]
+
+
 def main():
     strict = "--strict" in sys.argv
     f = Filter(strict=strict)
-    out = sys.stdout.buffer
+    out = sys.stdout.fileno()
     while True:
         chunk = sys.stdin.buffer.read(4096)
         if not chunk:
             break
-        out.write(f.feed(chunk))
-        out.flush()
+        write_all(out, f.feed(chunk))
     return 0
 
 
