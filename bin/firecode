@@ -1403,19 +1403,21 @@ except OSError:
 	# "CONNECT <port>" and got a hangup. Harmless, but it is our own polling
 	# writing errors into the log a person reads to see what a VM is doing.
 	python3 -c '
-import socket, sys
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(3)
+import os, sys
+sys.path.insert(0, sys.argv[3])
+import vsockdial
+s = None
 try:
-    s.connect(sys.argv[1])
+    s = vsockdial.connect(sys.argv[1], timeout=3)
     s.sendall(b"CONNECT %d\n" % int(sys.argv[2]))
     reply = s.recv(64)
 except OSError:
     sys.exit(1)
 finally:
-    s.close()
+    if s is not None:
+        s.close()
 sys.exit(0 if reply.startswith(b"OK") else 1)
-' "$addr" "$EXEC_PORT" 2>/dev/null
+' "$addr" "$EXEC_PORT" "$SCRIPTS" 2>/dev/null
 }
 
 # Whether two paths name the same place. A run records its project as the

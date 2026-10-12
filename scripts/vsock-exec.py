@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from termfilter import Filter  # noqa: E402
+import vsockdial  # noqa: E402
 
 BUF = 65536
 TRAILER = b"__firecode_exit "
@@ -51,9 +52,7 @@ def main(argv):
         sock.connect((int(uds[4:]), port))
         sock.settimeout(None)
     else:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(15)
-        sock.connect(uds)
+        sock = vsockdial.connect(uds, timeout=15)
         sock.sendall(b"CONNECT %d\n" % port)
         reply = b""
         while not reply.endswith(b"\n"):

@@ -18,7 +18,6 @@ usage: vsock-console.py <uds-path> <guest-port> [--timeout SECONDS]
 import os
 import select
 import signal
-import socket
 import sys
 import termios
 import time
@@ -26,6 +25,7 @@ import tty
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from termfilter import Filter  # noqa: E402
+import vsockdial  # noqa: E402
 
 BUF = 65536
 
@@ -35,10 +35,9 @@ def connect(uds_path, port, timeout):
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5)
+        sock = None
         try:
-            sock.connect(uds_path)
+            sock = vsockdial.connect(uds_path, timeout=5)
             sock.sendall(b"CONNECT %d\n" % port)
             # Firecracker answers "OK <assigned port>\n" once the guest is
             # listening, and closes the connection when it is not.
@@ -54,7 +53,8 @@ def connect(uds_path, port, timeout):
             last = reply.decode(errors="replace").strip()
         except (OSError, ConnectionError) as exc:
             last = str(exc)
-        sock.close()
+        if sock is not None:
+            sock.close()
         time.sleep(0.25)
     raise SystemExit(f"could not reach the guest console: {last or 'timed out'}")
 

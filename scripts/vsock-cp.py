@@ -17,13 +17,14 @@ import sys
 import tarfile
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vsockdial  # noqa: E402
+
 BUF = 65536
 
 
 def connect(uds_path, port):
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(15)
-    sock.connect(uds_path)
+    sock = vsockdial.connect(uds_path, timeout=15)
     sock.sendall(b"CONNECT %d\n" % port)
     reply = b""
     while not reply.endswith(b"\n"):
