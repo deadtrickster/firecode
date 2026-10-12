@@ -57,6 +57,10 @@ BASE=$BASE,fuse3,libfuse3-dev,libfuse-dev,python3-fusepy,python3-pyfuse3
 # ones whose test stack is a compose file. iptables for its NAT; the modules
 # both need come from the modules drive, not from here.
 BASE=$BASE,docker.io,docker-compose-v2,docker-buildx,iptables
+# The guest is arm64 on a Mac. qemu-user, registered with binfmt_misc, runs
+# x86 binaries in it transparently - so GOARCH=386 / GOARCH=amd64 tests run,
+# instead of dying on "exec format error".
+BASE=$BASE,qemu-user-static
 # Postgres is NOT in this list on purpose - see the PGDG step below. Noble
 # ships PostgreSQL 16, and a gate that tests against a version nobody runs is
 # testing a hypothetical.

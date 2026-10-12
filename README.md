@@ -97,6 +97,11 @@ What is different, and why:
 
 Nothing needs `net-setup` or `install-privileged.sh`; both say so and exit.
 
+**The guest is arm64, and x86 still runs in it.** qemu-user is registered with
+binfmt_misc, so a 386 or amd64 binary - `GOARCH=386 go test ./...`, an amd64
+container image - runs transparently under emulation instead of failing with
+"exec format error". Slower than native, and fine for tests.
+
 Not available on a Mac: `--gpu` and `--vmm libvirt` (no passthrough),
 hardware counters in a guest, pinning to cores (`--vectorized` runs unpinned
 and says so), `firecode grow` on a running VM (the framework cannot resize

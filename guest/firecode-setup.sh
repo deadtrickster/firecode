@@ -196,6 +196,19 @@ setup_modules() {
 		return 0
 	fi
 	log "kernel modules available ($ver)"
+
+	# Foreign-architecture binaries (qemu-user: GOARCH=386 or amd64 tests on
+	# this arm64 guest) are registered by systemd-binfmt, which runs early in
+	# boot - before this drive is mounted, so binfmt_misc, a module, was not
+	# there to register into and every handler was silently missing. Done
+	# again now that it can be.
+	if compgen -G "/usr/lib/binfmt.d/*.conf" >/dev/null || compgen -G "/etc/binfmt.d/*.conf" >/dev/null; then
+		modprobe binfmt_misc 2>/dev/null
+		mountpoint -q /proc/sys/fs/binfmt_misc ||
+			mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null
+		systemctl restart systemd-binfmt 2>/dev/null &&
+			log "foreign-architecture binaries run under qemu-user"
+	fi
 }
 
 # Where docker and containerd keep images and layers.
