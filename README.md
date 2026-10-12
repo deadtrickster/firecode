@@ -158,8 +158,18 @@ firecode claude --timeout 3600 "big refactor"  # give up after an hour
 firecode claude                                # interactive, in byobu
 firecode opencode "fix the failing build"
 firecode shell                                 # poke around by hand
+firecode run go test ./...                     # on Linux, against your tree as it is now
 firecode exec make -j8                         # any command, in the sandbox
 ```
+
+**`run` is the door for "just run this on Linux".** The first call starts a VM
+for the project and leaves it up; every call after sends it only the files
+that changed since the last (gitignored ones never), runs the command where
+you are standing, and exits with its status. Nothing is copied back and
+firecode prints nothing of its own. A call takes about a second.
+`firecode down` stops the VM. `exec` copies the whole project and boots for
+every command; `in` runs against the copy `up` made, which your later edits
+never reach.
 
 **A task means unattended. Flags alone mean a session you drive.** So
 `firecode claude --resume <id>` gives you the REPL with that conversation

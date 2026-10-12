@@ -3755,6 +3755,88 @@ run_of_socket() {
 # later, or (with nothing changed) never, with nothing to tell those apart.
 # Now `down` waits for the run's copy_out record and prints where the work is.
 # --no-wait stops it and returns; the record still tells a caller later.
+# The door for "run this on Linux, against my tree as it is now".
+#
+#   firecode run go test ./...
+#
+# exec copies the whole project and boots for every command; in runs against
+# the copy `up` made, so edits on the host after that never reach it. This is
+# the one that is both current and quick: a VM for the project stays up after
+# the first call, each call sends it only the files that changed since the
+# last (scripts/vsock-sync.py), then runs the command where you are standing
+# and exits with its status. Nothing comes back - the VM is a place to run
+# things, not to work in - and firecode says nothing unless it has to.
+cmd_run() {
+	local proj=""
+	local -a upargs=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--project)
+			proj=$2
+			shift 2
+			;;
+		--mem | --vcpu | --layer-size)
+			upargs+=("$1" "$2")
+			shift 2
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode run [--project DIR] [--mem MB] [--vcpu N] [--] <command...>
+
+Run a command on Linux against your project as it is right now, and exit with
+its status. The first call starts a VM for the project (a few seconds); later
+calls send only the files that changed and run at once. Nothing is copied
+back. The project is the git repository you are in, or the current directory.
+Stop the VM with: firecode down
+USAGE
+			return 0
+			;;
+		--)
+			shift
+			break
+			;;
+		*) break ;;
+		esac
+	done
+	[[ $# -gt 0 ]] || die "usage: firecode run [--project DIR] <command...>"
+	[[ -n $proj ]] || proj=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+	proj=$(cd "$proj" && pwd) || die "no such directory: $proj"
+
+	local sock rd manifest
+	sock=$(live_vm_socket "$proj" 2>/dev/null) || sock=""
+	if [[ -z $sock ]]; then
+		echo "[firecode] starting a Linux VM for $proj (later runs reuse it; firecode down stops it)" >&2
+		# The baseline before the VM's copy is made from this tree: anything
+		# that changes in between differs from it and is sent next time.
+		local base
+		base=$(mktemp "${TMPDIR:-/tmp}/firecode-sync.XXXXXX")
+		python3 "$SCRIPTS/vsock-sync.py" - 0 "$proj" "$base" --baseline ||
+			die "could not list $proj"
+		local uplog
+		uplog=$(mktemp "${TMPDIR:-/tmp}/firecode-run-up.XXXXXX")
+		if ! cmd_up --project "$proj" --no-sync ${upargs+"${upargs[@]}"} >"$uplog" 2>&1; then
+			cat "$uplog" >&2
+			rm -f "$base"
+			die "the VM did not start"
+		fi
+		rm -f "$uplog"
+		sock=$(require_vm_socket "$proj")
+		rd=$(run_of_socket "$sock" || true)
+		[[ -n $rd ]] && mv -f "$base" "$rd/sync-manifest"
+		rm -f "$base"
+	fi
+	rd=${rd:-$(run_of_socket "$sock" || true)}
+	[[ -n $rd ]] || die "the VM for $proj is up but firecode has no record of its run"
+	manifest="$rd/sync-manifest"
+	python3 "$SCRIPTS/vsock-sync.py" "$sock" "$EXEC_PORT" "$proj" "$manifest" ||
+		die "could not bring the VM's copy of $proj up to date"
+
+	# Where you are standing, which is the same path in there.
+	local cwd=$proj
+	[[ $PWD == "$proj" || $PWD == "$proj"/* ]] && cwd=$PWD
+	exec python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$@"
+}
+
 cmd_down() {
 	local want="" nowait=0
 	while [[ $# -gt 0 ]]; do
@@ -8205,6 +8287,10 @@ up)
 in)
 	shift
 	cmd_in "$@"
+	;;
+run)
+	shift
+	cmd_run "$@"
 	;;
 checkpoint)
 	shift
