@@ -51,15 +51,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Node (agents and their MCP servers assume it) and bun.
 #
-# --retry, because a build host on a VPN resolves and connects unreliably, and
-# a single curl that gives up takes the whole image with it - twenty minutes
-# of work lost to one refused name. curl's own retry covers the transient
-# case; the DNS case is handled a level up, where prepare notices "could not
-# resolve" and rebuilds on the host network.
+# Fetched from nodejs.org as a tarball, not via deb.nodesource.com. The nodesource
+# apt repo is slow enough from some networks (measured 687 B/s here against an
+# 11 MB/s stream for the official tarball) that `apt install nodejs` effectively
+# hangs on its 37.8 MB package. Same Node 22, same layout (/usr/local/bin/node).
 RUN curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 \
-	https://deb.nodesource.com/setup_22.x | bash - \
-	&& apt-get install -y --no-install-recommends nodejs \
-	&& rm -rf /var/lib/apt/lists/* \
+	https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz \
+	| tar -xJ -C /usr/local --strip-components=1 \
 	&& npm install -g pnpm yarn 2>/dev/null || true
 RUN curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 \
 	https://bun.sh/install | bash \
