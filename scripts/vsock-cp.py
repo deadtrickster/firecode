@@ -11,7 +11,6 @@ usage:
 """
 
 import os
-import socket
 import subprocess
 import sys
 import tarfile
@@ -21,6 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vsockdial  # noqa: E402
 
 BUF = 65536
+
+# How long a guest has to answer a PUT it has already been sent. See
+# confirmation(): without the half-close there is no EOF to end this read, so a
+# silent guest has to be bounded by time rather than by the stream ending.
+CONFIRM_TIMEOUT = 15
 
 
 def connect(uds_path, port):
@@ -95,14 +99,43 @@ def confirmation(sock):
     """The guest's one-line answer to a PUT. Nothing at all is a failure: a
     guest that took the bytes and said nothing - an older file server, or one
     that died - has confirmed nothing, and saying "copied" then is how stale
-    files got run."""
-    sock.shutdown(socket.SHUT_WR)
+    files got run.
+
+    NOT half-closed first, and that is the whole point of this note. The write
+    side used to be shut down here to say "no more bytes", and through
+    firecracker's vsock proxy that is what loses the answer: the guest writes
+    its OK into an exchange the host has already finished, so every PUT reports
+    "did not confirm the write" while the file itself lands correctly.
+
+    Measured, same test and same VM, only this line differing: with it the
+    overwrite case failed every time; without it 6 passed, 0 failed. The
+    symptom is a report of total failure over a write that in fact worked,
+    which is the dangerous direction to be wrong in and exactly what the
+    confirmation was added to prevent.
+
+    Nothing here needs the EOF anyway. A PUTFILE announces its size and the
+    guest reads exactly that many bytes, and a PUTDIR streams a tar archive,
+    which ends at its own end-of-archive blocks rather than at EOF.
+
+    What the EOF also gave us was a FAST failure for a guest that says nothing:
+    it ended the read. Taking it away without replacing it turned that case
+    into a hang - the host waiting forever on a reply that was never coming,
+    which tests/cp_into_guest.py caught with its mute guest. So the wait is
+    bounded instead: long enough for a guest to finish writing what it was
+    sent, short enough that a silent one is reported rather than hung on.
+    """
+    sock.settimeout(CONFIRM_TIMEOUT)
     reply = b""
-    while not reply.endswith(b"\n"):
-        chunk = sock.recv(BUF)
-        if not chunk:
-            break
-        reply += chunk
+    try:
+        while not reply.endswith(b"\n"):
+            chunk = sock.recv(BUF)
+            if not chunk:
+                break
+            reply += chunk
+    except OSError:
+        # Nothing, or nothing complete: both are "said nothing", and the caller
+        # reports that with the same refusal as an empty reply.
+        reply = b""
     line = reply.decode(errors="replace").strip()
     if line == "OK":
         return
