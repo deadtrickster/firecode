@@ -211,30 +211,46 @@ setup_modules() {
 	fi
 }
 
-# The project as the host has it, live - shared with virtio-fs rather than
-# copied - and read-only at the host, so nothing done in here can change it.
-# A tmpfs layer over it takes whatever the guest writes (a test's scratch
-# files, a build's output) and is gone with the VM: the project can be used
-# as if it were writable, and nothing comes back.
-mount_project_share() {
-	local target=${FIRECODE_PROJECT:-} tag=${FIRECODE_PROJECT_SHARE:-}
-	[[ -n $target && -n $tag ]] || return 0
-	local ro=/run/firecode/share-ro rw=/run/firecode/share-rw
+# Host directories shared with virtio-fs rather than copied, from
+# FIRECODE_SHARES: one "tag mode path" per line, mounted in that order, each at
+# the path it has on the host.
+#   ro       read-only (and read-only at the host)
+#   rw       written through: changes land on the host as they are made
+#   overlay  read-only with a tmpfs layer over it - usable as if writable, and
+#            whatever is written is gone with the VM (firecode sh)
+mount_shares() {
+	[[ -n ${FIRECODE_SHARES:-} ]] || return 0
 	modprobe virtiofs 2>/dev/null
-	mkdir -p "$ro" "$rw" "$target"
-	if ! mount -t virtiofs -o ro "$tag" "$ro"; then
-		log "WARNING: could not mount the shared project ($tag) - $target is empty"
-		return 0
-	fi
-	mount -t tmpfs -o mode=0755 tmpfs "$rw"
-	mkdir -p "$rw/upper" "$rw/work"
-	chown "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" "$rw/upper"
-	if mount -t overlay overlay -o "lowerdir=$ro,upperdir=$rw/upper,workdir=$rw/work" "$target"; then
-		log "project mounted from the host at $target (read-only; writes here are thrown away)"
-	else
-		log "WARNING: no writable layer over the share - $target is read-only"
-		mount --bind "$ro" "$target"
-	fi
+	local tag mode path n=0
+	while read -r tag mode path; do
+		[[ -n $tag && -n $path ]] || continue
+		n=$((n + 1))
+		mkdir -p "$path" 2>/dev/null
+		case $mode in
+		rw)
+			mount -t virtiofs "$tag" "$path" ||
+				log "WARNING: could not mount $path from the host"
+			;;
+		ro)
+			mount -t virtiofs -o ro "$tag" "$path" ||
+				log "WARNING: could not mount $path from the host"
+			;;
+		overlay)
+			local ro=/run/firecode/share-$n-ro rw=/run/firecode/share-$n-rw
+			mkdir -p "$ro" "$rw"
+			if ! mount -t virtiofs -o ro "$tag" "$ro"; then
+				log "WARNING: could not mount $path from the host"
+				continue
+			fi
+			mount -t tmpfs -o mode=0755 tmpfs "$rw"
+			mkdir -p "$rw/upper" "$rw/work"
+			chown "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" "$rw/upper"
+			mount -t overlay overlay -o "lowerdir=$ro,upperdir=$rw/upper,workdir=$rw/work" "$path" ||
+				mount --bind "$ro" "$path"
+			;;
+		esac
+		log "$path mounted from the host ($mode)"
+	done <<<"$FIRECODE_SHARES"
 }
 
 # Where docker and containerd keep images and layers.
@@ -357,9 +373,9 @@ mount_disks() {
 mount_project() {
 	local target=${FIRECODE_PROJECT:-}
 	[[ -n $target ]] || return 0
-	# Shared rather than copied: mounted by mount_project_share, once the
-	# modules - virtiofs among them - are there.
-	[[ -n ${FIRECODE_PROJECT_SHARE:-} ]] && return 0
+	# Shared rather than copied: mounted by mount_shares, once the modules -
+	# virtiofs among them - are there.
+	[[ -n ${FIRECODE_SHARES:-} ]] && return 0
 	mkdir_owned "$target"
 	mount_label firecode-src "$target" || return 0
 
@@ -505,7 +521,7 @@ main() {
 	mount_label firecode-state "$STATE"
 
 	setup_modules
-	mount_project_share
+	mount_shares
 	setup_container_storage
 
 	overlay_home claude

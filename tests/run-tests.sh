@@ -1335,6 +1335,48 @@ test_down_discard_brings_nothing_back() {
 	fi
 }
 
+# A git worktree on a Mac is mounted, not copied: edits and commits land in the
+# real worktree and repository while the VM runs, the main checkout cannot be
+# written, and down copies nothing because the work is already in place.
+test_worktree_is_mounted() {
+	((QUICK)) && return 0
+	if [[ $(uname -s) != Darwin ]]; then
+		ok "mounted worktree (skipped: virtio-fs is the Mac's)"
+		return 0
+	fi
+	local repo="$WORK/org/repo" wt="$WORK/org/repo-mtest" out
+	rm -rf "$WORK/org"
+	mkdir -p "$repo"
+	git -C "$repo" init -q -b main
+	echo base >"$repo/base.txt"
+	git -C "$repo" add base.txt
+	git -C "$repo" -c user.name=t -c user.email=t@t commit -qm base
+	if ! (cd "$repo" && "$FIRECODE" up --worktree mtest --no-net --mem 1024 >/dev/null 2>&1); then
+		no "a mounted worktree VM starts"
+		return 0
+	fi
+	out=$("$FIRECODE" in --project "$wt" '
+		echo change >wt.txt && git add wt.txt &&
+		git -c user.name=vm -c user.email=vm@vm commit -qm from-vm && echo COMMITTED
+		touch '"$repo"'/should-fail 2>/dev/null || echo MAIN-READONLY
+	' 2>&1)
+	contains "a commit is made in the VM" "COMMITTED" "$out"
+	contains "the main checkout is read-only" "MAIN-READONLY" "$out"
+	check "the worktree's edit is on the host while the VM runs" "change" "$(cat "$wt/wt.txt" 2>/dev/null)"
+	check "and the commit is on the branch in the real repository" "from-vm" \
+		"$(git -C "$repo" log -1 --format=%s mtest 2>/dev/null)"
+	out=$("$FIRECODE" down --project "$wt" 2>&1)
+	# By name: git reports the worktree by its real path, and on a Mac /tmp is
+	# a link into /private.
+	contains "down says the work is the worktree" "work delivered: " "$out"
+	contains "...naming it" "repo-mtest" "$out"
+	if compgen -G "$wt-*" >/dev/null; then
+		no "and nothing is copied out" "found $(echo "$wt"-*)"
+	else
+		ok "and nothing is copied out"
+	fi
+}
+
 test_vm_stops_completely() {
 	((QUICK)) && return 0
 	local p
@@ -2009,6 +2051,7 @@ run_test second_shell_leaves_vm_running
 run_test vm_stops_completely
 run_test up_gate_runs_at_down
 run_test down_discard_brings_nothing_back
+run_test worktree_is_mounted
 run_test containers_have_what_they_need
 run_test child_dies_with_parent
 run_test cancel_stops_the_run

@@ -220,7 +220,26 @@ firecode enter                    # second shell in the running VM
 # then open http://172.16.1.2:8080 in your browser
 ```
 
-## The layers
+## Three rungs: throwaway, worktree, copy
+
+How much of your project a VM gets, from least to most. The first two are a
+Mac's (virtio-fs); on Linux everything is the third.
+
+| | the project | what comes back | for |
+|---|---|---|---|
+| `firecode sh` | mounted read-only, with a throwaway layer over it | nothing - the VM and its disks are deleted | running tests, poking around: a contained shell |
+| a git worktree (`--worktree NAME`, or any worktree as the project) | the worktree mounted **read-write**, the main checkout **read-only**, the repository's `.git` **read-write** | nothing to copy: edits and commits are in the worktree and the repository as they happen | agents doing work, the way a host agent would |
+| anything else | copied in | a sibling `<project>-<timestamp>` when it stops (`down --discard` for none) | full isolation of a tree you do not want touched |
+
+**The worktree rung** is where agents belong. `firecode claude --worktree fix-x`
+in `~/Projects/stroppy-io/stroppy` makes `~/Projects/stroppy-io/stroppy-fix-x` on
+branch `fix-x`, beside the repository and nowhere else, and runs in it. The
+agent reads the canonical checkout but cannot change it; it commits to its
+branch with git's own machinery, so `git log fix-x` shows its work while it is
+still running. It could also move other branches of that repository - as an
+agent on the host could - and nothing outside the repository is reachable.
+`--copy` gives the old behaviour: a copy, with commits fetched back at the end.
+
 
 The guest root is not a disk, it is a stack, assembled by an initramfs before
 the guest boots:

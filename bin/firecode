@@ -225,6 +225,12 @@ FRESH_ROOT=0
 # read-only, with a throwaway writable layer over it, nothing kept and nothing
 # copied out. What `firecode sh` runs on.
 MOUNT_PROJECT=0
+# A git worktree, on a Mac, mounted rather than copied: the worktree
+# read-write - edits land in it, nothing is copied out - the main checkout
+# read-only, and the repository's .git read-write so commits and branches are
+# git's own, as for an agent running on the host. --copy turns it off.
+MOUNT_WORKTREE=0
+NO_MOUNT=0
 declare -a EXTRA_DIRS=()
 # Host disks handed to the guest whole: HOSTPATH[:GUESTPATH[:ro]]. A file or a
 # block device, attached rather than copied - which is the only workable answer
@@ -2539,6 +2545,19 @@ cmd_up() {
 			passthru+=(--no-sync)
 			shift
 			;;
+		--worktree)
+			# The VM is the WORKTREE's, not the directory this was run in -
+			# so that is what to wait for. Waiting on the run directory's own
+			# path is how `up --worktree` sat there with its VM up and
+			# answering. Worked out the way launch names it.
+			local wrepo
+			wrepo=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) ||
+				die "--worktree needs a git repository"
+			wrepo=$(main_checkout "$wrepo")
+			here="${wrepo}-${2//[^A-Za-z0-9._-]/-}"
+			passthru+=(--worktree "$2")
+			shift 2
+			;;
 		-h | --help)
 			# Answered here. Passed through, --help reached the launcher as
 			# just another argument and booted a VM.
@@ -3759,6 +3778,25 @@ run_of_socket() {
 # later, or (with nothing changed) never, with nothing to tell those apart.
 # Now `down` waits for the run's copy_out record and prints where the work is.
 # --no-wait stops it and returns; the record still tells a caller later.
+# What a mounted run shares into the guest, one "tag mode path" per line, in
+# the order the guest mounts them - an outer directory before one inside it.
+share_lines() {
+	if ((MOUNT_WORKTREE)); then
+		local common main
+		common=$(cd "$WORKDIR" && realpath -m "$(git rev-parse --git-common-dir)")
+		main=$(dirname "$common")
+		# The main checkout to read, its .git to commit into, the worktree to
+		# work in. The worktree's own .git file names a directory under the
+		# common one by its host path - which is the path it has in here too.
+		echo "repo ro $main"
+		echo "git rw $common"
+		echo "src rw $WORKDIR"
+	elif ((MOUNT_PROJECT)); then
+		echo "src overlay $WORKDIR"
+	fi
+	return 0
+}
+
 # A contained, throwaway Linux shell with the project in it - nothing copied,
 # nothing kept.
 #
@@ -5043,6 +5081,10 @@ launch() {
 			SYNC_BACK=0
 			shift
 			;;
+		--copy)
+			NO_MOUNT=1
+			shift
+			;;
 		--no-tmux)
 			NO_TMUX=1
 			shift
@@ -5177,6 +5219,15 @@ launch() {
 		fi
 		WORKDIR=$wt
 	fi
+	# A linked git worktree on a Mac is mounted, not copied - see MOUNT_WORKTREE.
+	if ((MACOS && !NO_MOUNT && !MOUNT_PROJECT)) && [[ $VMM == vz ]] &&
+		[[ -f $WORKDIR/.git ]] && git -C "$WORKDIR" rev-parse --git-common-dir >/dev/null 2>&1; then
+		MOUNT_WORKTREE=1
+		SYNC_BACK=0
+		((FAST)) && die "--fast in a mounted worktree: a checkpoint cannot hold a shared directory (--copy for the copied kind)"
+		log "worktree mounted, not copied: edits land in $WORKDIR as they are made"
+	fi
+
 	# The project directory is a way into the guest just as much as --add-dir
 	# is. Matters most if launching is ever exposed to something automated.
 	refuse_if_sensitive "$WORKDIR"
@@ -5570,7 +5621,7 @@ launch() {
 		# one the restored guest's memory describes. Packing a new drive here
 		# would be both wasted and wrong.
 		:
-	elif ((MOUNT_PROJECT)); then
+	elif ((MOUNT_PROJECT || MOUNT_WORKTREE)); then
 		# An empty one, so the drive table is what every run has; the guest
 		# mounts the share at the project's path instead.
 		local empty
@@ -5696,8 +5747,10 @@ launch() {
 		# Which kernel the modules drive is for, so the guest mounts it only
 		# when there is one - and never waits for a label that is not coming.
 		env_line FIRECODE_MODULES "$MODULES_VERSION"
-		# Mounted rather than copied: the virtio-fs tag the guest mounts.
-		((MOUNT_PROJECT)) && env_line FIRECODE_PROJECT_SHARE src
+		# Mounted rather than copied: what the guest mounts, in order, one
+		# "tag mode path" per line - mode ro, rw, or overlay (read-only with
+		# a throwaway layer over it).
+		env_line FIRECODE_SHARES "$(share_lines)"
 		# Read from the project, not from wherever firecode happens to live, so
 		# a repo-local identity wins the same way it would on the host.
 		env_line FIRECODE_GIT_NAME "$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)"
@@ -6284,11 +6337,17 @@ launch() {
 		balloon=',
   "balloon": {"amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 0, "free_page_reporting": true}'
 	local shares=""
-	if ((MOUNT_PROJECT)); then
-		# Read-only at the host: whatever the guest does, the share cannot be
-		# written through. JSON-quoted by python, since a path is arbitrary text.
+	if ((MOUNT_PROJECT || MOUNT_WORKTREE)); then
+		# A share the guest mounts read-only is read-only at the host too:
+		# whatever the guest does, it cannot be written through.
 		shares=",
-  \"firecode-vz-shares\": [{\"tag\": \"src\", \"path\": $(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$WORKDIR"), \"read_only\": true}]"
+  \"firecode-vz-shares\": $(share_lines | python3 -c '
+import json, sys
+out = []
+for line in sys.stdin.read().splitlines():
+    tag, mode, path = line.split(" ", 2)
+    out.append({"tag": tag, "path": path, "read_only": mode != "rw"})
+print(json.dumps(out))')"
 	fi
 	cat >"$JAIL_DIR/vm-config.json" <<EOF
 {
@@ -6528,7 +6587,14 @@ EOF
 		SYNC_BACK=0
 		log "discarded, as asked: nothing is copied out"
 	fi
-	((SYNC_BACK)) || copy_out_mark none
+	# A mounted worktree has nothing to copy: the work is already where it
+	# belongs, and that is what the record says - which is also what tells
+	# anything driving the VM (letibot) where the work landed.
+	if ((MOUNT_WORKTREE)); then
+		copy_out_mark "done $WORKDIR"
+	else
+		((SYNC_BACK)) || copy_out_mark none
+	fi
 
 	if ((SYNC_BACK)) && [[ -n $WORKTREE ]]; then
 		# A worktree firecode made is scratch by construction - a branch to
