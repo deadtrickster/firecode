@@ -5387,7 +5387,14 @@ launch() {
 		return 0
 	fi
 
-	build_config_drive
+	# A mounted throwaway VM runs no agent, so the drive that carries the
+	# agents' binaries and credentials is taken as it is. Rebuilt otherwise
+	# whenever Claude rotates its credentials - which is often, and 400M.
+	if ((MOUNT_PROJECT)) && [[ -f $CFG_DRIVE ]]; then
+		:
+	else
+		build_config_drive
+	fi
 
 	# Everything the guest should be able to reach on the host's loopback:
 	# MCP servers found in the config, plus whatever --host-port asked for
