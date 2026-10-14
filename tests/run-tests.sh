@@ -1313,6 +1313,28 @@ test_containers_have_what_they_need() {
 	(cd "$p" && "$FIRECODE" down --project "$p" >/dev/null 2>&1)
 }
 
+# `down --discard` stops a VM and brings nothing back - a VM used to run tests
+# made a timestamped copy of the project beside it at every down, which is the
+# right default for work and pure clutter for a run.
+test_down_discard_brings_nothing_back() {
+	((QUICK)) && return 0
+	local p out
+	p=$(make_project)
+	rm -rf "$p"-*
+	if ! start_vm "$p"; then
+		no "a VM starts"
+		return 0
+	fi
+	(cd "$p" && "$FIRECODE" in --project "$p" 'echo made > made.txt' >/dev/null 2>&1)
+	out=$(cd "$p" && "$FIRECODE" down --project "$p" --discard 2>&1)
+	contains "down --discard says it discarded" "discarded" "$out"
+	if compgen -G "$p-*" >/dev/null; then
+		no "and nothing is copied out" "found $(echo "$p"-*)"
+	else
+		ok "and nothing is copied out"
+	fi
+}
+
 test_vm_stops_completely() {
 	((QUICK)) && return 0
 	local p
@@ -1986,6 +2008,7 @@ run_test interactive
 run_test second_shell_leaves_vm_running
 run_test vm_stops_completely
 run_test up_gate_runs_at_down
+run_test down_discard_brings_nothing_back
 run_test containers_have_what_they_need
 run_test child_dies_with_parent
 run_test cancel_stops_the_run

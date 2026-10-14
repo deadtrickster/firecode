@@ -508,6 +508,7 @@ firecode up                       # boots and waits until it can take commands
 firecode in 'cargo test --release'   # output, and the command's own exit status
 firecode in 'python3 bench.py'
 firecode down                     # stops it, copying the work back out
+firecode down --discard           # stops it, and nothing comes back
 ```
 
 `in` returns the command's exit status, so a failing suite and a suite that

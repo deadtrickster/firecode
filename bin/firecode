@@ -3838,7 +3838,7 @@ USAGE
 }
 
 cmd_down() {
-	local want="" nowait=0
+	local want="" nowait=0 discard=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--project)
@@ -3849,8 +3849,19 @@ cmd_down() {
 			nowait=1
 			shift
 			;;
+		--discard)
+			discard=1
+			shift
+			;;
 		-h | --help)
-			echo "usage: firecode down [--project DIR | NAME] [--no-wait]"
+			cat <<'USAGE'
+usage: firecode down [--project DIR | NAME] [--discard] [--no-wait]
+
+Stop a VM. Its copy of the project is delivered beside the project as
+<project>-<timestamp> - unless:
+  --discard   nothing comes back: the VM ran things, it did not make anything
+  --no-wait   return at once; the copy-out finishes in the background
+USAGE
 			return 0
 			;;
 		*)
@@ -3864,6 +3875,10 @@ cmd_down() {
 	rd=$(run_of_socket "$sock" || true)
 	name=$(cat "$rd/name" 2>/dev/null || true)
 	log "stopping the VM${name:+ $name}${rd:+ (${rd##*/})}"
+	if ((discard)); then
+		[[ -n $rd ]] || die "--discard: firecode has no record of this run, so it cannot be told"
+		: >"$rd/discard"
+	fi
 
 	# A VM that `up` started is held by an idle loop. Ending that loop rather
 	# than rebooting the guest lets the entrypoint finish the way an
@@ -3960,7 +3975,13 @@ down_wait_copy_out() {
 		log "work delivered: ${state#done }"
 		echo "${state#done }"
 		;;
-	none) log "nothing to deliver: the guest changed nothing (or the run had --no-sync)" ;;
+	none)
+		if [[ -f $rd/discard ]]; then
+			log "discarded: nothing was copied out, as asked"
+		else
+			log "nothing to deliver: the guest changed nothing (or the run had --no-sync)"
+		fi
+		;;
 	failed*) die "copy-out ${state}" ;;
 	*) die "copy-out: unreadable record '$state' in $rd/copy_out" ;;
 	esac
@@ -6357,6 +6378,12 @@ EOF
 	fi
 	echo >&2
 	log "VM exited (status $rc)"
+	# `down --discard` asked for nothing to come back. Read here, as the VM
+	# exits, because the decision is this process's: down is another one.
+	if ((SYNC_BACK)) && [[ -f $RUN_DIR/discard ]]; then
+		SYNC_BACK=0
+		log "discarded, as asked: nothing is copied out"
+	fi
 	((SYNC_BACK)) || copy_out_mark none
 
 	if ((SYNC_BACK)) && [[ -n $WORKTREE ]]; then
