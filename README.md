@@ -229,6 +229,7 @@ Mac's (virtio-fs); on Linux everything is the third.
 |---|---|---|---|
 | `firecode sh` | mounted read-only, with a throwaway layer over it | nothing - the VM and its disks are deleted | running tests, poking around: a contained shell |
 | a git worktree (`--worktree NAME`, or any worktree as the project) | the worktree mounted **read-write**, the main checkout **read-only**, the repository's `.git` **read-write** | nothing to copy: edits and commits are in the worktree and the repository as they happen | agents doing work, the way a host agent would |
+| a folder, `--mount-rw` (what `letibot --vm` uses) | the directory itself, **read-write**: a folder of repositories, every one in it | nothing to copy: edits, worktrees beside a repository, commits all land as they happen | a whole agent session and its subagents working on a set of repositories, everything allowed, nothing else of the host reachable |
 | anything else | copied in | a sibling `<project>-<timestamp>` when it stops (`down --discard` for none) | full isolation of a tree you do not want touched |
 
 **The worktree rung** is where agents belong. `firecode claude --worktree fix-x`

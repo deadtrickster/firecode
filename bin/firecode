@@ -231,6 +231,11 @@ MOUNT_PROJECT=0
 # git's own, as for an agent running on the host. --copy turns it off.
 MOUNT_WORKTREE=0
 NO_MOUNT=0
+# The project directory itself shared read-write (a Mac): a folder of
+# repositories that agents work in exactly as on the host - edits, worktrees,
+# commits all land where they are made - with nothing else of the host
+# reachable. What `letibot --vm` runs in. --mount-rw.
+MOUNT_RW=0
 declare -a EXTRA_DIRS=()
 # Host disks handed to the guest whole: HOSTPATH[:GUESTPATH[:ro]]. A file or a
 # block device, attached rather than copied - which is the only workable answer
@@ -1725,7 +1730,7 @@ cmd_info() {
 		esac
 	done
 
-	local sock jail ip run project
+	local sock jail ip run project mount
 	sock=$(require_vm_socket "$want")
 	jail=$(dirname "$sock")
 	ip=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
@@ -1739,6 +1744,7 @@ cmd_info() {
 			{ [[ -f $r/jail && $(cat "$r/jail") == "$jail" ]] || continue; }
 		run=$(basename "${r%/}")
 		project=$(cat "$r/project" 2>/dev/null)
+		mount=$(cat "$r/mount" 2>/dev/null || echo copy)
 		break
 	done
 
@@ -1746,9 +1752,9 @@ cmd_info() {
 		python3 -c '
 import json, sys
 print(json.dumps(dict(zip(
-    ("run", "project", "ip", "socket", "exec_port", "console_port", "files_port"),
+    ("run", "project", "ip", "socket", "exec_port", "console_port", "files_port", "mount"),
     sys.argv[1:])), indent=2))
-' "${run:-}" "${project:-}" "${ip:-}" "$sock" "$EXEC_PORT" "$CONSOLE_PORT" "$FILES_PORT"
+' "${run:-}" "${project:-}" "${ip:-}" "$sock" "$EXEC_PORT" "$CONSOLE_PORT" "$FILES_PORT" "${mount:-copy}"
 		return 0
 	fi
 
@@ -3834,10 +3840,27 @@ share_lines() {
 		echo "repo ro $main"
 		echo "git rw $common"
 		echo "src rw $WORKDIR"
+	elif ((MOUNT_RW)); then
+		echo "src rw $WORKDIR"
 	elif ((MOUNT_PROJECT)); then
 		echo "src overlay $WORKDIR"
 	fi
 	return 0
+}
+
+# How this run has its project, as recorded on it (runs/<id>/mount) and said by
+# `info --json`: rw, worktree, overlay, or copy. Lets whatever joins a running
+# VM tell one that has the folder itself from one holding a copy.
+mount_kind() {
+	if ((MOUNT_RW)); then
+		echo rw
+	elif ((MOUNT_WORKTREE)); then
+		echo worktree
+	elif ((MOUNT_PROJECT)); then
+		echo overlay
+	else
+		echo copy
+	fi
 }
 
 # A contained, throwaway Linux shell with the project in it - nothing copied,
@@ -5137,6 +5160,11 @@ launch() {
 			NO_MOUNT=1
 			shift
 			;;
+		--mount-rw)
+			MOUNT_RW=1
+			SYNC_BACK=0
+			shift
+			;;
 		--no-tmux)
 			NO_TMUX=1
 			shift
@@ -5230,7 +5258,7 @@ launch() {
 	# The cost of being wrong is asymmetric - a refusal costs one flag, a
 	# mistaken pack costs a filled disk and a long wait - so implicit and
 	# large is refused, while --project stays a decision anybody can make.
-	if ((WORKDIR_EXPLICIT == 0)) && [[ $AGENT != shell ]]; then
+	if ((WORKDIR_EXPLICIT == 0 && !MOUNT_PROJECT && !MOUNT_RW)) && [[ $AGENT != shell ]]; then
 		local limit=${FIRECODE_MAX_IMPLICIT_PROJECT:-$((4 * 1024 * 1024 * 1024))}
 		local bytes
 		# Bounded on purpose: a tree too big to measure in five seconds is
@@ -5272,12 +5300,17 @@ launch() {
 		WORKDIR=$wt
 	fi
 	# A linked git worktree on a Mac is mounted, not copied - see MOUNT_WORKTREE.
-	if ((MACOS && !NO_MOUNT && !MOUNT_PROJECT)) && [[ $VMM == vz ]] &&
+	if ((MACOS && !NO_MOUNT && !MOUNT_PROJECT && !MOUNT_RW)) && [[ $VMM == vz ]] &&
 		[[ -f $WORKDIR/.git ]] && is_linked_worktree "$WORKDIR"; then
 		MOUNT_WORKTREE=1
 		SYNC_BACK=0
 		((FAST)) && die "--fast in a mounted worktree: a checkpoint cannot hold a shared directory (--copy for the copied kind)"
 		log "worktree mounted, not copied: edits land in $WORKDIR as they are made"
+	fi
+	if ((MOUNT_RW)); then
+		[[ $VMM == vz ]] || die "--mount-rw shares the project with virtio-fs, which only the Mac's VMM has"
+		((FAST)) && die "--mount-rw and --fast: a checkpoint cannot hold a shared directory"
+		log "$WORKDIR mounted read-write: everything done in it lands on the host as it is made"
 	fi
 
 	# The project directory is a way into the guest just as much as --add-dir
@@ -5410,6 +5443,7 @@ launch() {
 	else
 		printf '%s\n' "$JAIL_DIR/firecracker-vsock.sock" >"$RUN_DIR/vsock"
 	fi
+	mount_kind >"$RUN_DIR/mount"
 
 	# The cgroup this run owns. Nested inside the parent's when this VM was
 	# asked for by another one, which is what makes the parent's teardown
@@ -5673,7 +5707,7 @@ launch() {
 		# one the restored guest's memory describes. Packing a new drive here
 		# would be both wasted and wrong.
 		:
-	elif ((MOUNT_PROJECT || MOUNT_WORKTREE)); then
+	elif ((MOUNT_PROJECT || MOUNT_WORKTREE || MOUNT_RW)); then
 		# An empty one, so the drive table is what every run has; the guest
 		# mounts the share at the project's path instead.
 		local empty
@@ -6389,7 +6423,7 @@ launch() {
 		balloon=',
   "balloon": {"amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 0, "free_page_reporting": true}'
 	local shares=""
-	if ((MOUNT_PROJECT || MOUNT_WORKTREE)); then
+	if ((MOUNT_PROJECT || MOUNT_WORKTREE || MOUNT_RW)); then
 		# A share the guest mounts read-only is read-only at the host too:
 		# whatever the guest does, it cannot be written through.
 		shares=",
@@ -6642,7 +6676,7 @@ EOF
 	# A mounted worktree has nothing to copy: the work is already where it
 	# belongs, and that is what the record says - which is also what tells
 	# anything driving the VM (letibot) where the work landed.
-	if ((MOUNT_WORKTREE)); then
+	if ((MOUNT_WORKTREE || MOUNT_RW)); then
 		# The guest leaves its markers - exit status, the gate's verdict and
 		# log - in the project, for a copy-out to read and drop. Mounted,
 		# there is no copy-out, and the project is the real worktree: so they
