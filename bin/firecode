@@ -3778,6 +3778,49 @@ run_of_socket() {
 # later, or (with nothing changed) never, with nothing to tell those apart.
 # Now `down` waits for the run's copy_out record and prints where the work is.
 # --no-wait stops it and returns; the record still tells a caller later.
+# A linked worktree, and not a submodule: both have a .git FILE, but only a
+# worktree's git directory differs from the repository's common one.
+is_linked_worktree() {
+	local gd cd
+	gd=$(cd "$1" && realpath -m "$(git rev-parse --git-dir 2>/dev/null)") || return 1
+	cd=$(cd "$1" && realpath -m "$(git rev-parse --git-common-dir 2>/dev/null)") || return 1
+	[[ -n $gd && -n $cd && $gd != "$cd" ]]
+}
+
+# The guest's markers, out of a mounted worktree and onto the run - see the
+# copy-out's handling of the same files, which this mirrors. Sets rc.
+mounted_markers() {
+	local m=$WORKDIR/.firecode-exit-status ast
+	if [[ -f $m ]]; then
+		ast=$(cat "$m")
+		log "agent exit status: $ast"
+		mv -f "$m" "$RUN_DIR/exit-status"
+		[[ $ast =~ ^[0-9]+$ ]] && ((ast != 0 && rc == 0)) && rc=$ast
+	fi
+	[[ -f $WORKDIR/.firecode-verify-seconds ]] &&
+		mv -f "$WORKDIR/.firecode-verify-seconds" "$RUN_DIR/verify-seconds"
+	[[ -f $WORKDIR/.firecode-verify.log ]] &&
+		mv -f "$WORKDIR/.firecode-verify.log" "$RUN_DIR/verify.log"
+	m=$WORKDIR/.firecode-verify-status
+	if [[ -f $m ]]; then
+		local vrc
+		vrc=$(cat "$m")
+		mv -f "$m" "$RUN_DIR/verify-status"
+		if [[ $vrc == 0 ]]; then
+			log "verification passed - see $RUN_DIR/verify.log"
+		else
+			log "VERIFICATION FAILED (exit $vrc) - $RUN_DIR/verify.log"
+			[[ $vrc =~ ^[0-9]+$ ]] && ((vrc > 0)) || vrc=1
+			rc=$vrc
+		fi
+	elif [[ -n $VERIFY ]]; then
+		log "VERIFICATION VERDICT MISSING - a verify command was set and no result came back"
+		echo missing >"$RUN_DIR/verify-status"
+		rc=1
+	fi
+	return 0
+}
+
 # What a mounted run shares into the guest, one "tag mode path" per line, in
 # the order the guest mounts them - an outer directory before one inside it.
 share_lines() {
@@ -4010,7 +4053,10 @@ USAGE
 	# A reboot killed the loop and the entrypoint together, so a gate given to
 	# `up` never ran - a placed agent's "done" was only its word.
 	#
-	# [f]irecode-idle so the pattern does not match the shell running pkill.
+	# Anchored to the loop's own command line. Unanchored it also matched
+	# runuser, which carries the same words as arguments; killing that made the
+	# run's status runuser's 143 instead of the loop's clean 0. The shell
+	# running pkill does not start with "sh -c trap", so it is not matched either.
 	local verify=""
 	[[ -n $rd && -f $rd/ctl/env ]] &&
 		verify=$(
@@ -4020,7 +4066,7 @@ USAGE
 			printf '%s' "${FIRECODE_VERIFY:-}"
 		)
 	if python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
-		"sudo pkill -TERM -f '[f]irecode-idle'" >/dev/null 2>&1; then
+		"sudo pkill -TERM -f '^sh -c trap .exit 0. TERM; while .*firecode-idle'" >/dev/null 2>&1; then
 		if [[ -n $verify ]]; then
 			log "running its gate before it stops: $verify"
 			[[ -n $rd ]] && ((!nowait)) && {
@@ -4066,7 +4112,13 @@ down_report_verdict() {
 	"") ;;
 	0) log "verify passed" ;;
 	missing) log "VERIFY GAVE NO VERDICT - the gate never reported; counted as a failure" ;;
-	*) log "VERIFY FAILED (exit $v) - its output is .firecode-verify.log in the delivered work" ;;
+	*)
+		if [[ -f $rd/verify.log ]]; then
+			log "VERIFY FAILED (exit $v) - its output is $rd/verify.log"
+		else
+			log "VERIFY FAILED (exit $v) - its output is .firecode-verify.log in the delivered work"
+		fi
+		;;
 	esac
 }
 
@@ -5221,7 +5273,7 @@ launch() {
 	fi
 	# A linked git worktree on a Mac is mounted, not copied - see MOUNT_WORKTREE.
 	if ((MACOS && !NO_MOUNT && !MOUNT_PROJECT)) && [[ $VMM == vz ]] &&
-		[[ -f $WORKDIR/.git ]] && git -C "$WORKDIR" rev-parse --git-common-dir >/dev/null 2>&1; then
+		[[ -f $WORKDIR/.git ]] && is_linked_worktree "$WORKDIR"; then
 		MOUNT_WORKTREE=1
 		SYNC_BACK=0
 		((FAST)) && die "--fast in a mounted worktree: a checkpoint cannot hold a shared directory (--copy for the copied kind)"
@@ -6591,6 +6643,13 @@ EOF
 	# belongs, and that is what the record says - which is also what tells
 	# anything driving the VM (letibot) where the work landed.
 	if ((MOUNT_WORKTREE)); then
+		# The guest leaves its markers - exit status, the gate's verdict and
+		# log - in the project, for a copy-out to read and drop. Mounted,
+		# there is no copy-out, and the project is the real worktree: so they
+		# are read and taken out of it here, and the worktree holds only the
+		# agent's work. Before the record says done, because whatever reads
+		# that record reads the verdict next.
+		mounted_markers
 		copy_out_mark "done $WORKDIR"
 	else
 		((SYNC_BACK)) || copy_out_mark none
