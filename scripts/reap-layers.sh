@@ -90,7 +90,9 @@ cg_procs() {
 		cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null || true
 		return
 	fi
-	cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null |
+	# `|| true`: a leaf with no file yet makes cat fail, and under pipefail
+	# that ended the whole script, silently, at the first run directory.
+	{ cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null || true; } |
 		while read -r pid start; do
 			[ -n "$pid" ] || continue
 			now=$(ps -o lstart= -p "$pid" 2>/dev/null) || continue
