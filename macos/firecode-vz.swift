@@ -291,6 +291,25 @@ struct Config {
 		if raw["vsock"] != nil {
 			c.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 		}
+
+		// Host directories shared into the guest with virtio-fs - no copy.
+		// firecracker has nothing like it; this is the one device the Mac's
+		// VMM offers that it does not, so it is firecode-vz's own key.
+		//   "firecode-vz-shares": [{"tag": "src", "path": "/abs", "read_only": true}]
+		var shares: [VZDirectorySharingDeviceConfiguration] = []
+		for sh in raw["firecode-vz-shares"] as? [[String: Any]] ?? [] {
+			guard let tag = sh["tag"] as? String, let path = sh["path"] as? String else { continue }
+			do {
+				try VZVirtioFileSystemDeviceConfiguration.validateTag(tag)
+			} catch {
+				fail("share tag \(tag): \(error.localizedDescription)")
+			}
+			let dev = VZVirtioFileSystemDeviceConfiguration(tag: tag)
+			dev.share = VZSingleDirectoryShare(directory: VZSharedDirectory(
+				url: URL(fileURLWithPath: path), readOnly: (sh["read_only"] as? Bool) ?? true))
+			shares.append(dev)
+		}
+		c.directorySharingDevices = shares
 		if raw["balloon"] != nil {
 			c.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 		}

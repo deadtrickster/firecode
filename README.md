@@ -163,6 +163,8 @@ firecode claude --timeout 3600 "big refactor"  # give up after an hour
 firecode claude                                # interactive, in byobu
 firecode opencode "fix the failing build"
 firecode shell                                 # poke around by hand
+firecode sh                                    # throwaway shell, project mounted read-only (Mac)
+firecode sh -c 'GOARCH=386 go test ./...'      # the same, one command, its exit status
 firecode run go test ./...                     # on Linux, against your tree as it is now
 firecode exec make -j8                         # any command, in the sandbox
 ```

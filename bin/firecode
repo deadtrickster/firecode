@@ -221,6 +221,10 @@ NO_TMUX=0
 DRY_RUN=0
 WORKTREE=""
 FRESH_ROOT=0
+# The project shared into the guest instead of copied (virtio-fs, a Mac only):
+# read-only, with a throwaway writable layer over it, nothing kept and nothing
+# copied out. What `firecode sh` runs on.
+MOUNT_PROJECT=0
 declare -a EXTRA_DIRS=()
 # Host disks handed to the guest whole: HOSTPATH[:GUESTPATH[:ro]]. A file or a
 # block device, attached rather than copied - which is the only workable answer
@@ -3755,6 +3759,87 @@ run_of_socket() {
 # later, or (with nothing changed) never, with nothing to tell those apart.
 # Now `down` waits for the run's copy_out record and prints where the work is.
 # --no-wait stops it and returns; the record still tells a caller later.
+# A contained, throwaway Linux shell with the project in it - nothing copied,
+# nothing kept.
+#
+#   firecode sh                         a shell; exit, and the VM is gone
+#   firecode sh -c 'GOARCH=386 go test ./...'
+#
+# The project is shared into the VM (virtio-fs) at its own path, read-only at
+# the host, with a throwaway layer over it: edits on the host are there at
+# once, writes in the guest work and vanish. The VM's own disks are fresh and
+# deleted with it - no result directory, no per-project layer, no state.
+# Toolchains come from the image (firecode prepare --with go) or from the
+# project's existing layer, inherited read-only.
+cmd_sh() {
+	local dir="" command="" have_cmd=0
+	local -a upargs=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		-c)
+			[[ $# -ge 2 ]] || die "usage: firecode sh [-c COMMAND] [DIR]"
+			command=$2
+			have_cmd=1
+			shift 2
+			;;
+		--mem | --vcpu | --layer-size)
+			upargs+=("$1" "$2")
+			shift 2
+			;;
+		--no-net)
+			upargs+=("$1")
+			shift
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode sh [-c COMMAND] [--mem MB] [--vcpu N] [--no-net] [DIR]
+
+A contained, throwaway Linux shell with DIR (default: the git repository you
+are in, or the current directory) mounted at its own path - read-only at the
+host, with a throwaway layer over it, so tests can write scratch files and
+nothing reaches your tree. Nothing is copied in, nothing is kept: the VM and
+its disks are deleted when the shell ends.
+  -c COMMAND   run COMMAND instead of a shell; exit with its status
+macOS only (virtio-fs). Each call boots a fresh VM, a few seconds.
+USAGE
+			return 0
+			;;
+		-*) die "firecode sh: unknown option $1" ;;
+		*)
+			dir=$1
+			shift
+			;;
+		esac
+	done
+	((MACOS)) || die "firecode sh mounts the project with virtio-fs, which only the Mac's VMM has - firecode run is the door on Linux"
+	[[ -n $dir ]] || dir=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+	dir=$(cd "$dir" && pwd) || die "no such directory: $dir"
+
+	local uplog
+	uplog=$(mktemp "${TMPDIR:-/tmp}/firecode-sh.XXXXXX")
+	((have_cmd)) || echo "[firecode] starting a throwaway VM with $dir mounted (exit ends it)" >&2
+	if ! cmd_up --project "$dir" --mount ${upargs+"${upargs[@]}"} >"$uplog" 2>&1; then
+		cat "$uplog" >&2
+		rm -f "$uplog"
+		die "the VM did not start"
+	fi
+	rm -f "$uplog"
+	local sock
+	sock=$(require_vm_socket "$dir")
+	# However this ends - the command, the shell, a ^C - the VM goes with it.
+	# shellcheck disable=SC2064  # $dir is meant to be fixed now
+	trap "cmd_down --project '$dir' --discard >/dev/null 2>&1 || true" EXIT INT TERM HUP
+
+	local cwd=$dir rc=0
+	[[ $PWD == "$dir" || $PWD == "$dir"/* ]] && cwd=$PWD
+	if ((have_cmd)); then
+		python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" "$cwd" "$command" || rc=$?
+	else
+		python3 "$SCRIPTS/vsock-console.py" "$sock" "$CONSOLE_PORT" || rc=$?
+	fi
+	return "$rc"
+}
+
 # The door for "run this on Linux, against my tree as it is now".
 #
 #   firecode run go test ./...
@@ -4953,6 +5038,11 @@ launch() {
 			DRY_RUN=1
 			shift
 			;;
+		--mount)
+			MOUNT_PROJECT=1
+			SYNC_BACK=0
+			shift
+			;;
 		--no-tmux)
 			NO_TMUX=1
 			shift
@@ -5400,7 +5490,22 @@ launch() {
 
 	# --- per-project agent state, so --continue and --resume have something
 	#     to continue from. Taken first: it decides where the src drive lives.
-	ensure_state_drive "$WORKDIR" "$RUN_DIR"
+	if ((MOUNT_PROJECT)); then
+		# Nothing of this run is kept, the agent's home included: a fresh
+		# state drive in the run's own directory, gone with it.
+		[[ $VMM == vz ]] || die "--mount shares the project with virtio-fs, which only the Mac's VMM has"
+		((FAST)) && die "--mount and --fast: a checkpoint cannot hold a shared directory"
+		SLUG=$(project_slug "$WORKDIR")
+		local seed
+		seed=$(mktemp -d)
+		mkdir -p "$seed/upper" "$seed/work"
+		mkimage_from_dir "$seed" "$RUN_DIR/state.ext4" firecode-state $((1024 * 1024 * 1024))
+		rm -rf "$seed"
+		STATE_DRIVE="$RUN_DIR/state.ext4"
+		STATE_PERSISTENT=0
+	else
+		ensure_state_drive "$WORKDIR" "$RUN_DIR"
+	fi
 	local state_drive=$STATE_DRIVE
 
 	# Whether this is a restore has to be settled here, before the drives get
@@ -5458,6 +5563,13 @@ launch() {
 		# one the restored guest's memory describes. Packing a new drive here
 		# would be both wasted and wrong.
 		:
+	elif ((MOUNT_PROJECT)); then
+		# An empty one, so the drive table is what every run has; the guest
+		# mounts the share at the project's path instead.
+		local empty
+		empty=$(mktemp -d)
+		mkimage_from_dir "$empty" "$src_drive" firecode-src $((16 * 1024 * 1024))
+		rm -rf "$empty"
 	elif ((RESUME_TREE)) && [[ -f $src_drive ]]; then
 		log "resuming the working tree from the previous run"
 	else
@@ -5577,6 +5689,8 @@ launch() {
 		# Which kernel the modules drive is for, so the guest mounts it only
 		# when there is one - and never waits for a label that is not coming.
 		env_line FIRECODE_MODULES "$MODULES_VERSION"
+		# Mounted rather than copied: the virtio-fs tag the guest mounts.
+		((MOUNT_PROJECT)) && env_line FIRECODE_PROJECT_SHARE src
 		# Read from the project, not from wherever firecode happens to live, so
 		# a repo-local identity wins the same way it would on the host.
 		env_line FIRECODE_GIT_NAME "$(git -C "$WORKDIR" config --get user.name 2>/dev/null || true)"
@@ -5680,7 +5794,14 @@ launch() {
 	local workspace_layer main_layer="" main_dir
 	main_dir=$(main_checkout "$WORKDIR")
 
-	if [[ -n $main_dir && $main_dir != "$WORKDIR" ]]; then
+	# Mounted, the project's own layer - where its toolchains were installed -
+	# is inherited read-only like a worktree's main checkout, if it has one;
+	# the run writes to a fresh layer of its own and keeps nothing.
+	if ((MOUNT_PROJECT)) && [[ ${main_dir:-$WORKDIR} == "$WORKDIR" ]]; then
+		main_dir=$WORKDIR
+		[[ -f $STATE_DIR/$SLUG-layer.ext4 ]] || main_dir=""
+	fi
+	if [[ -n $main_dir ]] && { [[ $main_dir != "$WORKDIR" ]] || ((MOUNT_PROJECT)); }; then
 		main_layer=$(ensure_layer "$(project_slug "$main_dir")")
 		# A layer whose VM was killed rather than shut down has a dirty
 		# journal, and the kernel cannot replay one on a read-only mount - it
@@ -5851,11 +5972,20 @@ launch() {
 	lower_drives+=("$ROOTFS")
 
 	workspace_layer="$STATE_DIR/$SLUG-layer.ext4"
-	if ((FRESH_ROOT)) && [[ -f $workspace_layer ]]; then
+	if ((MOUNT_PROJECT)); then
+		workspace_layer="$RUN_DIR/layer.ext4"
+		local lseed
+		lseed=$(mktemp -d)
+		mkdir -p "$lseed/upper" "$lseed/work"
+		mkimage_from_dir "$lseed" "$workspace_layer" "fl-layer" \
+			"${FIRECODE_LAYER_SIZE:-$((16 * 1024 * 1024 * 1024))}"
+		rm -rf "$lseed"
+	fi
+	if ((FRESH_ROOT && !MOUNT_PROJECT)) && [[ -f $workspace_layer ]]; then
 		log "discarding this workspace's layer, starting from the base image"
 		rm -f "$workspace_layer"
 	fi
-	[[ -f $workspace_layer ]] || {
+	((MOUNT_PROJECT)) || [[ -f $workspace_layer ]] || {
 		log "new workspace layer (what gets installed here stays here)"
 		ensure_layer "$SLUG" >/dev/null
 	}
@@ -5885,7 +6015,7 @@ launch() {
 	# that remounted read-only mid-boot, and a run that died twelve seconds in
 	# saying "mount point is not a directory". Nothing pointed at the cause.
 	local private_copy=0
-	if ((STATE_PERSISTENT == 0)); then
+	if ((STATE_PERSISTENT == 0 && !MOUNT_PROJECT)); then
 		local shared=$workspace_layer
 		workspace_layer="$RUN_DIR/layer.ext4"
 		private_copy=1
@@ -6146,6 +6276,13 @@ launch() {
 	[[ ${FIRECODE_BALLOON:-1} != 0 ]] &&
 		balloon=',
   "balloon": {"amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 0, "free_page_reporting": true}'
+	local shares=""
+	if ((MOUNT_PROJECT)); then
+		# Read-only at the host: whatever the guest does, the share cannot be
+		# written through. JSON-quoted by python, since a path is arbitrary text.
+		shares=",
+  \"firecode-vz-shares\": [{\"tag\": \"src\", \"path\": $(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$WORKDIR"), \"read_only\": true}]"
+	fi
 	cat >"$JAIL_DIR/vm-config.json" <<EOF
 {
   "boot-source": {
@@ -6158,7 +6295,7 @@ launch() {
   ],
   "machine-config": {"vcpu_count": $VCPU, "mem_size_mib": $MEM},
   "network-interfaces": $net_ifaces,
-  "vsock": {"guest_cid": $cid, "uds_path": "firecracker-vsock.sock"}$balloon
+  "vsock": {"guest_cid": $cid, "uds_path": "firecracker-vsock.sock"}$balloon$shares
 }
 EOF
 
@@ -8318,6 +8455,10 @@ in)
 run)
 	shift
 	cmd_run "$@"
+	;;
+sh)
+	shift
+	cmd_sh "$@"
 	;;
 checkpoint)
 	shift

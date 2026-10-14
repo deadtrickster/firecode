@@ -211,6 +211,32 @@ setup_modules() {
 	fi
 }
 
+# The project as the host has it, live - shared with virtio-fs rather than
+# copied - and read-only at the host, so nothing done in here can change it.
+# A tmpfs layer over it takes whatever the guest writes (a test's scratch
+# files, a build's output) and is gone with the VM: the project can be used
+# as if it were writable, and nothing comes back.
+mount_project_share() {
+	local target=${FIRECODE_PROJECT:-} tag=${FIRECODE_PROJECT_SHARE:-}
+	[[ -n $target && -n $tag ]] || return 0
+	local ro=/run/firecode/share-ro rw=/run/firecode/share-rw
+	modprobe virtiofs 2>/dev/null
+	mkdir -p "$ro" "$rw" "$target"
+	if ! mount -t virtiofs -o ro "$tag" "$ro"; then
+		log "WARNING: could not mount the shared project ($tag) - $target is empty"
+		return 0
+	fi
+	mount -t tmpfs -o mode=0755 tmpfs "$rw"
+	mkdir -p "$rw/upper" "$rw/work"
+	chown "${FIRECODE_UID:-0}:${FIRECODE_GID:-0}" "$rw/upper"
+	if mount -t overlay overlay -o "lowerdir=$ro,upperdir=$rw/upper,workdir=$rw/work" "$target"; then
+		log "project mounted from the host at $target (read-only; writes here are thrown away)"
+	else
+		log "WARNING: no writable layer over the share - $target is read-only"
+		mount --bind "$ro" "$target"
+	fi
+}
+
 # Where docker and containerd keep images and layers.
 #
 # Not on the root: it is an overlay, and their overlay2/overlayfs drivers
@@ -331,6 +357,9 @@ mount_disks() {
 mount_project() {
 	local target=${FIRECODE_PROJECT:-}
 	[[ -n $target ]] || return 0
+	# Shared rather than copied: mounted by mount_project_share, once the
+	# modules - virtiofs among them - are there.
+	[[ -n ${FIRECODE_PROJECT_SHARE:-} ]] && return 0
 	mkdir_owned "$target"
 	mount_label firecode-src "$target" || return 0
 
@@ -476,6 +505,7 @@ main() {
 	mount_label firecode-state "$STATE"
 
 	setup_modules
+	mount_project_share
 	setup_container_storage
 
 	overlay_home claude
