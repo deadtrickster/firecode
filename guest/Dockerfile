@@ -49,6 +49,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& ln -sf /usr/bin/fdfind /usr/local/bin/fd \
 	&& rm -rf /var/lib/apt/lists/*
 
+# Shell linters, from upstream at pinned versions.
+#
+# noble's apt has shellcheck 0.9.0 and no shfmt at all, and 0.9.0 predates checks
+# people gate on: a script that passes in a VM would fail on the host for the
+# tool's age rather than the change's. Both are static binaries whose version is
+# in the file name, so the pin is real rather than a comment, and neither needs
+# an interpreter the guest might later lose.
+ARG SHELLCHECK_VERSION=0.11.0
+ARG SHFMT_VERSION=3.14.1
+RUN set -eux; \
+	arch="$(dpkg --print-architecture)"; \
+	case "$arch" in \
+	amd64) sc_arch=x86_64 sh_arch=amd64 ;; \
+	arm64) sc_arch=aarch64 sh_arch=arm64 ;; \
+	*) echo "no upstream shellcheck/shfmt release for $arch" >&2; exit 1 ;; \
+	esac; \
+	curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 \
+		"https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.${sc_arch}.tar.xz" \
+		| tar -xJ -C /usr/local/bin --strip-components=1 --wildcards '*/shellcheck'; \
+	curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 20 \
+		-o /usr/local/bin/shfmt \
+		"https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_${sh_arch}"; \
+	chmod 0755 /usr/local/bin/shellcheck /usr/local/bin/shfmt; \
+	shellcheck --version | sed -n 2p; \
+	shfmt --version
+
 # Node (agents and their MCP servers assume it) and bun.
 #
 # Fetched from nodejs.org as a tarball, not via deb.nodesource.com. The nodesource
@@ -153,6 +179,23 @@ RUN printf '%s\n' \
 	'export PATH=/opt/mise/shims:$PATH' \
 	> /etc/profile.d/10-mise.sh \
 	&& chmod 0644 /etc/profile.d/10-mise.sh
+
+# wasm32, FOR WHICHEVER RUST THIS IMAGE ENDED UP WITH.
+#
+# rustup keeps targets per toolchain and no profile includes wasm32, so a build
+# script that compiles to wasm (letibot's crates/builtins) dies in the middle of
+# a build with "can't find crate for `core`" instead of saying what is missing.
+# Here rather than inside the --full branch so a toolchain that arrived through
+# `--with rust@...` gets it too; a lean image has no rustup and needs no target.
+ARG RUST_TARGETS=wasm32-unknown-unknown
+RUN set -eux; \
+	PATH="/opt/mise/shims:$PATH"; \
+	if command -v rustup >/dev/null 2>&1; then \
+		rustup target add $RUST_TARGETS; \
+		rustup target list --installed; \
+	else \
+		echo "no rust toolchain in this image; nothing to add $RUST_TARGETS to"; \
+	fi
 
 # ---------------------------------------------------------------- guest bits
 COPY firecode-setup.sh agent-entrypoint.sh profile.sh /opt/firecode/

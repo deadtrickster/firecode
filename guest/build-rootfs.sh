@@ -195,6 +195,33 @@ for tty in ttyS0 hvc0; do
 		EOF
 done
 
+# Shell linters, from upstream at pinned versions.
+#
+# Noble's apt has shellcheck 0.9.0 and no shfmt, and 0.9.0 predates checks
+# people gate on. Same two tarballs and same pins as guest/Dockerfile - the two
+# builders make one image and must not disagree about what is in it.
+SHELLCHECK_VERSION=${SHELLCHECK_VERSION:-0.11.0}
+SHFMT_VERSION=${SHFMT_VERSION:-3.14.1}
+say "shellcheck $SHELLCHECK_VERSION, shfmt $SHFMT_VERSION"
+sudo -n chroot "$TREE" /bin/bash -s "$SHELLCHECK_VERSION" "$SHFMT_VERSION" \
+	"$(dpkg --print-architecture)" <<-'LINTERS'
+		set -euo pipefail
+		sc=$1 sh=$2 arch=$3
+		case "$arch" in
+		amd64) sc_arch=x86_64 sh_arch=amd64 ;;
+		arm64) sc_arch=aarch64 sh_arch=arm64 ;;
+		*) echo "no upstream shellcheck/shfmt release for $arch" >&2; exit 1 ;;
+		esac
+		curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused \
+			"https://github.com/koalaman/shellcheck/releases/download/v${sc}/shellcheck-v${sc}.linux.${sc_arch}.tar.xz" \
+			| tar -xJ -C /usr/local/bin --strip-components=1 --wildcards '*/shellcheck'
+		curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused -o /usr/local/bin/shfmt \
+			"https://github.com/mvdan/sh/releases/download/v${sh}/shfmt_v${sh}_linux_${sh_arch}"
+		chmod 0755 /usr/local/bin/shellcheck /usr/local/bin/shfmt
+		shellcheck --version | sed -n 2p
+		shfmt --version
+	LINTERS
+
 say "the initramfs that assembles the layered root"
 INITRD=/tmp/firecode-initrd
 sudo -n rm -rf "$INITRD"
@@ -222,6 +249,17 @@ if [[ -n $TOOLS ]]; then
 		mise reshim
 		chmod -R a+rX /opt/mise
 	"
+	# wasm32 for whichever rust arrived through --with: rustup keeps targets
+	# per toolchain and no profile includes it, so a wasm build script dies
+	# mid-build with "can't find crate for `core`". Nothing to add without rust.
+	sudo -n chroot "$TREE" /bin/bash -s <<-'WASM'
+		set -euo pipefail
+		PATH=/opt/mise/shims:$PATH
+		if command -v rustup >/dev/null 2>&1; then
+			rustup target add wasm32-unknown-unknown
+			rustup target list --installed
+		fi
+	WASM
 fi
 
 # The builder's resolver goes back out - see the copy above.

@@ -45,6 +45,10 @@ that only exists inside this VM is worse than useless in a commit message.
   then and nothing you do can damage the real tree.
 - Packages you install stay in this workspace's layer and are still here next
   run. Do not reinstall a toolchain that is already present.
+- `shellcheck` and `shfmt` are on PATH at pinned versions - lint or format a
+  shell change here before you call it done. `mise` is there for anything else.
+- If `cargo` exists, the wasm32 target is installed with its toolchain; if it
+  does not, this image has no rust and `mise use rust` is how you get one.
 - Your session history is kept, so a later run can resume this conversation.
 - Anything outside the project and the system is gone with the VM.
 
