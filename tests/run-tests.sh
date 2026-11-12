@@ -927,6 +927,76 @@ test_relay_stays_on_upstream() {
 	((rc == 0)) || [[ $out == *NO\ * ]] || no "the relay test ran" "$out"
 }
 
+# THE RESULT DIRECTORY MUST NOT EXIST UNTIL IT IS ALL THERE.
+#
+# extract_image writes into the directory it is handed, and it used to be handed
+# <project>-<timestamp> - so that name appeared with the first file in it, and a
+# caller watching for the result (letibot polls for .git) could take hold of a
+# checkout that was still arriving. The copy-out goes to a staging directory
+# beside the name now, and publish_result renames it into place last.
+#
+# Host-side and hermetic: a real ext4 image stands in for the guest's drive, and
+# the real extraction and publish functions are taken out of the script.
+test_copy_out_is_published_whole() {
+	local src="$WORK/copyout-src" id="test-copyout-$$" img="$WORK/copyout.ext4"
+	local want="$WORK/copyout-result" staging published mkfs out
+	mkfs=$(PATH="$PATH:/sbin:/usr/sbin" command -v mkfs.ext4) ||
+		{
+			no "mkfs.ext4 is available" "not found"
+			return
+		}
+	rm -rf "$src" "$want" "$want"-* "$WORK"/.firecode-copyout.*
+	mkdir -p "$src/.git"
+	echo "the agent's work" >"$src/work.txt"
+	echo "ref: refs/heads/main" >"$src/.git/HEAD"
+	"$mkfs" -q -F -d "$src" "$img" 16M >/dev/null 2>&1 ||
+		{
+			no "a source image can be made" "mkfs failed"
+			return
+		}
+
+	out=$(
+		log() { printf 'copy: %s\n' "$*" >&2; }
+		eval "$(sed -n '/^sbin() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^defang_git() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^extract_image() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^publish_result() {$/,/^}$/p' "$FIRECODE")"
+		staging=$(mktemp -d "$WORK/.firecode-copyout.XXXXXX")
+		extract_image "$img" "$staging"
+		# The name a caller watches for must still be absent, and its .git
+		# with it, while the tree is being written.
+		printf 'before:%s\n' "$([[ -e $want ]] && echo present || echo absent)"
+		published=$(publish_result "$staging" "$want")
+		printf 'published:%s\n' "$published"
+		printf 'staging:%s\n' "$([[ -d $staging ]] && echo kept || echo gone)"
+		printf 'git:%s\n' "$([[ -f $want/.git/HEAD ]] && echo yes || echo no)"
+		printf 'work:%s\n' "$(cat "$want/work.txt" 2>/dev/null)"
+		# A name already taken by somebody else's directory is not merged into.
+		mkdir -p "$WORK/occupied"/keep
+		staging=$(mktemp -d "$WORK/.firecode-copyout.XXXXXX")
+		extract_image "$img" "$staging"
+		printf 'second:%s\n' "$(publish_result "$staging" "$WORK/occupied")"
+		printf 'occupied:%s\n' "$(ls "$WORK/occupied" | tr '\n' ' ')"
+		rm -rf "$WORK/occupied"
+	)
+	check "the result name is absent while the copy is being made" "before:absent" \
+		"$(grep '^before:' <<<"$out")"
+	check "it is published under the name asked for" "published:$want" \
+		"$(grep '^published:' <<<"$out")"
+	check "and the staging directory is gone" "staging:gone" "$(grep '^staging:' <<<"$out")"
+	check "a whole checkout arrives, .git included" "git:yes" "$(grep '^git:' <<<"$out")"
+	check "with the work in it" "work:the agent's work" "$(grep '^work:' <<<"$out")"
+	# A directory that is not empty belongs to somebody else. The tree goes
+	# beside it under a name of its own.
+	if [[ $(grep '^second:' <<<"$out") == "second:$WORK/occupied" ]]; then
+		no "a name already taken by a full directory is not landed into" "$out"
+	else
+		ok "a name already taken by a full directory is not landed into"
+	fi
+	check "and its contents are untouched" "keep" "$(grep '^occupied:' <<<"$out" | sed 's/^occupied://' | tr -d ' ')"
+	rm -rf "$WORK"/.firecode-copyout.* "$WORK/occupied"* "$want"*
+}
+
 # A result's .git was written by the guest, and repo config is code: fsmonitor
 # runs on `git status`, hooks on `git commit`. Host-side and instant - a drive
 # made with mkfs -d stands in for one a guest wrote, and the real extract path
@@ -2250,6 +2320,7 @@ run_test list_and_ps_tell_unresponsive_from_busy
 run_test up_help_boots_nothing
 run_test shared_project_names_the_run
 run_test result_git_is_inert
+run_test copy_out_is_published_whole
 run_test jail_wrapper_refuses
 run_test libvirt_cids_are_unique
 run_test libvirt_balloon_reports

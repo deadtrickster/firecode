@@ -6826,7 +6826,16 @@ EOF
 		# directory reads as "the VM produced nothing" rather than as a full
 		# filesystem. Say which it is before it happens.
 		disk_pressure "$(dirname -- "$out_dir")" "copying the project out"
-		extract_image "$src_drive" "$out_dir"
+		# BESIDE THE NAME IT WILL HAVE, never under it. The tree used to be
+		# extracted straight into <project>-<timestamp>, so from the first file
+		# onwards that name existed and looked like a result: letibot polled
+		# for .git, saw a half-written checkout, and handed the run's caller a
+		# tree that was still arriving. A dot-prefixed staging name in the same
+		# directory keeps the rename one filesystem, so publishing is atomic.
+		local staging
+		staging=$(mktemp -d "$(dirname -- "$out_dir")/.firecode-copyout.XXXXXX") ||
+			die "could not make a staging directory beside $out_dir"
+		extract_image "$src_drive" "$staging"
 		# The run directory remembers what the delivered tree is about to
 		# forget. These markers are deleted from the result - they are
 		# harness bookkeeping, not somebody's work - and until now the verdict
@@ -6834,10 +6843,7 @@ EOF
 		# later "did that run pass, and where did it land" had to grep a
 		# console; `land` cannot be built on that, and neither can an honest
 		# status.
-		printf '%s\n' "$out_dir" >"$RUN_DIR/result"
-		printf '%s\n' "$WORKDIR" >"$RUN_DIR/workdir"
-
-		local st="$out_dir/.firecode-exit-status"
+		local st="$staging/.firecode-exit-status"
 		if [[ -f $st ]]; then
 			local ast
 			ast=$(cat "$st")
@@ -6856,20 +6862,20 @@ EOF
 		# this from mtimes - the whole tree is copied out at once and lands
 		# with a single timestamp - and it is the number that says whether
 		# a gate is doing anything at all.
-		local vsec="$out_dir/.firecode-verify-seconds"
+		local vsec="$staging/.firecode-verify-seconds"
 		if [[ -f $vsec ]]; then
 			cp -f "$vsec" "$RUN_DIR/verify-seconds"
 			rm -f "$vsec"
 		fi
-		local vst="$out_dir/.firecode-verify-status"
+		local vst="$staging/.firecode-verify-status"
 		if [[ -f $vst ]]; then
 			local vrc
 			vrc=$(cat "$vst")
 			cp -f "$vst" "$RUN_DIR/verify-status"
 			if [[ $vrc == 0 ]]; then
-				log "verification passed - see $out_dir/.firecode-verify.log"
+				log "verification passed - see $staging/.firecode-verify.log"
 			else
-				log "VERIFICATION FAILED (exit $vrc) - $out_dir/.firecode-verify.log"
+				log "VERIFICATION FAILED (exit $vrc) - $staging/.firecode-verify.log"
 				log "  whatever the agent said about this run, the check did not pass"
 				# The gate's status becomes the run's, which is the entire
 				# point of having one. It was being logged and then dropped:
@@ -6901,8 +6907,8 @@ EOF
 		# behind. Most of these VMs are transient - a test, a probe, one that
 		# failed to start - and seventeen identical directories beside a
 		# project is just litter to work out the meaning of later.
-		if [[ -z $DELIVER ]] && diff -rq --exclude=.git "$WORKDIR" "$out_dir" >/dev/null 2>&1; then
-			rm -rf "$out_dir"
+		if [[ -z $DELIVER ]] && diff -rq --exclude=.git "$WORKDIR" "$staging" >/dev/null 2>&1; then
+			rm -rf "$staging"
 			copy_out_mark none
 			log "nothing changed, so no result directory"
 			echo
@@ -6911,7 +6917,16 @@ EOF
 			return "$rc"
 		fi
 		local saved
-		saved=$(link_unchanged "$WORKDIR" "$out_dir")
+		saved=$(link_unchanged "$WORKDIR" "$staging")
+		# THE RENAME IS THE ANNOUNCEMENT, and it is the last thing that
+		# happens: until then the tree is under a name nothing watches for, and
+		# afterwards every file of it is there. runs/<id>/copy_out is written
+		# after it, so `done <path>` - what `firecode down` prints - is only
+		# ever true of a whole directory.
+		out_dir=$(publish_result "$staging" "$out_dir") ||
+			die "could not move the copy-out into place - nothing is lost, it is at $staging"
+		printf '%s\n' "$out_dir" >"$RUN_DIR/result"
+		printf '%s\n' "$WORKDIR" >"$RUN_DIR/workdir"
 		# The same string as runs/<id>/result, so the two never disagree.
 		[[ $out_dir == /* ]] || out_dir=$(realpath -m -- "$out_dir")
 		copy_out_mark "done $out_dir"
@@ -6979,6 +6994,33 @@ report_unlanded_commits() {
 	echo "              fold them into the project with:"
 	echo "                  firecode land ${RUN_DIR##*/}"
 	return 0
+}
+
+# PUBLISH A COPY-OUT IN ONE RENAME, AND ONLY ONCE IT IS WHOLE.
+#
+# extract_image writes into the directory it is given, so handing it
+# <project>-<timestamp> made that name exist from the first file onwards - and
+# anything watching for the result (letibot polls for .git) read a half-written
+# checkout as the finished work. It is given a staging directory beside the name
+# instead, and this moves it into place: one filesystem, one rename, nothing
+# observable in between. Prints the path it landed on, which is not always the
+# one asked for.
+publish_result() {
+	local staging=$1 want=$2
+	# An EMPTY directory of that name is ours to take: renaming onto it would
+	# put the tree inside it rather than in its place.
+	if [[ -d $want && -z $(ls -A "$want" 2>/dev/null) ]]; then
+		rmdir -- "$want" 2>/dev/null || true
+	fi
+	if [[ -e $want ]] || ! mv -- "$staging" "$want" 2>/dev/null; then
+		# Something took the name while the copy was being made. Never land
+		# inside it: a second name beside it is better than a half tree in a
+		# directory somebody else now owns.
+		want="$want-$(date +%H%M%S)"
+		mv -- "$staging" "$want" || return 1
+		log "the result's name was taken; it is at $want instead"
+	fi
+	printf '%s\n' "$want"
 }
 
 # Read an ext4 image without mounting it, so no root is needed. Files the
