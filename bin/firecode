@@ -167,6 +167,13 @@ OPENCODE_CONF="${FIRECODE_OPENCODE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/openc
 # Defaults. Claude Code alone wants ~1.5G, so 1G was never going to work.
 MEM=4096
 VCPU=4
+# What a workspace layer may hold before it is full. A package's first rounds are
+# rust + node + a debug test build, and 16G ran out on exactly that: `ld` died
+# with a Bus error on a harnessd test binary. The file is sparse, so an empty one
+# costs its ext4 metadata (~260M measured at this size, ~130M at 16G) and not
+# 32G; every copy this file makes of a layer is `cp --sparse=always`. Overridden
+# per run by --layer-size.
+LAYER_SIZE=$((32 * 1024 * 1024 * 1024))
 NONET=0
 NOJAIL=0
 CGROUPS=0
@@ -1348,7 +1355,7 @@ ensure_layer() {
 		seed=$(mktemp -d)
 		mkdir -p "$seed/upper" "$seed/work"
 		mkimage_from_dir "$seed" "$img" "fl-layer" \
-			"${FIRECODE_LAYER_SIZE:-$((16 * 1024 * 1024 * 1024))}"
+			"${FIRECODE_LAYER_SIZE:-$LAYER_SIZE}"
 		rm -rf "$seed"
 	fi
 	echo "$img"
@@ -6151,7 +6158,7 @@ launch() {
 		lseed=$(mktemp -d)
 		mkdir -p "$lseed/upper" "$lseed/work"
 		mkimage_from_dir "$lseed" "$workspace_layer" "fl-layer" \
-			"${FIRECODE_LAYER_SIZE:-$((16 * 1024 * 1024 * 1024))}"
+			"${FIRECODE_LAYER_SIZE:-$LAYER_SIZE}"
 		rm -rf "$lseed"
 	fi
 	if ((FRESH_ROOT && !MOUNT_PROJECT)) && [[ -f $workspace_layer ]]; then

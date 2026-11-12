@@ -7,7 +7,7 @@
 # Per-project layers, declared Dockerfile-style, editable by the agent and
 # manageable from a UI rather than by hand.
 #
-# WHAT IT REPLACES. ensure_layer() makes one empty 16G sparse ext4 per project
+# WHAT IT REPLACES. ensure_layer() makes one empty 32G sparse ext4 per project
 # and nothing ever puts anything in it declaratively - it fills only as a guest
 # happens to write. So a project's toolchain is whatever somebody installed by
 # hand, most recently through an UNTRACKED vm-provision.sh sitting in a scratch

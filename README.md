@@ -585,11 +585,11 @@ does not:
   images survive the VM, per workspace, like anything else it installs.
 
 **Size the layer for the stack.** Images, volumes and the build cache share
-the workspace layer, 16G by default. PeerDB's dev stack - 14 services, six
-images built from the repository - filled it: 3.3G of images and 8.9G of
-build cache. `docker builder prune -af` after the build gets most of that
-back; for a stack you build often, give the workspace room up front, which
-applies when the layer is created (`--fresh-root` makes a new one):
+the workspace layer, 32G by default. PeerDB's dev stack - 14 services, six
+images built from the repository - filled the 16G it used to be: 3.3G of images
+and 8.9G of build cache. `docker builder prune -af` after the build gets most
+of that back; for a stack you build often, give the workspace room up front,
+which applies when the layer is created (`--fresh-root` makes a new one):
 
 ```sh
 firecode up --layer-size 48G --fresh-root --mem 16384 --vcpu 8
