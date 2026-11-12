@@ -165,8 +165,11 @@ OPENCODE_SHARE="${FIRECODE_OPENCODE_SHARE:-${XDG_DATA_HOME:-$HOME/.local/share}/
 OPENCODE_CONF="${FIRECODE_OPENCODE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
 
 # Defaults. Claude Code alone wants ~1.5G, so 1G was never going to work.
-MEM=4096
-VCPU=4
+# FIRECODE_MEM and FIRECODE_VCPU are the same knob without a command line -
+# a caller that places VMs (letibot) sets them for the machine it is about to
+# ask for, and --mem/--vcpu still win over both.
+MEM=${FIRECODE_MEM:-4096}
+VCPU=${FIRECODE_VCPU:-4}
 # What a workspace layer may hold before it is full. A package's first rounds are
 # rust + node + a debug test build, and 16G ran out on exactly that: `ld` died
 # with a Bus error on a harnessd test binary. The file is sparse, so an empty one
@@ -5047,6 +5050,48 @@ cleanup_run() {
 	return $status
 }
 
+# WHAT THE AGENT IS TOLD ABOUT THIS MACHINE, in the text it actually reads.
+#
+# Two things beyond the standing briefing. The memory and vCPU count, because a
+# package's first rounds were lost to a suite that could not fit - the kernel
+# killed the biggest process and the run read as a crash at something unrelated.
+# And the gate, because an agent that knows which command decides the outcome
+# can aim at it, and one that does not finds out after it has stopped.
+run_context() {
+	cat "$GUEST/firecode-context.md"
+	cat <<-EOF
+
+		## What this machine is
+
+		${MEM} MB of RAM and ${VCPU} vCPU, for the whole VM - not per process.
+
+		A suite sized for a laptop will not fit here. A debug build of cargo or
+		rustc, a linker over a large binary, or a harness that starts a dozen
+		processes will each take most of it, and running out looks like a crash
+		rather than like a machine that ran out: the kernel kills the biggest
+		process, or a build dies with "Bus error" or "No space left on device"
+		while df reads comfortable. If what you were asked to run cannot fit,
+		say so and name what it needs - a VM with more memory is a flag on the
+		host, not something you can change from in here. \`free -m\` and
+		\`nproc\` are the same two numbers.
+	EOF
+	if [[ -n $VERIFY ]]; then
+		cat <<-EOF
+
+			## What will be run after you finish
+
+			\`$VERIFY\`
+
+			The harness runs this itself once you exit, in the project
+			directory as it will be handed over, and its exit status is
+			what this run reports. You are not asked to trust it or to
+			remember it - run it yourself, as often as you like, and fix
+			what it says. A run whose agent claimed success and whose
+			verification failed is reported as a failure.
+		EOF
+	fi
+}
+
 launch() {
 	AGENT=$1
 	shift
@@ -5573,7 +5618,7 @@ launch() {
 	trap cleanup_run EXIT
 	trap 'cleanup_run; exit 141' PIPE
 
-	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR"
+	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR  mem=${MEM}M  vcpu=$VCPU"
 
 	# Which provider is being stood in for, decided before anything is staged.
 	#
@@ -5944,27 +5989,7 @@ launch() {
 		[[ -n ${FIRECODE_INBOX_IDLE:-} ]] &&
 			env_line FIRECODE_INBOX_IDLE "$FIRECODE_INBOX_IDLE"
 	} >"$ctl_stage/env"
-	{
-		cat "$GUEST/firecode-context.md"
-		# Said here rather than left as a surprise: an agent that knows which
-		# command decides the outcome can aim at it, and one that does not
-		# finds out after it has stopped, which helps nobody.
-		if [[ -n $VERIFY ]]; then
-			cat <<-EOF
-
-				## What will be run after you finish
-
-				\`$VERIFY\`
-
-				The harness runs this itself once you exit, in the project
-				directory as it will be handed over, and its exit status is
-				what this run reports. You are not asked to trust it or to
-				remember it - run it yourself, as often as you like, and fix
-				what it says. A run whose agent claimed success and whose
-				verification failed is reported as a failure.
-			EOF
-		fi
-	} >"$ctl_stage/context.md"
+	run_context >"$ctl_stage/context.md"
 
 	# The guest scripts ride along on the control drive and take precedence
 	# over the copies baked into the image, so changing the harness does not

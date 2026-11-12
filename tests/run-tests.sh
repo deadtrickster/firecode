@@ -2163,6 +2163,59 @@ test_proc_mounted() {
 	(cd "$p" && "$FIRECODE" down >/dev/null 2>&1)
 }
 
+# WHAT THE AGENT IS TOLD ABOUT ITS MACHINE, and the knob that sets it.
+#
+# A package's first rounds were lost to a suite that could not fit: the kernel
+# killed the biggest process and the run read as a crash at something else. So
+# the size is in the text the agent actually reads, and it can be set per VM
+# without a command line - FIRECODE_MEM / FIRECODE_VCPU, which is what a caller
+# that places VMs (letibot) needs.
+test_guest_memory_is_declared() {
+	local p out ctx fake
+	p=$(make_project)
+	# A tree with the assets in it, so the dry run reaches the line it prints
+	# the machine on. Without them it stops early, which says nothing about
+	# memory and would fail on a host that has never built an image.
+	fake="$WORK/memroot"
+	mkdir -p "$fake/images" "$fake/runs" "$fake/vendor/bin"
+	: >"$fake/images/vmlinux-6.8.0"
+	: >"$fake/images/agent-firecode.ext4"
+	: >"$fake/images/initrd.gz"
+	cp /bin/true "$fake/vendor/bin/firecracker"
+	cp /bin/true "$fake/vendor/bin/jailer"
+	# The env knob, where a caller can see it and a person can check it: the
+	# run line of a dry run.
+	out=$(cd "$p" && FIRECODE_ROOT="$fake" FIRECODE_MEM=2048 FIRECODE_VCPU=2 \
+		timeout 60 "$FIRECODE" exec --no-jail --no-net \
+		--api-base http://127.0.0.1:9/v1 --dry-run "a task" 2>&1)
+	contains "FIRECODE_MEM sizes the VM" "mem=2048M" "$out"
+	contains "FIRECODE_VCPU sizes it too" "vcpu=2" "$out"
+	out=$(cd "$p" && FIRECODE_ROOT="$fake" FIRECODE_MEM=2048 timeout 60 "$FIRECODE" exec \
+		--no-jail --no-net --api-base http://127.0.0.1:9/v1 --mem 3072 --dry-run "a task" 2>&1)
+	contains "and --mem still wins over it" "mem=3072M" "$out"
+
+	# The same numbers reach the agent's own briefing, which is the whole point:
+	# an agent that knows what it has can say "this does not fit" instead of
+	# failing at something unrelated.
+	ctx=$(
+		export GUEST="$ROOT/guest" MEM=2048 VCPU=2
+		VERIFY=""
+		eval "$(sed -n '/^run_context() {$/,/^}$/p' "$FIRECODE")"
+		run_context
+	)
+	contains "the briefing names the memory" "2048 MB of RAM" "$ctx"
+	contains "and the cpu count" "2 vCPU" "$ctx"
+	contains "and says a suite can be too big for it" "will not fit here" "$ctx"
+	# And it is sized per run, not once: a 4G VM says 4G.
+	ctx=$(
+		export GUEST="$ROOT/guest" MEM=4096 VCPU=4
+		VERIFY=""
+		eval "$(sed -n '/^run_context() {$/,/^}$/p' "$FIRECODE")"
+		run_context
+	)
+	contains "a bigger VM says so" "4096 MB of RAM and 4 vCPU" "$ctx"
+}
+
 # A DROPPED FLAG IS WHAT THIS ASSERTS AGAINST, not JSON syntax.
 #
 # On a host with no VMs, `firecode ps` and `firecode ps --json` both exit 0 and
@@ -2305,6 +2358,7 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 
 run_test shellcheck
 run_test cached_image_matches_guest
+run_test guest_memory_is_declared
 run_test ps_json_is_not_the_prose
 run_test projects_is_a_registry_not_a_config_file
 run_test layer_inherit
