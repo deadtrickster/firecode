@@ -71,7 +71,7 @@ cat >"$work/vm-config.json" <<EOF
     {"drive_id": "target", "path_on_host": "target.ext4", "is_root_device": false, "is_read_only": false},
     {"drive_id": "input", "path_on_host": "input.tar", "is_root_device": false, "is_read_only": true}
   ],
-  "machine-config": {"vcpu_count": $(( $(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo 4) )), "mem_size_mib": 4096},
+  "machine-config": {"vcpu_count": $(($(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo 4))), "mem_size_mib": 4096},
   "network-interfaces": [{"iface_id": "eth0", "guest_mac": "06:00:ac:10:fe:02", "host_dev_name": "nat"}]
 }
 EOF

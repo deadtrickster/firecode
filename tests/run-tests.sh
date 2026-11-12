@@ -819,7 +819,10 @@ test_result_git_is_inert() {
 	local src="$WORK/evil" id="test-defang-$$" out marker="$WORK/guest-ran-on-host"
 	local mkfs
 	mkfs=$(PATH="$PATH:/sbin:/usr/sbin" command -v mkfs.ext4) ||
-		{ no "mkfs.ext4 is available" "not found"; return; }
+		{
+			no "mkfs.ext4 is available" "not found"
+			return
+		}
 	rm -rf "$src" "$marker"
 	git init -q "$src"
 	git -C "$src" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
@@ -1161,7 +1164,8 @@ test_cp_from_guest_is_all_or_nothing() {
 # memory is locked for DMA. Host-side - the XML builder alone.
 test_libvirt_balloon_reports() {
 	local out
-	out=$(python3 - "$ROOT/scripts/libvirt-domain.py" <<'PY'
+	out=$(
+		python3 - "$ROOT/scripts/libvirt-domain.py" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("ld", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -1175,7 +1179,7 @@ print("plain", bal())
 print("gpu", bal(pci=["0000:01:00.0"]))
 print("off", bal(balloon=False))
 PY
-)
+	)
 	contains "a libvirt VM reports free pages" 'freePageReporting="on"' "$(grep '^plain' <<<"$out")"
 	contains "not with a passed-through device" 'model="none"' "$(grep '^gpu' <<<"$out")"
 	if grep '^off' <<<"$out" | grep -q freePageReporting; then

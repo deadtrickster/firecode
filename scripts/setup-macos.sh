@@ -96,13 +96,14 @@ unpack_kernel() {
 	local in=$1 out=$2
 	if [[ $(head -c 8 "$in" | tail -c 4) == zimg ]]; then
 		local comp
-		comp=$(python3 - "$in" "$out.payload" <<-'PY'
-			import struct, sys
-			data = open(sys.argv[1], "rb").read()
-			off, size = struct.unpack_from("<II", data, 8)
-			open(sys.argv[2], "wb").write(data[off:off + size])
-			print(data[24:32].rstrip(b"\0").decode())
-		PY
+		comp=$(
+			python3 - "$in" "$out.payload" <<-'PY'
+				import struct, sys
+				data = open(sys.argv[1], "rb").read()
+				off, size = struct.unpack_from("<II", data, 8)
+				open(sys.argv[2], "wb").write(data[off:off + size])
+				print(data[24:32].rstrip(b"\0").decode())
+			PY
 		)
 		case $comp in
 		zstd) zstd -qdc "$out.payload" >"$out" ;;
@@ -122,7 +123,7 @@ unpack_kernel() {
 	}
 }
 
-if compgen -G "$IMAGES/vmlinux-*-arm64" >/dev/null && [[ -f $MAC/busybox && -d $MAC/modules ]] && ((!FORCE)); then
+if compgen -G "$IMAGES/vmlinux-*-arm64" >/dev/null && [[ -f $MAC/busybox && -d $MAC/modules ]] && ((! FORCE)); then
 	say "kernel already present: $(basename "$(find "$IMAGES" -maxdepth 1 -name 'vmlinux-*-arm64' | sort -V | tail -1)")"
 else
 	fetch_index
@@ -174,7 +175,7 @@ fi
 # the indices on a layer over this drive and keeps them per project.
 ver=$(cat "$MAC/kernel-version")
 MODDRIVE="$IMAGES/modules-$ver.ext4"
-if [[ -f $MODDRIVE ]] && ((!FORCE)); then
+if [[ -f $MODDRIVE ]] && ((! FORCE)); then
 	say "modules drive already present: $(basename "$MODDRIVE")"
 else
 	command -v mkfs.ext4 >/dev/null || {

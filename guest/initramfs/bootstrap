@@ -41,9 +41,15 @@ if [ -f /lib/modules/load ]; then
 fi
 
 mkdir -p /work
-mount -t ext4 /dev/vda /work || { say "cannot mount the scratch disk"; finish FAILED; }
+mount -t ext4 /dev/vda /work || {
+	say "cannot mount the scratch disk"
+	finish FAILED
+}
 mkdir -p /work/in /work/root
-tar -xf /dev/vdc -C /work/in || { say "cannot read the input drive"; finish FAILED; }
+tar -xf /dev/vdc -C /work/in || {
+	say "cannot read the input drive"
+	finish FAILED
+}
 
 say "network"
 cat >/bin/dhcp-script <<'EOF'
@@ -62,7 +68,10 @@ chmod +x /bin/dhcp-script
 mkdir -p /etc
 ip link set lo up
 ip link set eth0 up
-udhcpc -i eth0 -t 10 -T 1 -n -q -s /bin/dhcp-script || { say "no dhcp lease"; finish FAILED; }
+udhcpc -i eth0 -t 10 -T 1 -n -q -s /bin/dhcp-script || {
+	say "no dhcp lease"
+	finish FAILED
+}
 
 say "unpacking ubuntu-base"
 tar -xzf /work/in/ubuntu-base.tar.gz -C /work/root || finish FAILED
@@ -84,11 +93,17 @@ chroot /work/root /bin/sh -c '
 	apt-get update -qq
 	apt-get install -y -qq --no-install-recommends \
 		sudo mmdebstrap arch-test e2fsprogs ca-certificates curl gnupg >/dev/null
-' || { say "apt in the builder failed"; finish FAILED; }
+' || {
+	say "apt in the builder failed"
+	finish FAILED
+}
 
 tools=$(cat /work/in/tools 2>/dev/null)
 say "build-rootfs.sh${tools:+ with $tools}"
 chroot /work/root /bin/bash /opt/guest/build-rootfs.sh /dev/vdb /opt/guest "$tools" ||
-	{ say "build-rootfs.sh failed"; finish FAILED; }
+	{
+		say "build-rootfs.sh failed"
+		finish FAILED
+	}
 
 finish OK

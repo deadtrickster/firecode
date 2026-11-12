@@ -225,7 +225,7 @@ mv -f "$NEXT" "$OUT"
 # newer than any image ever built, and an mtime comparison would fail every
 # branch. The paths are relative to the checkout so the hash is the same from a
 # worktree as from the tree that built it.
-( cd "$ROOT" && find guest -type f -print0 | sort -z | xargs -0 sha256sum ) |
+(cd "$ROOT" && find guest -type f -print0 | sort -z | xargs -0 sha256sum) |
 	sha256sum | cut -d' ' -f1 >"$IMAGES/.guest-inputs.sha256"
 echo "[prepare] rootfs ready:"
 ls -lh "$OUT"

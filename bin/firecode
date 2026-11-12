@@ -973,7 +973,7 @@ build_config_drive() {
 	local item
 	# Credentials by way of host_claude_credentials, which knows where this
 	# machine keeps them. 0600, as the client writes them.
-	if ((!AUTH_RELAY)); then
+	if ((! AUTH_RELAY)); then
 		(
 			umask 077
 			host_claude_credentials >"$stage/claude/.credentials.json" 2>/dev/null
@@ -3137,7 +3137,7 @@ cmd_prepare_in_vm() {
 
 	# Not on a Mac: the initramfs there is built on the host by setup, around
 	# the modules Ubuntu's kernel needs, and the guest's would not have them.
-	if [[ -s $work/.initrd.b64 ]] && ((!MACOS)); then
+	if [[ -s $work/.initrd.b64 ]] && ((! MACOS)); then
 		base64 -d <"$work/.initrd.b64" >"$IMAGES/initrd.gz.next" &&
 			mv -f "$IMAGES/initrd.gz.next" "$INITRD"
 		log "initrd updated"
@@ -3150,7 +3150,7 @@ cmd_prepare_in_vm() {
 	# is about to boot still matches its own guest/. Same stamp as the docker
 	# path in scripts/prepare-rootfs.sh, and the same reasons: content rather
 	# than mtime, and paths relative to the checkout.
-	( cd "$ROOT" && find guest -type f -print0 | sort -z | xargs -0 sha256sum ) |
+	(cd "$ROOT" && find guest -type f -print0 | sort -z | xargs -0 sha256sum) |
 		sha256sum | cut -d' ' -f1 >"$IMAGES/.guest-inputs.sha256"
 	((keep)) || rm -rf "$work"
 	log "rootfs built in a VM: $(du -h "$ROOTFS" | cut -f1)"
@@ -3199,7 +3199,7 @@ cmd_prepare_macos() {
 			die "the bootstrap failed"
 		return 0
 	fi
-	if ((!force && !have_tools)); then
+	if ((! force && ! have_tools)); then
 		log "there is a guest image already: $rootfs"
 		log "  --force rebuilds it (in a VM booted off this one), --with changes its tools"
 		return 0
@@ -4126,7 +4126,7 @@ USAGE
 		"sudo pkill -TERM -f '^sh -c trap .exit 0. TERM; while .*firecode-idle'" >/dev/null 2>&1; then
 		if [[ -n $verify ]]; then
 			log "running its gate before it stops: $verify"
-			[[ -n $rd ]] && ((!nowait)) && {
+			[[ -n $rd ]] && ((! nowait)) && {
 				down_wait_copy_out "$rd"
 				down_report_verdict "$rd"
 				return
@@ -4767,7 +4767,7 @@ massage_args() {
 		# with -p first that argument was --dangerously-skip-permissions:
 		# every auto-flagged run was told the flag was its task, and the
 		# task itself went nowhere.
-		if ((!has_print)); then
+		if ((! has_print)); then
 			local at
 			at=$(prompt_index ${in+"${in[@]}"})
 			if [[ -n $at ]]; then
@@ -5292,7 +5292,7 @@ launch() {
 	# The cost of being wrong is asymmetric - a refusal costs one flag, a
 	# mistaken pack costs a filled disk and a long wait - so implicit and
 	# large is refused, while --project stays a decision anybody can make.
-	if ((WORKDIR_EXPLICIT == 0 && !MOUNT_PROJECT && !MOUNT_RW)) && [[ $AGENT != shell ]]; then
+	if ((WORKDIR_EXPLICIT == 0 && ! MOUNT_PROJECT && ! MOUNT_RW)) && [[ $AGENT != shell ]]; then
 		local limit=${FIRECODE_MAX_IMPLICIT_PROJECT:-$((4 * 1024 * 1024 * 1024))}
 		local bytes
 		# Bounded on purpose: a tree too big to measure in five seconds is
@@ -5334,7 +5334,7 @@ launch() {
 		WORKDIR=$wt
 	fi
 	# A linked git worktree on a Mac is mounted, not copied - see MOUNT_WORKTREE.
-	if ((MACOS && !NO_MOUNT && !MOUNT_PROJECT && !MOUNT_RW)) && [[ $VMM == vz ]] &&
+	if ((MACOS && ! NO_MOUNT && ! MOUNT_PROJECT && ! MOUNT_RW)) && [[ $VMM == vz ]] &&
 		[[ -f $WORKDIR/.git ]] && is_linked_worktree "$WORKDIR"; then
 		MOUNT_WORKTREE=1
 		SYNC_BACK=0
@@ -5440,7 +5440,7 @@ launch() {
 	RUN_ID="$id"
 	# A jailed run under the wrapper lives in the root-owned base, which the
 	# wrapper makes a directory in for us; anything else in our own.
-	if ((!NOJAIL)) && [[ -n $JAIL_WRAPPER ]]; then
+	if ((! NOJAIL)) && [[ -n $JAIL_WRAPPER ]]; then
 		JAIL_BASE=$PRIV_JAIL_BASE
 		JAIL_FC=$PRIV_LIBEXEC/firecracker
 	fi
@@ -6161,7 +6161,7 @@ launch() {
 			"${FIRECODE_LAYER_SIZE:-$LAYER_SIZE}"
 		rm -rf "$lseed"
 	fi
-	if ((FRESH_ROOT && !MOUNT_PROJECT)) && [[ -f $workspace_layer ]]; then
+	if ((FRESH_ROOT && ! MOUNT_PROJECT)) && [[ -f $workspace_layer ]]; then
 		log "discarding this workspace's layer, starting from the base image"
 		rm -f "$workspace_layer"
 	fi
@@ -6195,7 +6195,7 @@ launch() {
 	# that remounted read-only mid-boot, and a run that died twelve seconds in
 	# saying "mount point is not a directory". Nothing pointed at the cause.
 	local private_copy=0
-	if ((STATE_PERSISTENT == 0 && !MOUNT_PROJECT)); then
+	if ((STATE_PERSISTENT == 0 && ! MOUNT_PROJECT)); then
 		local shared=$workspace_layer
 		workspace_layer="$RUN_DIR/layer.ext4"
 		private_copy=1
@@ -6592,7 +6592,7 @@ EOF
 		vm_done=1
 	fi
 
-	if ((!vm_done)); then
+	if ((! vm_done)); then
 		# The VM boundary is Firecracker and KVM either way. The jailer adds a
 		# chroot, a dropped uid and a private pid namespace around the VMM
 		# process itself - defence in depth against a VMM escape, and the only

@@ -36,7 +36,7 @@ mkdir -p "$VENDOR" "$IMAGES"
 
 RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases"
 
-if [[ -x $VENDOR/firecracker && -x $VENDOR/jailer ]] && ((!FORCE)); then
+if [[ -x $VENDOR/firecracker && -x $VENDOR/jailer ]] && ((! FORCE)); then
 	echo "[setup] firecracker $("$VENDOR/firecracker" --version | head -1) already in vendor/bin"
 else
 	echo "[setup] fetching the latest firecracker release"
