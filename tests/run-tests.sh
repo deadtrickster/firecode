@@ -1349,6 +1349,19 @@ test_shellcheck() {
 	else
 		ok "shellcheck not installed (skipped)"
 	fi
+	# FORMATTING, AT THE VERSION THE IMAGE PINS. Without an .editorconfig and
+	# without this, "the shell is formatted" is a preference nobody can fail -
+	# and the tools that decide it are only newer than apt's in the image.
+	out=""
+	for f in "$ROOT/bin/firecode" "$ROOT"/scripts/*.sh "$ROOT"/guest/*.sh \
+		"$ROOT"/tests/*.sh; do
+		[[ -n $(shfmt -l "$f" 2>/dev/null) ]] && out="$out $(basename "$f")"
+	done
+	if command -v shfmt >/dev/null 2>&1; then
+		check "every script is shfmt-clean" "" "$out"
+	else
+		ok "shfmt not installed (skipped)"
+	fi
 	# What an agent is told, and when. The connect-time slot is small - a
 	# couple of thousand characters before a client truncates it - so the
 	# brief has to stay inside it and the real guide has to ride along with
