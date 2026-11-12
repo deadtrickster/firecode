@@ -21,7 +21,14 @@ set -u
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
-say() { echo "[firecode-initrd] $*"; }
+# Stamped with the kernel's uptime when /proc is already mounted, so the boot
+# before systemd can be timed too (scripts/boot-timings.sh). Busybox sh, so no
+# `local`.
+uptime_s() {
+	read -r u _ 2>/dev/null </proc/uptime
+	printf '%s' "${u:-?}"
+}
+say() { printf '[+%ss] [firecode-initrd] %s\n' "$(uptime_s)" "$*"; }
 
 fail() {
 	say "ERROR: $*"

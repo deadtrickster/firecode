@@ -6,7 +6,15 @@ set -u
 
 CTL_MNT=/opt/firecode/run
 
-log() { echo "[firecode] $*"; }
+# Stamped with the kernel's uptime, so a run can be timed from its console
+# afterwards (scripts/boot-timings.sh). `[firecode]` stays in the line for
+# everything that greps it.
+uptime_s() {
+	local up=""
+	read -r up _ 2>/dev/null </proc/uptime
+	printf '%s' "${up:-?}"
+}
+log() { printf '[+%ss] [firecode] %s\n' "$(uptime_s)" "$*"; }
 
 # Prefer the copy the harness shipped on the control drive, so a fix here
 # does not need the rootfs image rebuilt.

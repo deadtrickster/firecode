@@ -1456,6 +1456,47 @@ test_shellcheck() {
 	fi
 }
 
+# A BOOT THAT TOOK MINUTES HAS TO BE EXPLAINABLE AFTERWARDS.
+#
+# `firecode up` waits for the guest to answer, and at load ~380 that answer was
+# three to six minutes with nothing to say where they went. The guest's own log
+# lines now carry the kernel's uptime, so the gap between two of them IS the
+# phase - and this checks the reading, on a console with a phase worth finding.
+# Host-side: the console is a file.
+test_boot_timings_read_a_boot() {
+	local dir out run
+	dir="$WORK/btruns"
+	run="$dir/firecode-20261112-101010-1234"
+	mkdir -p "$run"
+	cat >"$run/console.log" <<'EOF'
+[    0.000000] Linux version 6.8.0-firecracker
+[    3.456789] Run /sbin/init as init process
+[+3.59s] [firecode-initrd] assembling the root
+[+41.70s] [firecode] kernel modules available
+[+52.10s] [firecode] drives mounted
+EOF
+	printf 'x\n' >"$run/vsock"
+	# The run started at 10:10:10 and the VMM existed at 10:11:46: prep.
+	touch -d '2026-11-12 10:11:46' "$run/vsock"
+	touch -d '2026-11-12 10:13:44' "$run/console.log"
+
+	out=$("$ROOT/scripts/boot-timings.sh" "$dir" 2>&1)
+	contains "the run is named by its id" "firecode-20261112-101010-1234" "$out"
+	contains "prep is the wall clock before the VMM existed" "96s" "$out"
+	contains "the kernel's hand-over is read from its own stamps" "3.456789" "$out"
+	contains "the biggest gap is found, with the line that ended it" \
+		"38.1s in  [+41.70s] [firecode] kernel modules available" "$out"
+
+	# A run from before the stamps existed still says what it can, and says
+	# what it cannot - a breakdown invented from nothing would be worse than
+	# none.
+	mkdir -p "$dir/firecode-20261112-101011-12"
+	printf '[    0.000000] Linux\n[    2.000000] Run /sbin/init\n' \
+		>"$dir/firecode-20261112-101011-12/console.log"
+	out=$("$ROOT/scripts/boot-timings.sh" "$dir" 2>&1)
+	contains "a console with no stamps says so" "no stamps in this run's console" "$out"
+}
+
 # The guest image is a cache shared by every checkout, and most of the harness
 # rides along at run time - but what is BAKED IN does not. A checkout that has
 # changed guest/ boots the image as it was built and passes while testing none
@@ -2474,6 +2515,7 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 
 run_test shellcheck
 run_test cached_image_matches_guest
+run_test boot_timings_read_a_boot
 run_test guest_memory_is_declared
 run_test ps_orphans_are_named
 run_test down_ends_a_stuck_vm

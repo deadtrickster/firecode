@@ -23,7 +23,13 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 
-say() { echo "[bootstrap] $*"; }
+# Stamped with the kernel's uptime, so a bootstrap build can be timed from its
+# console afterwards. Busybox sh, so no `local`.
+uptime_s() {
+	read -r u _ 2>/dev/null </proc/uptime
+	printf '%s' "${u:-?}"
+}
+say() { printf '[+%ss] [bootstrap] %s\n' "$(uptime_s)" "$*"; }
 
 # No RTC here: the clock is whatever the host said it was at boot.
 # shellcheck disable=SC2013  # /proc/cmdline is one line of words

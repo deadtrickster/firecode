@@ -19,7 +19,17 @@ STATE=/var/lib/firecode
 export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-log() { echo "[firecode] $*"; }
+# STAMPED WITH THE KERNEL'S UPTIME. A boot that takes minutes at load 380
+# cannot be explained afterwards from a log with no timestamps in it - the gap
+# between two of these lines is what a phase cost (scripts/boot-timings.sh).
+# One read of /proc/uptime per line, and `[firecode]` stays in the line for
+# everything that greps it.
+uptime_s() {
+	local up=""
+	read -r up _ 2>/dev/null </proc/uptime
+	printf '%s' "${up:-?}"
+}
+log() { printf '[+%ss] [firecode] %s\n' "$(uptime_s)" "$*"; }
 
 wait_for_label() {
 	local label=$1 i
