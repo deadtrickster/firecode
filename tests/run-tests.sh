@@ -976,7 +976,7 @@ test_copy_out_is_published_whole() {
 		staging=$(mktemp -d "$WORK/.firecode-copyout.XXXXXX")
 		extract_image "$img" "$staging"
 		printf 'second:%s\n' "$(publish_result "$staging" "$WORK/occupied")"
-		printf 'occupied:%s\n' "$(ls "$WORK/occupied" | tr '\n' ' ')"
+		printf 'occupied:%s\n' "$(find "$WORK/occupied" -mindepth 1 -maxdepth 1 -printf '%f ' | sort)"
 		rm -rf "$WORK/occupied"
 	)
 	check "the result name is absent while the copy is being made" "before:absent" \
@@ -2238,6 +2238,7 @@ test_guest_memory_is_declared() {
 	# The same numbers reach the agent's own briefing, which is the whole point:
 	# an agent that knows what it has can say "this does not fit" instead of
 	# failing at something unrelated.
+	# shellcheck disable=SC2030,SC2031,SC2034  # own subshell per run; VERIFY is read by the eval'd run_context
 	ctx=$(
 		export GUEST="$ROOT/guest" MEM=2048 VCPU=2
 		VERIFY=""
@@ -2248,6 +2249,7 @@ test_guest_memory_is_declared() {
 	contains "and the cpu count" "2 vCPU" "$ctx"
 	contains "and says a suite can be too big for it" "will not fit here" "$ctx"
 	# And it is sized per run, not once: a 4G VM says 4G.
+	# shellcheck disable=SC2030,SC2031,SC2034  # own subshell per run; VERIFY is read by the eval'd run_context
 	ctx=$(
 		export GUEST="$ROOT/guest" MEM=4096 VCPU=4
 		VERIFY=""
