@@ -1438,44 +1438,94 @@ same_path() {
 	[[ $(realpath -m -- "$1" 2>/dev/null) == "$(realpath -m -- "$2" 2>/dev/null)" ]]
 }
 
+# IS THAT RUN'S VM ALIVE? Cheap answers first, because the expensive one is a
+# python process per run directory and a host accumulates them.
+#
+#   cgroup    one file read. A run's cgroup holds processes exactly while its
+#             VMM lives, and cg_kill has removed it once the run is over.
+#   launcher  the process that owns the run. Dead, with no cgroup written (a run
+#             from before they existed), means nothing is listening - its own
+#             socket file outlives it and answers nothing.
+#   dial      only for a run that survived both: a launcher that is still alive
+#             says the run is in progress, not that its VM is up.
+#
+# A libvirt domain is not in our cgroup, so it is asked of libvirt - the same
+# answer live_runs uses, and only ever for a run the caller's identity matched.
+run_alive() {
+	local d=${1%/} cg="" pid=""
+	if [[ -f $d/domain ]]; then
+		libvirt_alive "$(<"$d/domain")" "$(cat "$d/libvirt-uri" 2>/dev/null)"
+		return
+	fi
+	# `read` AND NOT `cat`, HERE AND BELOW: a fork per file per run directory is
+	# the cost this function exists to remove - three of them, times however many
+	# runs the host has kept.
+	read -r cg 2>/dev/null <"$d/cgroup" || :
+	if [[ -n $cg ]]; then
+		cg_alive "$cg/vm"
+		return
+	fi
+	read -r pid 2>/dev/null <"$d/launcher" || :
+	if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+		return 1
+	fi
+	return 0
+}
+
 live_vm_socket() {
 	local want=${1:-}
 	local -a socks=() names=() rids=()
-	local r sock proj
+	local r sock proj name want_real="" by_name rname
+	[[ -n $want ]] && want_real=$(realpath -m -- "$want" 2>/dev/null || printf '%s' "$want")
 	for r in "$RUNS"/*/; do
 		[[ -f $r/jail ]] || continue
-		# Where this VM's channels are. A unix socket under firecracker, a
-		# vsock cid under libvirt - the guest listens on the same ports either
-		# way, so everything downstream of this line is identical.
-		if [[ -f $r/vsock ]]; then
-			sock=$(cat "$r/vsock")
-		else
-			sock="$(cat "$r/jail")/firecracker-vsock.sock"
+		# THE CHEAP QUESTION FIRST: IS THIS THE RUN THE CALLER NAMED?
+		#
+		# It used to be asked last, after a vsock handshake, so a host holding
+		# hundreds of finished runs paid a python process for each one on every
+		# lookup - `firecode in` against a project with no VM at all took ten
+		# seconds, and letibot calls it once per directory listing. Three file
+		# reads and three string comparisons cost nothing, and then almost
+		# every run on the host can be skipped without a dial.
+		rname=${r%/}
+		rname=${rname##*/}
+		name="" proj=""
+		read -r name 2>/dev/null <"$r/name" || :
+		read -r proj 2>/dev/null <"$r/project" || :
+		by_name=0
+		if [[ -n $want ]]; then
+			if [[ $name == "$want" || $rname == "$want" || ${rname##*-} == "$want" ]]; then
+				by_name=1
+			elif [[ $proj == "$want" || $proj == "$want_real" ]]; then
+				:
+			elif [[ -n $proj && ${proj##*/} == "${want_real##*/}" ]]; then
+				# Same leaf, different spelling of the parent: worth the fork that
+				# resolving costs, but only once the run has proved it is alive.
+				:
+			else
+				continue
+			fi
 		fi
-		# Ask whoever owns the VM, not the address: a finished run's recorded
-		# cid answers as soon as a later VM is given the same one.
-		if [[ -f $r/domain ]]; then
-			libvirt_alive "$(cat "$r/domain")" "$(cat "$r/libvirt-uri" 2>/dev/null)" || continue
-		else
-			vm_reachable "$sock" || continue
-		fi
-		proj=$(cat "$r/project" 2>/dev/null || echo "")
-		# `want` is whatever the caller had in front of them: a project path,
-		# a VM name, the run id, or the short form ps prints for a VM started
-		# before names existed. Anything displayed has to be usable, or the
-		# listing is telling you a name you cannot type.
-		if [[ -n $want ]] && ! same_path "$proj" "$want"; then
-			local rid
-			rid=$(basename "${r%/}")
-			[[ $(cat "$r/name" 2>/dev/null) == "$want" || $rid == "$want" ||
-			${rid##*-} == "$want" ]] || continue
+		# AND IS IT ALIVE, WITHOUT DIALING. This is where the ten seconds went:
+		# a dead run's answer is in its cgroup or its launcher, not in its
+		# socket, which outlives the process that made it.
+		run_alive "$r" || continue
+
+		sock=$(run_sock "${r%/}")
+		# libvirt was already asked inside run_alive; the handshake is what
+		# answers for firecracker, and is the only thing that answers certainly.
+		[[ -f $r/domain ]] || vm_reachable "$sock" || continue
+		# A run admitted by its leaf name still has to be the same place,
+		# resolved. Only candidates reach this, so the fork is affordable.
+		if [[ -n $want ]] && ((! by_name)) && [[ $proj != "$want" && $proj != "$want_real" ]]; then
+			same_path "$proj" "$want" || continue
 		fi
 		# Appended together, always: the two are read by index below, and a
 		# filtered-out run that lands in one but not the other silently
 		# shifts every name onto the wrong socket.
 		socks+=("$sock")
 		names+=("$proj")
-		rids+=("$(basename "${r%/}")")
+		rids+=("$rname")
 	done
 
 	# Returns non-zero rather than dying: callers ask "is one up?" as a
@@ -1517,12 +1567,15 @@ require_vm_socket() {
 		echo "$sock"
 		return 0
 	}
+	# WHICH VMs ARE RUNNING, for the message - asked the same cheap way. This is
+	# the path taken whenever the answer is "none", which is every `firecode in`
+	# in a directory that has no VM, so it must not dial a dead run either.
 	local running=""
 	local r
 	for r in "$RUNS"/*/; do
 		[[ -f $r/jail ]] || continue
-		[[ -S $(cat "$r/jail")/firecracker-vsock.sock ]] || continue
-		vm_reachable "$(cat "$r/jail")/firecracker-vsock.sock" || continue
+		run_alive "$r" || continue
+		[[ -f $r/domain ]] || vm_reachable "$(run_sock "${r%/}")" || continue
 		running="$running $(cat "$r/project" 2>/dev/null)"
 	done
 	if [[ -z $running ]]; then
@@ -7760,13 +7813,53 @@ socat_orphans() {
 }
 
 cmd_gc() {
-	local keep=${1:-5} n=0 d
+	local keep=5 older="" sweep=0 n=0 d
 	local -a stuck=()
+	while [[ ${1:-} == -* ]]; do
+		case "$1" in
+		--older-than)
+			older=${2:?--older-than needs an age: 90m, 12h or 2d}
+			shift 2
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode gc [KEEP] [--older-than AGE]
+
+  KEEP              finished runs to keep (default 5). Older ones are removed
+                    outright; the newest KEEP lose only their drives.
+  --older-than AGE  remove only runs that finished more than AGE ago (90m, 12h,
+                    2d), and no run newer than that. A run still holding a VM
+                    is never removed either way, and state/ is not touched -
+                    what this sweeps is runs/, whose directories accumulate a
+                    few thousand over a month and are what every lookup walks.
+                    A run directory is also what `firecode land <run-id>` reads,
+                    so do not sweep work you have not landed yet.
+USAGE
+			return 0
+			;;
+		*) break ;;
+		esac
+	done
+	if [[ -n ${1:-} ]]; then keep=$1; fi
+	# The age, in find's own vocabulary: -mtime for days, -mmin for the rest.
+	# It decides which runs are candidates at all, so a run younger than the age
+	# is not even considered - and with --older-than nothing goes by count.
+	local -a age_test=()
+	if [[ -n $older ]]; then
+		case "$older" in
+		*d) age_test=(-mtime +"${older%d}") ;;
+		*h) age_test=(-mmin +$((${older%h} * 60))) ;;
+		*m) age_test=(-mmin +"${older%m}") ;;
+		*) die "--older-than takes an age like 90m, 12h or 2d, not: $older" ;;
+		esac
+		sweep=1
+	fi
 	[[ -d $RUNS ]] || return 0
 	# Each `up` keeps its own log beside the runs. One a day untouched belongs
 	# to a VM long gone - a running one is still writing to its own.
 	find "$RUNS" -maxdepth 1 -name 'up.*.log' -mtime +1 -delete 2>/dev/null || true
-	# Newest first; anything past the keep count goes entirely.
+	# Newest first. By count, anything past the keep count goes entirely; with
+	# --older-than, the list has already been cut to the runs old enough to go.
 	while IFS= read -r d; do
 		# A RUN, AND NOT EVERY DIRECTORY THAT HAPPENS TO SIT HERE. runs/spawn
 		# holds the spawn server's per-run logs and is not a run: it has no
@@ -7822,13 +7915,14 @@ cmd_gc() {
 			continue
 		fi
 		n=$((n + 1))
-		if ((n > keep)); then
+		if ((sweep)) || ((n > keep)); then
 			log "removing $(basename "$d")"
 			rm -rf "$d"
-		else
+		elif ((! sweep)); then
 			rm -f "$d"/*.ext4
 		fi
-	done < <(find "$RUNS" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
+	done < <(find "$RUNS" -mindepth 1 -maxdepth 1 -type d ${age_test+"${age_test[@]}"} \
+		-printf '%T@ %p\n' |
 		sort -rn | cut -d' ' -f2-)
 	# Jail directories outlive a VM that was killed rather than stopped.
 	local j

@@ -494,6 +494,122 @@ test_commit_reachability() {
 # sweep_results runs for real here, taken out of the script, against roots that
 # exist only inside $WORK. FIRECODE_RESULT_ROOTS is what keeps it away from
 # /tmp and ~/Projects.
+# A DEAD RUN MUST NOT COST A DIAL, WHICH IS THE WHOLE COST OF `firecode in`.
+#
+# Every finished run leaves a directory whose socket file outlives the process
+# that made it, and the lookup dialed each one BEFORE asking whether it was even
+# the run the caller named. A vsock handshake is a python process, so on a host
+# with 3.8k of them `firecode in --project P true` measured 10.5 seconds -
+# letibot calls it once per directory listing and per page of file reads, which
+# is how a tree-wide grep became an hour.
+#
+# The sockets here are REAL sockets, bound and closed. A plain file would let the
+# old code skip one with `-S` before dialing, and the test would pass on the code
+# it is meant to fail.
+test_dead_runs_are_cheap() {
+	local root proj out secs ms
+	root=$(make_empty_root)
+	proj="$root/proj"
+	mkdir -p "$proj" "$root/runs"
+	python3 - "$root/runs" 300 <<'PY'
+import os, socket, sys
+
+runs, n = sys.argv[1], int(sys.argv[2])
+for i in range(n):
+    d = os.path.join(runs, "d%04d" % i)
+    os.makedirs(d)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(os.path.join(d, "s"))
+    s.close()
+    # What a finished run leaves: a socket nothing answers on, and a launcher
+    # whose pid is long gone. The project is somebody else's, which is the
+    # case that must cost nothing.
+    for name, value in (("jail", d), ("vsock", os.path.join(d, "s")),
+                        ("project", "/nonexistent/p%d" % i),
+                        ("name", "dead%d" % i), ("launcher", "999999")):
+        with open(os.path.join(d, name), "w") as fh:
+            fh.write(value + "\n")
+PY
+	TIMEFORMAT=%R
+	secs=$({ time FIRECODE_ROOT="$root" "$FIRECODE" in --project "$proj" true >/dev/null 2>&1; } 2>&1)
+	ms=$(awk -v s="$secs" 'BEGIN { printf "%d", s * 1000 }')
+	if [[ $ms =~ ^[0-9]+$ ]] && ((ms < 2000)); then
+		ok "300 dead runs cost no dials (${ms}ms for firecode in)"
+	else
+		no "300 dead runs cost no dials" "took ${ms:-?}ms - the sweep is dialing dead runs"
+	fi
+
+	# And it must still be right: a run for this project that is dead is not a
+	# VM, and naming it has to say so rather than hand back its stale socket.
+	mkdir -p "$root/runs/mine"
+	printf '%s\n' "$root/runs/mine" >"$root/runs/mine/jail"
+	printf '%s\n' "$proj" >"$root/runs/mine/project"
+	printf 'mine\n' >"$root/runs/mine/name"
+	printf '999999\n' >"$root/runs/mine/launcher"
+	out=$(FIRECODE_ROOT="$root" "$FIRECODE" in --project "$proj" true 2>&1)
+	contains "a dead run for this project is not a VM" "no VM is running" "$out"
+}
+
+# PRUNE BY AGE, AND ONLY WHAT IS DEAD.
+#
+# The sweep is what keeps runs/ from growing into the thing that makes every
+# lookup slow, so it has to be runnable on a real host without reasoning about
+# which of a few thousand directories are still wanted.
+test_gc_older_than() {
+	local root runs out d
+	root=$(make_empty_root)
+	runs="$root/runs"
+	mkdir -p "$runs/old-dead" "$runs/new-dead" "$runs/old-live"
+	for d in old-dead new-dead old-live; do
+		printf '%s\n' "$root/$d" >"$runs/$d/project"
+		printf '%s\n' "$d" >"$runs/$d/name"
+	done
+	# Two finished runs, and one that still holds a VM: a cgroup that lists
+	# processes is what gc's own guard reads, and /sys/fs/cgroup is one.
+	printf '999999\n' >"$runs/old-dead/launcher"
+	printf '999999\n' >"$runs/new-dead/launcher"
+	[[ -d /sys/fs/cgroup ]] && printf '/sys/fs/cgroup\n' >"$runs/old-live/cgroup"
+	touch -d '3 days ago' "$runs/old-dead" "$runs/old-live"
+
+	# The function alone, with its helpers stubbed: the real command goes on to
+	# sweep jails and relays, and a test must not point that at a host.
+	out=$(
+		die() {
+			printf 'gc: error: %s\n' "$*" >&2
+			exit 1
+		}
+		log() { printf 'gc: %s\n' "$*" >&2; }
+		cg_procs() { cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null || true; }
+		jail_bases() { :; }
+		jail_remove() { :; }
+		eval "$(sed -n '/^cmd_gc() {$/,/^}$/p' "$FIRECODE")"
+		RUNS="$runs" cmd_gc --older-than 2d 2>&1
+	)
+	check "a finished run older than the age is removed" gone \
+		"$([[ -d $runs/old-dead ]] && echo "still there: $out" || echo gone)"
+	check "a run younger than the age is kept" there \
+		"$([[ -d $runs/new-dead ]] && echo there || echo "removed: $out")"
+	if [[ -f $runs/old-live/cgroup ]]; then
+		check "a run that still holds a VM is kept" there \
+			"$([[ -d $runs/old-live ]] && echo there || echo "removed: $out")"
+	else
+		ok "a run that still holds a VM is kept (skipped: no cgroups here)"
+	fi
+	if out=$(
+		die() { exit 1; }
+		log() { :; }
+		cg_procs() { :; }
+		jail_bases() { :; }
+		jail_remove() { :; }
+		eval "$(sed -n '/^cmd_gc() {$/,/^}$/p' "$FIRECODE")"
+		RUNS="$runs" cmd_gc --older-than yesterday 2>&1
+	); then
+		no "--older-than refuses an age it cannot read" "exited 0"
+	else
+		ok "--older-than refuses an age it cannot read"
+	fi
+}
+
 # A scratch project's age was its top-level directory's mtime, which a commit
 # or an edit in a subdirectory never changes - so one worked on every day was
 # "days old" and gc removed it. Age is now the newest thing in the tree.
@@ -2135,6 +2251,8 @@ run_test session_import_resumable
 run_test results_come_back
 run_test commits_are_reported_unlanded
 run_test commit_reachability
+run_test dead_runs_are_cheap
+run_test gc_older_than
 run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
 run_test no_relays
