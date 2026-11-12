@@ -191,6 +191,11 @@ SYNC_BACK=1
 FAST=0
 REFRESH=0
 PARENT_RUN=""
+# Who asked for this VM, recorded beside the run. `letibot:<session>:<pid>` by
+# convention; `ps --orphans` reads the pid to tell a VM somebody still wants
+# from one whose caller is gone. --owner, or FIRECODE_OWNER for a caller that
+# cannot add flags.
+OWNER="${FIRECODE_OWNER:-}"
 # Which hypervisor. firecracker for everything it can do - it starts in
 # milliseconds and restores a snapshot in sixty - and libvirt/qemu for the one
 # thing it cannot: there is no PCI bus in a firecracker VM, so no GPU either.
@@ -1439,6 +1444,36 @@ same_path() {
 	[[ $1 == "$2" ]] && return 0
 	[[ -n $1 && -n $2 ]] || return 1
 	[[ $(realpath -m -- "$1" 2>/dev/null) == "$(realpath -m -- "$2" 2>/dev/null)" ]]
+}
+
+# WHO ASKED FOR THIS VM, as the caller wrote it: `letibot:<session>:<pid>`.
+#
+# A run outlives the process that placed it, deliberately - that is what `up`
+# is for. The cost is a VM nobody is waiting for any more: the caller died and
+# the VM sits there until a person notices it. The pid is the last
+# colon-separated field, which is the one any caller can supply.
+run_owner() {
+	local d=${1%/} o=""
+	read -r o 2>/dev/null <"$d/owner" || :
+	printf '%s' "$o"
+}
+
+owner_pid() {
+	local spec=${1:-} pid
+	[[ -n $spec ]] || return 0
+	pid=${spec##*:}
+	[[ $pid =~ ^[0-9]+$ ]] || return 0
+	printf '%s' "$pid"
+}
+
+# 0 when this run HAS an owner and that owner is gone. No owner file is not
+# evidence of anything, so a run nobody declared an owner for is never called
+# an orphan.
+owner_gone() {
+	local pid
+	pid=$(owner_pid "$(run_owner "$1")")
+	[[ -n $pid ]] || return 1
+	! kill -0 "$pid" 2>/dev/null
 }
 
 # IS THAT RUN'S VM ALIVE? Cheap answers first, because the expensive one is a
@@ -4178,7 +4213,7 @@ USAGE
 			. "$rd/ctl/env" 2>/dev/null
 			printf '%s' "${FIRECODE_VERIFY:-}"
 		)
-	if python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+	if timeout "${FIRECODE_DOWN_ASK:-15}" python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
 		"sudo pkill -TERM -f '^sh -c trap .exit 0. TERM; while .*firecode-idle'" >/dev/null 2>&1; then
 		if [[ -n $verify ]]; then
 			log "running its gate before it stops: $verify"
@@ -4191,20 +4226,43 @@ USAGE
 	else
 		# Not an idle `up` VM, or started by an older firecode: the guest is
 		# asked to shut down, which is what unmounts the project drive and
-		# lets the work be copied back.
-		python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+		# lets the work be copied back. Also time-boxed: a guest whose agent
+		# is stuck in a call answers the handshake and never runs this.
+		timeout "${FIRECODE_DOWN_ASK:-15}" python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
 			"sudo systemctl --no-block reboot" >/dev/null 2>&1 || true
 	fi
-	local waited=0
+
+	# ASK, THEN STOP ASKING. A request the guest never answers used to be
+	# waited on for sixty polls and then reported as "taking its time" with
+	# exit 0 - so the VM stayed up and a caller that trusted the status believed
+	# it had gone. The escalation is the run's own cgroup: one write takes the
+	# VMM, its relays and any child VMs, and the LAUNCHER survives to copy the
+	# work out, which is the same path a hard-killed VM takes.
+	local grace=${FIRECODE_DOWN_GRACE:-20} waited=0
 	while vm_reachable "$sock"; do
-		if ((waited >= 60)); then
-			log "it is taking its time; still shutting down"
-			[[ -n $rd ]] && log "  the copy-out will be recorded in $rd/copy_out"
-			return 0
-		fi
+		((waited >= grace)) && break
 		sleep 1
 		waited=$((waited + 1))
 	done
+	if vm_reachable "$sock"; then
+		local run_cg=""
+		if [[ -n $rd ]]; then read -r run_cg 2>/dev/null <"$rd/cgroup" || :; fi
+		if [[ -n $run_cg ]]; then
+			log "the guest did not stop after ${grace}s - ending its VM through the run's cgroup"
+			cg_kill "$run_cg"
+			waited=0
+			while vm_reachable "$sock" && ((waited < 10)); do
+				sleep 0.5
+				waited=$((waited + 1))
+			done
+		fi
+	fi
+	if vm_reachable "$sock"; then
+		[[ -n $rd ]] && log "  the copy-out will be recorded in $rd/copy_out"
+		die "could not stop that VM: the guest does not answer and this run has
+       no cgroup to end it through. Nothing was forced - look at $sock,
+       or stop the VMM by hand."
+	fi
 	log "stopped"
 	[[ -n $rd ]] || return 0
 	if ((nowait)); then
@@ -5217,6 +5275,13 @@ launch() {
 			PARENT_RUN="$2"
 			shift 2
 			;;
+		--owner)
+			# `letibot:<session>:<daemon pid>` - who is waiting for this VM.
+			# Recorded on the run so `ps --orphans` can name the ones nobody
+			# is waiting for any more.
+			OWNER="$2"
+			shift 2
+			;;
 		--vcpu | --cpus)
 			VCPU="$2"
 			shift 2
@@ -5569,6 +5634,7 @@ launch() {
 	# The process that will do the copy-out once the VM stops. `down` waits on
 	# copy_out while this is alive, and knows not to once it is not.
 	printf '%s\n' "$BASHPID" >"$RUN_DIR/launcher"
+	if [[ -n $OWNER ]]; then printf '%s\n' "$OWNER" >"$RUN_DIR/owner"; fi
 	# How to reach this VM's channels, whichever backend started it.
 	if [[ $VMM == libvirt ]]; then
 		alloc_libvirt_cid
@@ -7270,16 +7336,18 @@ PY
 # `last_output_s` is null when the VM has printed nothing yet, which is a
 # different fact from 0 seconds ago, and the JSON keeps them different.
 cmd_ps_json() {
-	local want=$1 id proj parent vmname backend quiet rows=()
+	local want=$1 orphans=$2 id proj parent vmname backend quiet owner rows=()
 	while IFS=$'\t' read -r id proj parent vmname; do
 		[[ -n $want && $vmname != "$wantname" ]] && ! same_path "$proj" "$want" && continue
+		((orphans)) && ! owner_gone "$RUNS/$id" && continue
 		backend="firecracker"
 		((MACOS)) && backend="vz"
 		[[ -f $RUNS/$id/domain ]] && backend="libvirt"
 		quiet=""
 		[[ -f $RUNS/$id/console.log ]] &&
 			quiet=$(($(date +%s) - $(stat -c %Y "$RUNS/$id/console.log")))
-		rows+=("$id"$'\t'"$proj"$'\t'"$parent"$'\t'"$vmname"$'\t'"$backend"$'\t'"$quiet")
+		owner=$(run_owner "$RUNS/$id")
+		rows+=("$id"$'\t'"$proj"$'\t'"$parent"$'\t'"$vmname"$'\t'"$backend"$'\t'"$quiet"$'\t'"$owner")
 	done < <(live_runs)
 
 	# Emitted by python rather than printf because a project path may contain a
@@ -7292,7 +7360,7 @@ for line in sys.stdin:
     line = line.rstrip("\n")
     if not line:
         continue
-    vid, proj, parent, name, backend, quiet = line.split("\t")
+    vid, proj, parent, name, backend, quiet, owner = line.split("\t")
     vms.append({
         "id": vid,
         "name": name or vid,
@@ -7300,6 +7368,7 @@ for line in sys.stdin:
         "parent": None if parent in ("-", "") else parent,
         "backend": backend,
         "last_output_s": int(quiet) if quiet else None,
+        "owner": owner or None,
         "probed": False,
     })
 json.dump({"vms": vms}, sys.stdout)
@@ -7314,7 +7383,7 @@ sys.stdout.write("\n")
 # running, what is it listening on, and is it busy or wedged - the things you
 # would otherwise get by opening a shell in each one in turn.
 cmd_ps() {
-	local want="" wantname="" id proj parent addr any=0 json=0
+	local want="" wantname="" id proj parent addr any=0 json=0 orphans=0
 	while (($#)); do
 		case $1 in
 		--project)
@@ -7328,18 +7397,25 @@ cmd_ps() {
 			json=1
 			shift
 			;;
-		*) die "usage: firecode ps [--project DIR] [--json]" ;;
+		--orphans)
+			# Only the VMs nobody is waiting for any more: the caller that
+			# placed them recorded `--owner ...:<pid>` and that pid is gone.
+			orphans=1
+			shift
+			;;
+		*) die "usage: firecode ps [--project DIR] [--json] [--orphans]" ;;
 		esac
 	done
 
 	((json)) && {
-		cmd_ps_json "$want"
+		cmd_ps_json "$want" "$orphans"
 		return
 	}
 
 	local vmname probe_s=${FIRECODE_PS_TIMEOUT:-25}
 	while IFS=$'\t' read -r id proj parent vmname; do
 		[[ -n $want && $vmname != "$want" ]] && ! same_path "$proj" "$want" && continue
+		((orphans)) && ! owner_gone "$RUNS/$id" && continue
 		any=1
 		addr=$(run_sock "$RUNS/$id")
 		local backend="firecracker"
@@ -7374,6 +7450,15 @@ cmd_ps() {
 		fi
 		printf '  %s' "$backend"
 		[[ $parent != "-" && -n $parent ]] && printf ', stops with %s' "$parent"
+		# Who placed it, when the caller said. The whole point of --orphans is
+		# this line: an owner with a dead pid is why a VM is still running with
+		# nobody watching it.
+		local own
+		own=$(run_owner "$RUNS/$id")
+		if [[ -n $own ]]; then
+			printf ', owner %s' "$own"
+			owner_gone "$RUNS/$id" && printf ' (GONE)' || true
+		fi
 		echo
 
 		# One round trip for everything worth knowing. A VM whose exec channel
@@ -7416,7 +7501,13 @@ true' 2>/dev/null) || snap=""
 		fi
 	done < <(live_runs)
 
-	((any)) || echo "no VMs running"
+	((any)) || {
+		if ((orphans)); then
+			echo "no orphaned VMs"
+		else
+			echo "no VMs running"
+		fi
+	}
 }
 
 # What a VM has printed - the console, which is where the agent's own output

@@ -2216,6 +2216,122 @@ test_guest_memory_is_declared() {
 	contains "a bigger VM says so" "4096 MB of RAM and 4 vCPU" "$ctx"
 }
 
+# WHO PLACED THE VM, AND WHETHER THEY ARE STILL THERE.
+#
+# A run outlives its caller by design - that is what `up` is for - so a caller
+# that dies leaves a VM nobody is waiting for, still holding a tap and its
+# memory. `--owner letibot:<session>:<pid>` records who asked, and --orphans
+# is the list of the ones whose owner has gone.
+test_ps_orphans_are_named() {
+	local root cg out json i d
+	root=$(make_empty_root)
+	# The real scripts and guest files, so the fake root behaves like a checkout.
+	for d in bin scripts guest macos; do ln -sfn "$ROOT/$d" "$root/$d"; done
+	# Three live runs. Liveness here is the cgroup file firecode's own guard
+	# reads, so a plain directory with `populated 1` in it is a live run -
+	# no VM is needed to ask this question, and none is started.
+	cg="$root/cg"
+	mkdir -p "$cg/vm" "$root/runs"
+	printf 'populated 1\n' >"$cg/vm/cgroup.events"
+	for i in orphan owned nobody; do
+		mkdir -p "$root/runs/$i" "$root/jails/$i"
+		printf '%s\n' "$root/jails/$i" >"$root/runs/$i/jail"
+		printf '%s\n' "$root/proj-$i" >"$root/runs/$i/project"
+		printf '%s\n' "vm-$i" >"$root/runs/$i/name"
+		printf '%s\n' "$root/nothing-$i.sock" >"$root/runs/$i/vsock"
+		printf '%s\n' "$cg" >"$root/runs/$i/cgroup"
+	done
+	printf 'letibot:s1:999999\n' >"$root/runs/orphan/owner"
+	printf 'letibot:s2:%s\n' "$$" >"$root/runs/owned/owner"
+
+	out=$(FIRECODE_ROOT="$root" FIRECODE_PS_TIMEOUT=1 "$FIRECODE" ps --orphans 2>&1)
+	contains "a run whose owner pid is gone is listed" "vm-orphan" "$out"
+	if grep -q 'vm-owned\|vm-nobody' <<<"$out"; then
+		no "and nothing else is" "$out"
+	else
+		ok "and nothing else is"
+	fi
+	contains "the owner that is gone is said to be gone" "letibot:s1:999999 (GONE)" "$out"
+
+	out=$(FIRECODE_ROOT="$root" FIRECODE_PS_TIMEOUT=1 "$FIRECODE" ps 2>&1)
+	contains "ps still lists the owned one" "vm-owned" "$out"
+	contains "and the one nobody claimed" "vm-nobody" "$out"
+	if grep -q 'vm-owned.*GONE\|vm-nobody.*GONE' <<<"$out"; then
+		no "a live owner is not called gone" "$out"
+	else
+		ok "a live owner is not called gone"
+	fi
+
+	json=$(FIRECODE_ROOT="$root" "$FIRECODE" ps --json --orphans 2>&1)
+	check "--json --orphans carries just the orphan" "1 vm-orphan letibot:s1:999999" \
+		"$(printf '%s' "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["vms"]
+print(len(d), d[0]["name"] if d else "-", (d[0]["owner"] if d else "-"))
+' 2>&1)"
+}
+
+# DOWN MUST END A VM THAT WILL NOT ANSWER, not wait politely and report success.
+#
+# A guest whose agent is stuck in a call completes the vsock handshake and never
+# runs the command, so the polite request cannot land - and `down` used to poll
+# for a minute and then print "it is taking its time" with exit 0, leaving the
+# VM up and the caller believing otherwise. The escalation is the run's cgroup,
+# and this stands one up: a socket that handshakes and then goes silent, and a
+# cgroup directory whose removal is what the "VM" notices.
+test_down_ends_a_stuck_vm() {
+	local root proj cg sock out rc srv d
+	root=$(make_empty_root)
+	# The real scripts, so the vsock client it drives is the real one.
+	for d in bin scripts guest macos; do ln -sfn "$ROOT/$d" "$root/$d"; done
+	proj="$root/proj"
+	cg="$root/cg/run-stuck"
+	sock="$root/live.sock"
+	mkdir -p "$proj" "$cg/vm" "$root/runs/stuck"
+	printf 'populated 1\n' >"$cg/vm/cgroup.events"
+	# The guest, from the host's side: the handshake, then nothing. It notices
+	# the escalation the way a real VM does - `cgroup.kill` is the write that
+	# ends it (and on a Mac, the cgroup being taken away).
+	python3 - "$sock" "$cg" <<'PY' &
+import os, socket, sys
+
+path, cg = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(8)
+s.settimeout(0.2)
+while os.path.isdir(cg) and not os.path.exists(os.path.join(cg, "cgroup.kill")):
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    c.recv(64)
+    c.sendall(b"OK 1\n")
+s.close()
+PY
+	srv=$!
+	printf '%s\n' "$root/runs/stuck" >"$root/runs/stuck/jail"
+	printf '%s\n' "$proj" >"$root/runs/stuck/project"
+	printf 'stuck\n' >"$root/runs/stuck/name"
+	printf '%s\n' "$sock" >"$root/runs/stuck/vsock"
+	printf '%s\n' "$cg" >"$root/runs/stuck/cgroup"
+	printf '%s\n' "$$" >"$root/runs/stuck/launcher"
+	sleep 0.5
+
+	out=$(FIRECODE_ROOT="$root" FIRECODE_DOWN_ASK=1 FIRECODE_DOWN_GRACE=1 timeout 90 \
+		"$FIRECODE" down --project "$proj" --no-wait 2>&1)
+	rc=$?
+	kill "$srv" 2>/dev/null
+	wait "$srv" 2>/dev/null
+	check "a guest that will not answer is still stopped" "0" "$rc"
+	contains "and down says it escalated" "ending its VM through the run's cgroup" "$out"
+	if [[ -e $cg/cgroup.kill || ! -d $cg ]]; then
+		ok "the run's cgroup was the thing that ended it"
+	else
+		no "the run's cgroup was the thing that ended it" "still there: $(ls "$cg" 2>&1)"
+	fi
+}
+
 # A DROPPED FLAG IS WHAT THIS ASSERTS AGAINST, not JSON syntax.
 #
 # On a host with no VMs, `firecode ps` and `firecode ps --json` both exit 0 and
@@ -2359,6 +2475,8 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 run_test shellcheck
 run_test cached_image_matches_guest
 run_test guest_memory_is_declared
+run_test ps_orphans_are_named
+run_test down_ends_a_stuck_vm
 run_test ps_json_is_not_the_prose
 run_test projects_is_a_registry_not_a_config_file
 run_test layer_inherit
