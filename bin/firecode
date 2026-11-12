@@ -3165,7 +3165,10 @@ cmd_prepare_in_vm() {
 			keep=1
 			shift
 			;;
-		*) die "usage: firecode prepare --in-vm [--with 'dotnet@10 uv'] [--size 6G] [--keep]" ;;
+		# An in-VM build always rebuilds, so --force asks for nothing more.
+		--force) shift ;;
+		--full) die "firecode prepare --in-vm has no --full: name the tools instead, e.g. --with 'rust@stable go'" ;;
+		*) die "usage: firecode prepare --in-vm [--with 'dotnet@10 uv'] [--size 6G] [--keep] [--force]" ;;
 		esac
 	done
 
@@ -8655,9 +8658,12 @@ prepare)
 	shift
 	if ((MACOS)); then
 		cmd_prepare_macos "$@"
-	elif [[ ${1:-} == --in-vm ]]; then
-		shift
-		cmd_prepare_in_vm "$@"
+	elif printf '%s\n' "$@" | grep -qx -- --in-vm; then
+		# The help lists --in-vm among the other flags, so it is taken in any position.
+		rest=()
+		a=""
+		for a in "$@"; do [[ $a == --in-vm ]] || rest+=("$a"); done
+		cmd_prepare_in_vm "${rest[@]}"
 	else
 		"$SCRIPTS/prepare-rootfs.sh" "$@"
 	fi
