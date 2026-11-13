@@ -1265,6 +1265,7 @@ ensure_state_drive() {
 	fi
 
 	if [[ ! -f $img ]]; then
+		disk_guard_for_layer "this project's agent home"
 		local seed
 		seed=$(mktemp -d)
 		mkdir -p "$seed/upper" "$seed/work"
@@ -1381,12 +1382,60 @@ commit_reachable() {
 	[[ -n $refs ]]
 }
 
+# Free space on the filesystem a path lives on, in whole GB. Nothing at all
+# when it cannot be read - a refusal invented from a failed measurement is how a
+# missing command becomes "the disk is full".
+free_gb_of() {
+	local kb
+	kb=$(df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }') || true
+	[[ $kb =~ ^[0-9]+$ ]] || return 0
+	echo $((kb / 1048576))
+}
+
+# ROOM TO BUILD A LAYER, ASKED BEFORE BUILDING IT.
+#
+# A VM that fills the filesystem kills every other VM on the host. Measured
+# 2026-11-13: state/ reached 800G, / went to 100%, and three agents' VMs died
+# mid-work with errors that named their own builds. So a new layer is a decision
+# about everybody's disk, not just this run's.
+#
+# Below FIRECODE_MIN_FREE GB (default 50) the ephemeral sessions go first - they
+# are the ones nobody will resume, so giving them up costs nothing - and if that
+# is not enough, no VM starts. Refusing is the point: carrying on with 3G free
+# boots a guest that dies somewhere unrelated an hour later and takes its
+# neighbours with it.
+disk_guard_for_layer() {
+	local what=$1 min=${FIRECODE_MIN_FREE:-50} avail
+	[[ $min =~ ^[0-9]+$ ]] || return 0
+	avail=$(free_gb_of "$STATE_DIR")
+	[[ -n $avail ]] || return 0
+	((avail >= min)) && return 0
+	log "only ${avail}G free where VM state lives ($STATE_DIR), and the floor is ${min}G"
+	log "  reclaiming what ephemeral sessions left behind, first"
+	gc_state_pass 2d 0 1
+	avail=$(free_gb_of "$STATE_DIR")
+	[[ -n $avail ]] || return 0
+	((avail >= min)) && return 0
+	die "refusing to start a VM: ${avail}G free on the filesystem holding $STATE_DIR,
+       and ${what} needs to make a new disk there (the floor is ${min}G).
+       A guest that fills this filesystem kills every VM on the host, so this
+       stops rather than trying.
+
+       What frees room:
+         firecode gc --state --dry-run   what stopped sessions are holding
+         firecode gc --state             reclaim it
+         scripts/reap-layers.sh          layers nothing has used in 14 days
+       Or put the state somewhere with room: FIRECODE_STATE=/big/disk/state
+       Or lower the floor deliberately: FIRECODE_MIN_FREE=10 firecode ..."
+}
+
 # An empty ext4 for one overlay layer. Sparse, so it costs what it holds.
 ensure_layer() {
 	local slug=$1
 	local img="$STATE_DIR/$slug-layer.ext4"
 	mkdir -p "$STATE_DIR"
 	if [[ ! -f $img ]]; then
+		disk_guard_for_layer "this project's workspace layer"
 		local seed
 		seed=$(mktemp -d)
 		mkdir -p "$seed/upper" "$seed/work"
@@ -8204,25 +8253,19 @@ file_bytes() {
 	printf '%s\n' "$b"
 }
 
-# Which sessions have a VM running now, and when each was last used.
+# Which sessions have a run in progress, and when each was last used.
 #
 # ONE WALK OF runs/, because the other shape - ask live_runs, then walk the
 # thousands of run directories again for each session - is minutes on the host
-# this exists for, and that host is out of disk. Both answers come from the same
-# test everything else uses: a cgroup holding processes.
+# this exists for, and that host is out of disk.
 declare -A SESSION_RUNNING=()
 declare -A SESSION_LAST_RUN=()
 index_runs_by_session() {
 	local d proj slug t
 	local -A slug_of=()
-	local id
 	SESSION_RUNNING=()
 	SESSION_LAST_RUN=()
 	[[ -d $RUNS ]] || return 0
-	while IFS=$'\t' read -r id proj _ _; do
-		[[ -n $proj ]] || continue
-		SESSION_RUNNING["$(project_slug "$proj")"]=1
-	done < <(live_runs 2>/dev/null)
 	for d in "$RUNS"/*/; do
 		[[ -f $d/project ]] || continue
 		proj=$(cat "$d/project" 2>/dev/null) || continue
@@ -8233,6 +8276,11 @@ index_runs_by_session() {
 			slug_of[$proj]=$(project_slug "$proj")
 		fi
 		slug=${slug_of[$proj]}
+		# RUN IN PROGRESS, not just "its VM is up": a run that is booting, or
+		# one copying its work out, holds this state too - and the copy-out is
+		# reading the src drive. run_alive is that question, and it is what
+		# keeps a fresh boot from being reclaimed a second after it starts.
+		if run_alive "${d%/}"; then SESSION_RUNNING[$slug]=1; fi
 		t=$(stat -c %Y "${d%/}" 2>/dev/null) || t=0
 		[[ $t =~ ^[0-9]+$ ]] || t=0
 		if [[ -z ${SESSION_LAST_RUN[$slug]:-} ]] || ((t > SESSION_LAST_RUN[$slug])); then
@@ -8986,6 +9034,11 @@ where the disks go (also settable in the environment, read once):
                       (default: <checkout>/state, tens of GB per project)
   FIRECODE_RUNS DIR   run records, console logs and copy-outs
                       (default: <checkout>/runs, a few files per run)
+  FIRECODE_MIN_FREE G how much room to leave on the filesystem holding
+                      FIRECODE_STATE (default 50). Below it, a new layer first
+                      reclaims what ephemeral sessions left behind, and if
+                      that is not enough the run REFUSES to start: a guest
+                      that fills the disk kills every other VM on this host
   Both are read once at startup and every path uses them, so a host can keep
   VM state on a big disk: FIRECODE_STATE=/build/firecode-state firecode ...
 

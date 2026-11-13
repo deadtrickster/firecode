@@ -923,6 +923,18 @@ Both are inherited by every run and by the spawn server, `reap-layers.sh` and
 `firecode doctor` says how much state there is and how much room is left where
 it lives.
 
+**A full disk kills VMs that are not yours.** On 2026-11-13 state/ reached 800G,
+the root filesystem went to 100%, and three agents' VMs died mid-work with
+errors naming their own builds. So making a new layer now begins by looking at
+the free space where state lives: under `FIRECODE_MIN_FREE` GB (default 50) the
+ephemeral sessions are reclaimed first, and if that is still not enough the run
+stops and says so, with the commands that free room. A refusal that costs one
+run is cheaper than a full disk that takes everyone's.
+
+```sh
+FIRECODE_MIN_FREE=10 firecode claude ...   # a small disk, deliberately
+```
+
 ## Housekeeping
 
 ```sh

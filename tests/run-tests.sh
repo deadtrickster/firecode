@@ -758,6 +758,8 @@ test_gc_state_pass() {
 	mkdir -p "$rn/recent"
 	printf '%s\n' "$p_recent" >"$rn/recent/project"
 	printf '%s\n' "$rn/recent" >"$rn/recent/jail"
+	# Its launcher is long gone: a run that is over, not a run in progress.
+	printf '999999\n' >"$rn/recent/launcher"
 
 	# And a finished run long past the age, to prove --state sweeps no runs.
 	mkdir -p "$rn/old-dead"
@@ -795,6 +797,102 @@ test_gc_state_pass() {
 		no "--state refuses an age it cannot read" "exited 0"
 	else
 		ok "--state refuses an age it cannot read"
+	fi
+}
+
+# A FULL DISK IS EVERYBODY'S DISK, SO IT IS CHECKED BEFORE A LAYER IS MADE.
+#
+# The guard's whole job is to refuse rather than to boot somewhere there is no
+# room, because a guest that fills the filesystem kills the other VMs on the
+# host - 2026-11-13, three of them mid-work. Nothing here touches a real disk:
+# the measurement is stubbed, which is the only way to test a threshold that a
+# test must not actually cross.
+test_disk_guard_refuses_before_a_layer() {
+	local dir out rc layer
+	dir="$WORK/guardstate"
+	mkdir -p "$dir"
+
+	# free_gb_of answers $first once and $after from then on, so "the reclaim made
+	# room" and "it did not" are the same test with different numbers.
+	guard() {
+		local first=$1 after=$2 min=${3:-50} cnt="$WORK/guard.count"
+		: >"$cnt"
+		(
+			export FIRECODE_MIN_FREE="$min" STATE_DIR="$dir"
+			export GUARD_FIRST="$first" GUARD_AFTER="$after" GUARD_CNT="$cnt"
+			log() { printf 'guard: %s\n' "$*" >&2; }
+			die() {
+				printf 'guard: error: %s\n' "$*" >&2
+				exit 3
+			}
+			free_gb_of() {
+				if [[ -s $GUARD_CNT ]]; then
+					echo "$GUARD_AFTER"
+				else
+					echo "$GUARD_FIRST"
+					echo x >>"$GUARD_CNT"
+				fi
+			}
+			gc_state_pass() { printf 'reclaimed: [%s]\n' "$*" >&2; }
+			eval "$(sed -n '/^disk_guard_for_layer() {$/,/^}$/p' "$FIRECODE")"
+			disk_guard_for_layer "a workspace layer" 2>&1
+		)
+	}
+
+	out=$(guard 100 100)
+	rc=$?
+	check "plenty of room starts no argument" "0" "$rc"
+	if [[ $out == *reclaim* ]]; then
+		no "and reclaims nothing" "$out"
+	else
+		ok "and reclaims nothing"
+	fi
+
+	out=$(guard 10 80)
+	rc=$?
+	check "short of room does not refuse once the reclaim works" "0" "$rc"
+	contains "it reclaims ephemeral state first" "reclaimed: [2d 0 1]" "$out"
+	contains "and says the floor it is judging against" "floor is 50G" "$out"
+
+	out=$(guard 10 10)
+	rc=$?
+	check "short of room with nothing to reclaim refuses to boot" "3" "$rc"
+	contains "and says how much is left" "10G free on the filesystem holding" "$out"
+	contains "and what to do about it" "firecode gc --state" "$out"
+	contains "and the variable that moves the floor" "FIRECODE_MIN_FREE" "$out"
+
+	out=$(guard 10 10 5)
+	check "a floor the operator lowered is obeyed" "0" "$?"
+
+	# And it is in the path that makes a layer, not just defined.
+	layer="$WORK/guardlayer"
+	mkdir -p "$layer"
+	out=$(
+		log() { :; }
+		die() {
+			printf 'error: %s\n' "$*" >&2
+			exit 3
+		}
+		free_gb_of() { echo 1; }
+		gc_state_pass() { :; }
+		eval "$(sed -n '/^disk_guard_for_layer() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^ensure_layer() {$/,/^}$/p' "$FIRECODE")"
+		STATE_DIR="$layer" FIRECODE_MIN_FREE=50 ensure_layer someproject 2>&1
+	)
+	check "a layer is not even started when the disk is too full" "3" "$?"
+	check "and no layer appeared" "no" \
+		"$([[ -f $layer/someproject-layer.ext4 ]] && echo yes || echo no)"
+	contains "and the refusal names the layer's own reason" "workspace layer" "$out"
+
+	# The measurement itself, on a real path.
+	out=$(
+		eval "$(sed -n '/^free_gb_of() {$/,/^}$/p' "$FIRECODE")"
+		free_gb_of "$WORK"
+	)
+	if [[ $out =~ ^[0-9]+$ ]]; then
+		ok "free space is measured as a number of GB ($out)"
+	else
+		no "free space is measured as a number of GB" "got [$out]"
 	fi
 }
 
@@ -2849,6 +2947,7 @@ run_test gc_older_than
 run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
 run_test gc_state_pass
+run_test disk_guard_refuses_before_a_layer
 run_test state_and_runs_are_relocatable
 run_test ephemeral_state_goes_with_the_work
 run_test ephemeral_vm_releases_state
