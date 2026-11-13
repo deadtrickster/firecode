@@ -87,7 +87,11 @@ VENDOR="$CACHE/vendor/bin"
 # path would then mean something else from inside it.
 RUNS=$(realpath -m "${FIRECODE_RUNS:-$ROOT/runs}")
 STATE_DIR=$(realpath -m "${FIRECODE_STATE:-$ROOT/state}")
-JAIL_BASE="$ROOT/.jail"
+# Beside the state, so the writable drives hardlink into the jail. A drive
+# copied in instead takes the guest's writes with it when the jail goes.
+JAIL_BASE=$(realpath -m "${FIRECODE_JAIL:-$(dirname "$STATE_DIR")/.jail}")
+# Where jails were before they followed the state: still scanned for live ones.
+LEGACY_JAIL_BASE=$(realpath -m "$ROOT/.jail")
 
 # The command as invoked, so a multiplexer session can re-run it verbatim.
 declare -a FIRECODE_ARGV=("$@")
@@ -131,8 +135,19 @@ JAIL_FC=$FC
 # Every place a jail can be, for the scans that look for live or stale ones.
 jail_bases() {
 	printf '%s\n' "$USER_JAIL_BASE"
+	[[ $LEGACY_JAIL_BASE != "$(realpath -m "$USER_JAIL_BASE")" ]] && printf '%s\n' "$LEGACY_JAIL_BASE"
 	[[ -n $PRIV_JAIL_BASE ]] && printf '%s\n' "$PRIV_JAIL_BASE"
 	return 0
+}
+
+# Whether the guest's tree has the history its source has: a commit that left
+# the files as they were is still work, and the file diff cannot see it.
+same_history() {
+	local src=$1 out=$2 a b
+	[[ -e $out/.git ]] || return 0
+	a=$(git -C "$src" rev-parse -q --verify HEAD 2>/dev/null || true)
+	b=$(git -C "$out" rev-parse -q --verify HEAD 2>/dev/null || true)
+	[[ $a == "$b" ]]
 }
 
 # Remove one run's jail - the directory above its root. A root-owned base is
@@ -6657,8 +6672,17 @@ launch() {
 		"$state_drive" ${extra_drives+"${extra_drives[@]}"}
 	)
 	for f in "${into_jail[@]}"; do
-		ln "$f" "$JAIL_DIR/$(basename "$f")" 2>/dev/null ||
-			cp "$f" "$JAIL_DIR/$(basename "$f")"
+		ln "$f" "$JAIL_DIR/$(basename "$f")" 2>/dev/null && continue
+		# A copied writable drive is where the guest's writes go, and the
+		# copy-out reads the original: the work would be lost at down.
+		if [[ $f == "$workspace_layer" || $f == "$src_drive" || $f == "$state_drive" ]]; then
+			die "$(basename "$f") cannot be hardlinked into the jail at $JAIL_DIR:
+       the drive is on $(df --output=target "$f" 2>/dev/null | tail -1) and the jail on
+       $(df --output=target "$JAIL_DIR" 2>/dev/null | tail -1). A copy would take the guest's writes
+       with it when the jail goes. Put the jail beside the state:
+         FIRECODE_JAIL=<dir on the same filesystem as $STATE_DIR>"
+		fi
+		cp "$f" "$JAIL_DIR/$(basename "$f")"
 	done
 
 	# The config drive, by content on a restore and by name always.
@@ -7104,6 +7128,14 @@ EOF
 	fi
 	echo >&2
 	log "VM exited (status $rc)"
+	# The copy-out reads the drive the guest wrote. A jail entry that is not
+	# the state drive itself is a copy, and it holds the writes.
+	local jailed_src
+	jailed_src="$JAIL_DIR/$(basename "$src_drive")"
+	if [[ -n $JAIL_DIR && -f $jailed_src && ! $jailed_src -ef $src_drive ]]; then
+		log "the guest wrote a copy of the src drive in the jail, so the copy-out reads that one"
+		src_drive=$jailed_src
+	fi
 	# `down --discard` asked for nothing to come back. Read here, as the VM
 	# exits, because the decision is this process's: down is another one.
 	if ((SYNC_BACK)) && [[ -f $RUN_DIR/discard ]]; then
@@ -7257,7 +7289,8 @@ EOF
 		# behind. Most of these VMs are transient - a test, a probe, one that
 		# failed to start - and seventeen identical directories beside a
 		# project is just litter to work out the meaning of later.
-		if [[ -z $DELIVER ]] && diff -rq --exclude=.git "$WORKDIR" "$staging" >/dev/null 2>&1; then
+		if [[ -z $DELIVER ]] && same_history "$WORKDIR" "$staging" &&
+			diff -rq --exclude=.git "$WORKDIR" "$staging" >/dev/null 2>&1; then
 			rm -rf "$staging"
 			copy_out_mark none
 			log "nothing changed, so no result directory"

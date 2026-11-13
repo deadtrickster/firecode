@@ -17,7 +17,7 @@ A run owns, and is solely responsible for releasing:
 |---|---|
 | the VMM process | a cgroup (below) |
 | relay processes | the same cgroup |
-| the jail directory | `.jail/firecracker/<id>/root` |
+| the jail directory | `.jail/firecracker/<id>/root`, beside `state/` |
 | drive images built for it | `runs/<id>/*.ext4` |
 | a tap device and a /30 | `fccode<slot>`, `172.16.<slot>.0/30` |
 | a lock on the project's state | `flock` on the state drive |

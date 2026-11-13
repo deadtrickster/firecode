@@ -918,6 +918,10 @@ export FIRECODE_STATE=/build/firecode-state
 export FIRECODE_RUNS=/build/firecode-runs   # optional; runs are small
 ```
 
+Jails go beside the state (`$(dirname $FIRECODE_STATE)/.jail`, or `FIRECODE_JAIL`), because
+the writable drives are hardlinked into the jail. A jail on another filesystem is refused at
+boot: a copied drive takes the guest's writes with it when the jail goes.
+
 Both are inherited by every run and by the spawn server, `reap-layers.sh` and
 `boot-timings.sh`, so nothing keeps reading the default behind your back.
 `firecode doctor` answers "why is this host out of disk" in three lines: how

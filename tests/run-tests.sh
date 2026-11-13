@@ -2455,6 +2455,50 @@ test_down_delivers_the_work() {
 	rm -rf "$dest"
 }
 
+# A writable drive the jail could not hardlink was copied into it, so the
+# guest wrote the copy, the copy-out read the untouched original and said
+# "nothing changed", and the work went with the jail. A jail on another
+# filesystem than the state is refused before anything boots.
+test_cross_fs_jail_is_refused() {
+	((QUICK)) && return 0
+	local p jail out
+	jail=/dev/shm/firecode-xfs-jail-$$
+	if [[ ! -d /dev/shm ]] || [[ $(stat -c %d /dev/shm) == "$(stat -c %d "$WORK")" ]]; then
+		ok "a cross-filesystem jail is refused (skipped, no second filesystem)"
+		return 0
+	fi
+	p=$(make_project)
+	out=$(cd "$p" && FIRECODE_STATE="$WORK/xfs-state" FIRECODE_JAIL="$jail" \
+		"$FIRECODE" up --no-jail --no-net --mem 1024 2>&1)
+	contains "a writable drive is never copied into the jail" "cannot be hardlinked into the jail" "$out"
+	check "and no VM was started" "" \
+		"$("$FIRECODE" list --ids 2>/dev/null | awk -v p="$p" '$2 == p {print $1; exit}')"
+	(cd "$p" && FIRECODE_STATE="$WORK/xfs-state" "$FIRECODE" down --project "$p" >/dev/null 2>&1)
+	rm -rf "$jail"
+}
+
+# A commit that leaves the files as they were is still work: the copy-out
+# compared files only and reported such a run as "nothing changed".
+test_a_commit_alone_is_work() {
+	local src="$WORK/hist-src" out="$WORK/hist-out" r
+	rm -rf "$src" "$out"
+	mkdir -p "$src"
+	echo same >"$src/f.txt"
+	git -C "$src" init -q
+	git -C "$src" add -A
+	git -C "$src" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm base
+	cp -a "$src" "$out"
+	r=$(
+		eval "$(sed -n '/^same_history() {$/,/^}$/p' "$FIRECODE")"
+		same_history "$src" "$out" && echo same || echo moved
+		git -C "$out" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+			commit -q --allow-empty -m work
+		same_history "$src" "$out" && echo same || echo moved
+	)
+	check "an untouched copy has the same history" "same" "$(sed -n 1p <<<"$r")"
+	check "a copy with a commit and no file change has not" "moved" "$(sed -n 2p <<<"$r")"
+}
+
 test_killed_vm_is_reported_dead() {
 	((QUICK)) && return 0
 	local p
@@ -3014,6 +3058,8 @@ run_test freed_memory_returns_to_host
 run_test libvirt_backend
 run_test cp_overwrites_in_vm
 run_test down_delivers_the_work
+run_test cross_fs_jail_is_refused
+run_test a_commit_alone_is_work
 run_test killed_vm_is_reported_dead
 run_test proc_mirror
 run_test proc_mounted
