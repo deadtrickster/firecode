@@ -582,6 +582,7 @@ test_gc_older_than() {
 		cg_procs() { cat "$1/cgroup.procs" "$1"/*/cgroup.procs 2>/dev/null || true; }
 		jail_bases() { :; }
 		jail_remove() { :; }
+		eval "$(sed -n '/^age_minutes() {$/,/^}$/p' "$FIRECODE")"
 		eval "$(sed -n '/^cmd_gc() {$/,/^}$/p' "$FIRECODE")"
 		RUNS="$runs" cmd_gc --older-than 2d 2>&1
 	)
@@ -601,6 +602,7 @@ test_gc_older_than() {
 		cg_procs() { :; }
 		jail_bases() { :; }
 		jail_remove() { :; }
+		eval "$(sed -n '/^age_minutes() {$/,/^}$/p' "$FIRECODE")"
 		eval "$(sed -n '/^cmd_gc() {$/,/^}$/p' "$FIRECODE")"
 		RUNS="$runs" cmd_gc --older-than yesterday 2>&1
 	); then
@@ -686,6 +688,114 @@ test_gc_keeps_unreachable_work() {
 	fi
 	contains "and names the commits that keep it" "the only copy of this" "$out"
 	contains "and how to land them" "firecode land firecode-20260818-101011-2222" "$out"
+}
+
+# THE PASS THAT ACTUALLY RECLAIMS state/.
+#
+# state/ is where the 393G was, and the rule is the hard part: an age alone
+# would delete a toolchain cache somebody is about to use, and liveness alone
+# would keep every disk forever. This pins down all four rules at once, on a
+# state directory that costs nothing to make.
+test_gc_state_pass() {
+	local st rn out p_old p_young p_eph p_boot p_live p_recent
+	local s_old s_young s_eph s_boot s_live s_recent
+	st="$WORK/gcstate"
+	rn="$WORK/gcruns"
+	rm -rf "$st" "$rn"
+	mkdir -p "$st" "$rn"
+
+	# project_slug in bin/firecode, mirrored: basename sanitised, then 8 hex of
+	# sha256 of the whole path. If that ever changes, this test says so.
+	gcs_slug_of() {
+		printf '%s-%s\n' "$(basename "$1" | tr -c 'A-Za-z0-9._-' '-')" \
+			"$(printf '%s' "$1" | sha256sum | cut -c1-8)"
+	}
+	# A session's drives, as old as $2.
+	gcs_session() {
+		local slug=$1 age=$2 f
+		for f in "$st/$slug.ext4" "$st/$slug-layer.ext4" "$st/$slug-src.ext4"; do
+			: >"$f"
+			touch -d "$age" "$f"
+		done
+	}
+
+	p_old="$WORK/gcs-old"
+	p_young="$WORK/gcs-young"
+	p_eph="$WORK/gcs-eph"
+	p_boot="$WORK/gcs-booting"
+	p_live="$WORK/gcs-live"
+	p_recent="$WORK/gcs-recent"
+	for d in "$p_old" "$p_young" "$p_eph" "$p_boot" "$p_live" "$p_recent"; do
+		mkdir -p "$d"
+	done
+	s_old=$(gcs_slug_of "$p_old")
+	s_young=$(gcs_slug_of "$p_young")
+	s_eph=$(gcs_slug_of "$p_eph")
+	s_boot=$(gcs_slug_of "$p_boot")
+	s_live=$(gcs_slug_of "$p_live")
+	s_recent=$(gcs_slug_of "$p_recent")
+
+	gcs_session "$s_old" '5 days ago'
+	gcs_session "$s_young" '1 hour ago'
+	gcs_session "$s_eph" '1 hour ago'
+	: >"$st/$s_eph.ephemeral"
+	touch -d '1 hour ago' "$st/$s_eph.ephemeral"
+	gcs_session "$s_boot" 'now'
+	: >"$st/$s_boot.ephemeral"
+	gcs_session "$s_live" '30 days ago'
+	gcs_session "$s_recent" '5 days ago'
+
+	# A run with a VM in it: what live_runs reads is a cgroup with something in
+	# it, so give it a cgroup.events saying exactly that.
+	mkdir -p "$rn/live" "$WORK/gcfake/vm"
+	printf 'populated 1\n' >"$WORK/gcfake/vm/cgroup.events"
+	printf '%s\n' "$WORK/gcfake" >"$rn/live/cgroup"
+	printf '%s\n' "$p_live" >"$rn/live/project"
+	printf '%s\n' "$rn/live" >"$rn/live/jail"
+
+	# A finished run an hour ago for $p_recent: its files are old, but somebody
+	# was using this session an hour ago, which is the question that matters.
+	mkdir -p "$rn/recent"
+	printf '%s\n' "$p_recent" >"$rn/recent/project"
+	printf '%s\n' "$rn/recent" >"$rn/recent/jail"
+
+	# And a finished run long past the age, to prove --state sweeps no runs.
+	mkdir -p "$rn/old-dead"
+	printf '%s\n' "$p_old" >"$rn/old-dead/project"
+	printf 'dead\n' >"$rn/old-dead/name"
+	printf '999999\n' >"$rn/old-dead/launcher"
+	touch -d '9 days ago' "$rn/old-dead"
+
+	# --dry-run lists and removes nothing.
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$rn" "$FIRECODE" gc --state --dry-run 2>&1)
+	contains "--state --dry-run lists a session nothing has touched" "$s_old-layer.ext4" "$out"
+	contains "and says it would remove rather than removed" "would remove" "$out"
+	check "and removed nothing" "yes" \
+		"$([[ -f $st/$s_old.ext4 ]] && echo yes || echo no)"
+
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$rn" "$FIRECODE" gc --state 2>&1)
+	check "a session nothing has touched for longer than the age goes" gone \
+		"$([[ -f $st/$s_old.ext4 ]] && echo "still there: $out" || echo gone)"
+	check "one younger than the age stays" there \
+		"$([[ -f $st/$s_young.ext4 ]] && echo there || echo "removed: $out")"
+	check "an ephemeral session's state goes at any age" gone \
+		"$([[ -f $st/$s_eph.ext4 ]] && echo "still there: $out" || echo gone)"
+	check "but not one a VM may be starting right now" there \
+		"$([[ -f $st/$s_boot.ext4 ]] && echo there || echo "removed: $out")"
+	check "a session with a VM running is never touched" there \
+		"$([[ -f $st/$s_live.ext4 ]] && echo there || echo "removed: $out")"
+	check "nor one a run named an hour ago" there \
+		"$([[ -f $st/$s_recent.ext4 ]] && echo there || echo "removed: $out")"
+	check "--state sweeps no run directories" there \
+		"$([[ -d $rn/old-dead ]] && echo there || echo "removed: $out")"
+	contains "and reports what it freed" "removed" "$out"
+
+	if FIRECODE_STATE="$st" FIRECODE_RUNS="$rn" "$FIRECODE" gc --state \
+		--older-than yesterday >/dev/null 2>&1; then
+		no "--state refuses an age it cannot read" "exited 0"
+	else
+		ok "--state refuses an age it cannot read"
+	fi
 }
 
 # WHERE THE DISKS ARE IS A DECISION, NOT A CONSTANT.
@@ -2738,6 +2848,7 @@ run_test dead_runs_are_cheap
 run_test gc_older_than
 run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
+run_test gc_state_pass
 run_test state_and_runs_are_relocatable
 run_test ephemeral_state_goes_with_the_work
 run_test ephemeral_vm_releases_state

@@ -8180,8 +8180,174 @@ socat_orphans() {
 	done
 }
 
+# The age, in minutes, from the spelling a person types: 90m, 12h, 2d.
+# One parser for both of gc's passes - the run sweep and the state pass - so
+# "older than 2d" cannot mean two different things in one command.
+age_minutes() {
+	local age=$1 n
+	case "$age" in
+	*d) n=$(((${age%d}) * 1440)) ;;
+	*h) n=$(((${age%h}) * 60)) ;;
+	*m) n=${age%m} ;;
+	*) return 1 ;;
+	esac
+	[[ $n =~ ^[0-9]+$ ]] || return 1
+	printf '%s\n' "$n"
+}
+
+# The size the disk actually gives up, not the apparent size: a layer is
+# sparse, so `du --apparent-size` says 32G for a file holding 2G.
+file_bytes() {
+	local b
+	b=$(du -B1 "$1" 2>/dev/null | cut -f1) || b=0
+	[[ $b =~ ^[0-9]+$ ]] || b=0
+	printf '%s\n' "$b"
+}
+
+# Which sessions have a VM running now, and when each was last used.
+#
+# ONE WALK OF runs/, because the other shape - ask live_runs, then walk the
+# thousands of run directories again for each session - is minutes on the host
+# this exists for, and that host is out of disk. Both answers come from the same
+# test everything else uses: a cgroup holding processes.
+declare -A SESSION_RUNNING=()
+declare -A SESSION_LAST_RUN=()
+index_runs_by_session() {
+	local d proj slug t
+	local -A slug_of=()
+	local id
+	SESSION_RUNNING=()
+	SESSION_LAST_RUN=()
+	[[ -d $RUNS ]] || return 0
+	while IFS=$'\t' read -r id proj _ _; do
+		[[ -n $proj ]] || continue
+		SESSION_RUNNING["$(project_slug "$proj")"]=1
+	done < <(live_runs 2>/dev/null)
+	for d in "$RUNS"/*/; do
+		[[ -f $d/project ]] || continue
+		proj=$(cat "$d/project" 2>/dev/null) || continue
+		[[ -n $proj ]] || continue
+		# Memoised by project path: hundreds of runs name the same project, and
+		# every miss is a sha256 in a subshell.
+		if [[ -z ${slug_of[$proj]:-} ]]; then
+			slug_of[$proj]=$(project_slug "$proj")
+		fi
+		slug=${slug_of[$proj]}
+		t=$(stat -c %Y "${d%/}" 2>/dev/null) || t=0
+		[[ $t =~ ^[0-9]+$ ]] || t=0
+		if [[ -z ${SESSION_LAST_RUN[$slug]:-} ]] || ((t > SESSION_LAST_RUN[$slug])); then
+			SESSION_LAST_RUN[$slug]=$t
+		fi
+	done
+	return 0
+}
+
+# GC'S STATE PASS: the drives of sessions nobody is coming back to.
+#
+# A session is one project's state - layer, agent home, src drive, lock - and it
+# outlives the runs that made it. That is the point of it (--continue, and a
+# toolchain paid for once) and also how 47 stopped VMs came to hold 393G.
+#
+# Four rules, each one a way this could destroy something:
+#
+#   a session with a VM running now is never touched, whatever its age says;
+#   nothing written in the last FIRECODE_STATE_GRACE_MIN minutes (10) is
+#     touched, which is what covers a run between creating its files and
+#     appearing in a cgroup;
+#   an EPHEMERAL session's state goes at any age - nobody will resume it, that
+#     is what it was for - and it goes first, because it is free to give up;
+#   any other session only when nothing has touched it for AGE, where "touched"
+#     is its own files or the last run that named it.
+#
+# `ephemeral` (third argument) restricts the pass to those - what the disk guard
+# runs before refusing to boot, so a full disk costs an ephemeral session rather
+# than the operator's toolchain caches.
+gc_state_pass() {
+	local older=$1 dry=$2 only_ephemeral=${3:-0}
+	local minutes slug f t newest ephemeral bytes total=0 n=0 sessions=0
+	local kept_live=0 kept_other=0 grace cutoff
+	local -a files=()
+	local -a rows=()
+	minutes=$(age_minutes "$older") ||
+		die "--older-than takes an age like 90m, 12h or 2d, not: $older"
+	if [[ ! -d $STATE_DIR ]]; then
+		log "no state directory at $STATE_DIR"
+		return 0
+	fi
+	grace=$(($(date +%s) - ${FIRECODE_STATE_GRACE_MIN:-10} * 60))
+	cutoff=$(($(date +%s) - minutes * 60))
+	index_runs_by_session
+
+	while IFS= read -r slug; do
+		[[ -n $slug ]] || continue
+		if [[ -n ${SESSION_RUNNING[$slug]:-} ]]; then
+			kept_live=$((kept_live + 1))
+			continue
+		fi
+		files=()
+		while IFS= read -r f; do files+=("$f"); done < <(session_state_files "$slug")
+		# Nothing on disk to weigh: a lock whose drives are already gone, or a
+		# session that vanished between the listing and here.
+		((${#files[@]})) || continue
+		ephemeral=0
+		[[ -f $STATE_DIR/$slug.ephemeral ]] && ephemeral=1
+		if ((only_ephemeral)) && ((! ephemeral)); then
+			kept_other=$((kept_other + 1))
+			continue
+		fi
+		newest=${SESSION_LAST_RUN[$slug]:-0}
+		for f in "${files[@]}"; do
+			t=$(stat -c %Y "$f" 2>/dev/null) || t=0
+			[[ $t =~ ^[0-9]+$ ]] || t=0
+			((t > newest)) && newest=$t
+		done
+		# Too recent to reason about - see FIRECODE_STATE_GRACE_MIN.
+		if ((newest > grace)); then
+			kept_other=$((kept_other + 1))
+			continue
+		fi
+		# An ephemeral session is reclaimable at any age; everything else has
+		# to have been left alone for AGE.
+		if ((! ephemeral)) && ((newest > cutoff)); then
+			kept_other=$((kept_other + 1))
+			continue
+		fi
+		sessions=$((sessions + 1))
+		bytes=0
+		for f in "${files[@]}"; do
+			t=$(file_bytes "$f")
+			bytes=$((bytes + t))
+			rows+=("$t|$f")
+		done
+		total=$((total + bytes))
+		n=$((n + ${#files[@]}))
+	done < <(state_sessions)
+
+	if ((${#rows[@]})); then
+		local row
+		for row in "${rows[@]}"; do
+			printf '%s  %s  %s\n' \
+				"$(numfmt --to=iec --suffix=B --padding=8 "${row%%|*}")" \
+				"$(date -r "${row#*|}" '+%Y-%m-%d')" "$(basename "${row#*|}")"
+		done
+	fi
+	if ((n == 0)); then
+		log "state: nothing to remove in $STATE_DIR ($kept_live session(s) with a VM, $kept_other not removable)"
+		return 0
+	fi
+	if ((dry)); then
+		log "state: would remove $n file(s), $(numfmt --to=iec --suffix=B "$total") from $sessions session(s) in $STATE_DIR"
+	else
+		local row
+		for row in "${rows[@]}"; do rm -f "${row#*|}" || true; done
+		log "state: removed $n file(s), $(numfmt --to=iec --suffix=B "$total") from $sessions session(s) in $STATE_DIR"
+	fi
+	log "  kept $kept_live session(s) with a VM running, $kept_other not removable (older-than $older)"
+	return 0
+}
+
 cmd_gc() {
-	local keep=5 older="" sweep=0 n=0 d
+	local keep=5 older="" sweep=0 state=0 dry=0 n=0 d
 	local -a stuck=()
 	while [[ ${1:-} == -* ]]; do
 		case "$1" in
@@ -8189,19 +8355,36 @@ cmd_gc() {
 			older=${2:?--older-than needs an age: 90m, 12h or 2d}
 			shift 2
 			;;
+		--state)
+			state=1
+			shift
+			;;
+		--dry-run)
+			dry=1
+			shift
+			;;
 		-h | --help)
 			cat <<'USAGE'
 usage: firecode gc [KEEP] [--older-than AGE]
+       firecode gc --state [--older-than AGE] [--dry-run]
 
   KEEP              finished runs to keep (default 5). Older ones are removed
                     outright; the newest KEEP lose only their drives.
   --older-than AGE  remove only runs that finished more than AGE ago (90m, 12h,
                     2d), and no run newer than that. A run still holding a VM
-                    is never removed either way, and state/ is not touched -
-                    what this sweeps is runs/, whose directories accumulate a
-                    few thousand over a month and are what every lookup walks.
-                    A run directory is also what `firecode land <run-id>` reads,
-                    so do not sweep work you have not landed yet.
+                    is never removed either way, and state/ is not touched
+                    without --state - what this sweeps is runs/, whose
+                    directories accumulate a few thousand over a month and are
+                    what every lookup walks. A run directory is also what
+                    `firecode land <run-id>` reads, so do not sweep work you
+                    have not landed yet.
+
+  --state           gc's second pass, and only that: remove the state files of
+                    sessions no VM is running and nothing has touched for AGE
+                    (default 2d), listing each with its size. An EPHEMERAL
+                    session's state goes at any age - nobody will resume it -
+                    and `--dry-run` lists without removing. Nothing of a
+                    running VM's is ever touched.
 USAGE
 			return 0
 			;;
@@ -8209,18 +8392,20 @@ USAGE
 		esac
 	done
 	if [[ -n ${1:-} ]]; then keep=$1; fi
-	# The age, in find's own vocabulary: -mtime for days, -mmin for the rest.
+	# The age, in find's own vocabulary, from the one parser both passes use.
 	# It decides which runs are candidates at all, so a run younger than the age
 	# is not even considered - and with --older-than nothing goes by count.
 	local -a age_test=()
 	if [[ -n $older ]]; then
-		case "$older" in
-		*d) age_test=(-mtime +"${older%d}") ;;
-		*h) age_test=(-mmin +$((${older%h} * 60))) ;;
-		*m) age_test=(-mmin +"${older%m}") ;;
-		*) die "--older-than takes an age like 90m, 12h or 2d, not: $older" ;;
-		esac
+		age_test=(-mmin +"$(age_minutes "$older")") ||
+			die "--older-than takes an age like 90m, 12h or 2d, not: $older"
 		sweep=1
+	fi
+	if ((state)); then
+		# Its own pass, touching state/ and nothing else: that is what makes
+		# --dry-run an honest list of everything this command would do.
+		gc_state_pass "${older:-2d}" "$dry"
+		return 0
 	fi
 	[[ -d $RUNS ]] || return 0
 	# Each `up` keeps its own log beside the runs. One a day untouched belongs
@@ -8741,6 +8926,8 @@ firecode - run a coding agent in a Firecracker microVM
   firecode list                  sessions, runs, and whether drives still exist
   firecode extract <id> [dest]   pull a run's /src back out
   firecode gc [keep]             drop old run drives (default: keep 5)
+  firecode gc --state            drop the state of sessions nothing has
+                                 touched for 2 days (--dry-run lists them)
 
   firecode snapshot [name]       capture this project's VM state
   firecode snapshot ls           list snapshots

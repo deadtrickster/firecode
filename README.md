@@ -929,6 +929,8 @@ it lives.
 firecode list                 # sessions and runs
 firecode extract <id>         # pull a run's project back out (with --keep)
 firecode gc                   # drop old run drives, keep the last 5
+firecode gc --state           # and the state of sessions untouched for 2 days
+firecode gc --state --dry-run # what that would remove, with sizes
 
 firecode layer add IMAGE      # a docker image as a read-only layer, by digest
 firecode layer ls             # which images this project boots with
@@ -944,7 +946,12 @@ firecode state reset          # forget this project's history, tree and layer
 ```
 
 Per-run drives are deleted when the VM exits unless you pass `--keep`. Console
-logs stay. Layers, state and snapshots are never touched by `gc`.
+logs stay. Snapshots are never touched by `gc`, and neither is `state/` - except
+by `gc --state`, which is the pass that exists because it has to be somebody's
+job: a project's state outlives the runs that made it (that is what `--continue`
+and a once-paid toolchain are), so it only ever grows. It touches a session only
+when no run of it is in progress, and only when nothing has touched it for the
+age - an ephemeral session's state, which nobody will resume, goes at any age.
 
 `--vmm libvirt` talks to `qemu:///session` - qemu runs as you, reads the
 images under your home, and uses the same taps. `--gpu` switches to
