@@ -241,6 +241,25 @@ still running. It could also move other branches of that repository - as an
 agent on the host could - and nothing outside the repository is reachable.
 `--copy` gives the old behaviour: a copy, with commits fetched back at the end.
 
+**A VM nobody will resume is `--ephemeral`.** Everything a run leaves in
+`state/` is kept by default so the next run can `--continue` and so a rebuilt
+toolchain is not built twice; a caller that starts dozens of short-lived VMs a
+day and never comes back keeps all of it forever, which is how state/ reached
+800G and filled a root filesystem. With `--ephemeral` (or
+`FIRECODE_EPHEMERAL=1` for a caller that cannot pass flags) the session's
+layer, agent home, working tree and lock are removed when the VM stops - after
+the work is copied out, never before, because the copy-out is the only copy
+there is:
+
+```sh
+firecode claude --ephemeral "try the upgrade and tell me if it builds"
+firecode down            # ...and prints how much disk that gave back
+```
+
+A copy-out that fails keeps every file and says where, and `firecode extract`
+reads it back out of the src drive. The project's layer goes too - that is the
+point, and it is why this is a flag and not a default.
+
 
 The guest root is not a disk, it is a stack, assembled by an initramfs before
 the guest boots:

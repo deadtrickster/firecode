@@ -729,6 +729,149 @@ PY
 	check "the spawn server reads the same FIRECODE_RUNS" "$rn" "$out"
 }
 
+# A DISK NOBODY WILL RESUME SHOULD NOT OUTLIVE THE WORK.
+#
+# An ephemeral run removes its own state when it stops - but only after the
+# copy-out is published, because that is the only copy of what the run
+# produced. Both halves are tested here, with the functions on their own: the
+# publishing side is a run directory with one line in it, so no VM is needed to
+# say what happens when it holds `done`, `none` or `failed`.
+test_ephemeral_state_goes_with_the_work() {
+	local st rd slug out proj
+	st="$WORK/ephstate"
+	rd="$WORK/ephrun"
+	slug="testproj-89abcdef"
+	proj="$WORK/ephproj"
+	mkdir -p "$proj"
+
+	count_in() { find "$1" -mindepth 1 -maxdepth 1 | wc -l; }
+
+	mkstate_e() {
+		rm -rf "$st" "$rd"
+		mkdir -p "$st" "$rd"
+		: >"$st/$slug.ext4"
+		: >"$st/$slug-src.ext4"
+		# 64K of real bytes: a size has to be measured, not assumed.
+		dd if=/dev/zero of="$st/$slug-layer.ext4" bs=1024 count=64 status=none
+		: >"$st/$slug.lock"
+		: >"$st/$slug.layers"
+		: >"$st/$slug.ephemeral"
+	}
+
+	# The function under test, with its two collaborators stubbed.
+	release_e() {
+		local state=$1
+		(
+			log() { printf 'log: %s\n' "$*" >&2; }
+			session_in_use() { [[ ${USED_BY_ANOTHER:-0} == 1 ]]; }
+			eval "$(sed -n '/^session_state_files() {$/,/^}$/p' "$FIRECODE")"
+			eval "$(sed -n '/^ephemeral_release() {$/,/^}$/p' "$FIRECODE")"
+			# shellcheck disable=SC2034  # read by the eval'd ephemeral_release
+			STATE_DIR="$st" RUN_DIR="$rd" RUN_ID=firecode-20260101-000000-1 SLUG="$slug"
+			printf '%s\n' "$state" >"$rd/copy_out"
+			ephemeral_release 2>&1
+		)
+	}
+
+	mkstate_e
+	out=$(USED_BY_ANOTHER=0 release_e "done $WORK/result")
+	check "the state goes once the work is out" "0" "$(count_in "$st")"
+	out=$(cat "$rd/state_freed" 2>/dev/null || echo missing)
+	if [[ $out =~ ^[0-9]+$ ]] && ((out > 60000)); then
+		ok "and how much it freed is a measured number ($out bytes)"
+	else
+		no "and how much it freed is a measured number" "state_freed is [$out]"
+	fi
+
+	mkstate_e
+	out=$(USED_BY_ANOTHER=0 release_e "failed the run ended (status 143) before the copy-out finished")
+	check "a copy-out that failed keeps every file" "6" "$(count_in "$st")"
+	contains "and says which files it kept" "$st/$slug" "$out"
+	contains "and how to read the work out of them" "firecode extract" "$out"
+	check "and records no number it did not measure" "no" \
+		"$([[ -f $rd/state_freed ]] && echo yes || echo no)"
+
+	mkstate_e
+	out=$(USED_BY_ANOTHER=0 release_e none)
+	check "a discarded run's state goes too" "0" "$(count_in "$st")"
+
+	mkstate_e
+	out=$(USED_BY_ANOTHER=1 release_e "done $WORK/result")
+	check "state another VM of the project is using stays" "6" "$(count_in "$st")"
+	contains "and it says why" "another VM is using" "$out"
+
+	# What `down` prints. It reads the run's own record rather than measuring.
+	mkstate_e
+	printf 'ephemeral\n' >"$rd/ephemeral"
+	printf '65536\n' >"$rd/state_freed"
+	out=$(
+		log() { printf 'log: %s\n' "$*" >&2; }
+		eval "$(sed -n '/^ephemeral_report() {$/,/^}$/p' "$FIRECODE")"
+		STATE_DIR="$st" ephemeral_report "$rd" 2>&1
+	)
+	contains "down says what an ephemeral stop gave back" "64KB" "$out"
+	printf 'ephemeral\n' >"$rd/ephemeral"
+	printf 'not a number\n' >"$rd/state_freed"
+	out=$(
+		log() { printf 'log: %s\n' "$*" >&2; }
+		eval "$(sed -n '/^ephemeral_report() {$/,/^}$/p' "$FIRECODE")"
+		STATE_DIR="$st" ephemeral_report "$rd" 2>&1
+	)
+	contains "and an unreadable number is zero rather than a crash" "0B" "$out"
+
+	# The flag itself, and the variable a caller without flags uses. A dry run
+	# says what it would do, which is enough to prove both were read - and it is
+	# pointed at an empty cache so it does not need this host's images built.
+	local cache="$WORK/ephcache"
+	mkdir -p "$cache/images"
+	out=$(FIRECODE_CACHE="$cache" FIRECODE_RUNS="$WORK/ephruns" "$FIRECODE" exec \
+		--workdir "$proj" --dry-run --ephemeral -- true 2>&1)
+	contains "exec takes --ephemeral" "this session's state is removed" "$out"
+	out=$(FIRECODE_CACHE="$cache" FIRECODE_EPHEMERAL=1 FIRECODE_RUNS="$WORK/ephruns" \
+		"$FIRECODE" exec --workdir "$proj" --dry-run -- true 2>&1)
+	contains "and FIRECODE_EPHEMERAL=1 does the same" "this session's state is removed" "$out"
+	out=$(FIRECODE_CACHE="$cache" FIRECODE_RUNS="$WORK/ephruns" "$FIRECODE" exec \
+		--workdir "$proj" --dry-run -- true 2>&1)
+	if [[ $out == *"state is removed"* ]]; then
+		no "nothing is ephemeral unless it is asked for" "$out"
+	else
+		ok "nothing is ephemeral unless it is asked for"
+	fi
+}
+
+# AND THE SAME THING WITH A REAL VM IN IT.
+#
+# The host-side test above pins the rule; this one pins the whole run: a VM
+# booted --ephemeral, its work copied out, and nothing of its session left in
+# state/. A separate project, because a session's files are exactly what the
+# other state tests leave behind.
+test_ephemeral_vm_releases_state() {
+	if ((QUICK)); then
+		ok "an ephemeral VM releases its state when it stops (skipped, needs a VM)"
+		return
+	fi
+	local proj state slug out res
+	proj="$WORK/ephvmproj"
+	state=${FIRECODE_STATE:-$ROOT/state}
+	rm -rf "$proj"
+	mkdir -p "$proj"
+	echo "# ephemeral" >"$proj/README.md"
+	git -C "$proj" init -q 2>/dev/null
+	git -C "$proj" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+		commit -qm init --allow-empty >/dev/null 2>&1
+	slug="$(basename "$proj" | tr -c 'A-Za-z0-9._-' '-')-$(printf '%s' "$proj" | sha256sum | cut -c1-8)"
+
+	out=$(timeout 600 "$FIRECODE" exec --project "$proj" --no-jail --no-net --ephemeral \
+		-- sh -c 'echo worked >> README.md' 2>&1)
+	check "the work comes back from an ephemeral VM" "yes" \
+		"$(printf '%s\n' "$out" | grep -q '^ *result:' && echo yes || echo no)"
+	res=$(printf '%s\n' "$out" | sed -n 's/^ *result: *//p' | head -1)
+	check "and it is really there" "yes" "$([[ -d $res ]] && echo yes || echo no)"
+	check "no state file of that session is left" "0" \
+		"$(find "$state" -maxdepth 1 -name "$slug*" 2>/dev/null | wc -l)"
+	contains "and the run says what it removed" "ephemeral: removed" "$out"
+}
+
 test_ro_image_cached() {
 	local project ref out1
 	ref="$WORK/testref"
@@ -2596,6 +2739,8 @@ run_test gc_older_than
 run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
 run_test state_and_runs_are_relocatable
+run_test ephemeral_state_goes_with_the_work
+run_test ephemeral_vm_releases_state
 run_test no_relays
 run_test concurrent_runs
 run_test ro_image_cached

@@ -180,6 +180,12 @@ OPENCODE_CONF="${FIRECODE_OPENCODE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/openc
 # ask for, and --mem/--vcpu still win over both.
 MEM=${FIRECODE_MEM:-4096}
 VCPU=${FIRECODE_VCPU:-4}
+# A run nobody will resume: its state files go when the work has been copied
+# out. --ephemeral, or FIRECODE_EPHEMERAL=1 for a caller that starts dozens of
+# short-lived VMs a day and never returns to them - which is what turned state/
+# into 800G and filled the root filesystem on 2026-11-13.
+EPHEMERAL=0
+if [[ ${FIRECODE_EPHEMERAL:-0} == 1 ]]; then EPHEMERAL=1; fi
 # What a workspace layer may hold before it is full. A package's first rounds are
 # rust + node + a debug test build, and 16G ran out on exactly that: `ld` died
 # with a Bus error on a harnessd test binary. The file is sparse, so an empty one
@@ -1246,6 +1252,18 @@ ensure_state_drive() {
 	img="$STATE_DIR/$slug.ext4"
 	mkdir -p "$STATE_DIR"
 
+	# SAY WHOSE THIS STATE IS BEFORE MAKING ANY OF IT. An ephemeral session's
+	# files are reclaimable at any age, and the mark is what tells gc so - a
+	# marker written after the drive would leave a crash window in which a
+	# fresh 3G file looks like an ordinary session's. A run that is not
+	# ephemeral takes the mark away: this session is wanted again, whatever the
+	# last one was.
+	if ((EPHEMERAL)); then
+		printf '%s\n' "${RUN_ID:-$BASHPID}" >"$STATE_DIR/$slug.ephemeral"
+	else
+		rm -f "$STATE_DIR/$slug.ephemeral"
+	fi
+
 	if [[ ! -f $img ]]; then
 		local seed
 		seed=$(mktemp -d)
@@ -1385,6 +1403,67 @@ snapshot_parts() {
 	echo "$STATE_DIR/$slug.ext4:agent"
 	echo "$STATE_DIR/$slug-src.ext4:src"
 	echo "$STATE_DIR/$slug-root.ext4:root"
+}
+
+# EVERY FILE A SESSION OWNS IN state/, named once.
+#
+# Three commands ask this question - the ephemeral release, the gc state pass
+# and doctor - and a suffix missing from one of them is a disk left behind by
+# the other two. The lock is in the list because it is a file per project that
+# outlives every run; the markers because they describe the drives and mean
+# nothing without them.
+#
+# `state reset` deliberately does not use it: it forgets a session, and the
+# layer is the toolchain cache rather than history - --fresh-root is its verb.
+#
+# Paths that are not there are not printed, so a caller can count what it got.
+session_state_files() {
+	local slug=$1 f
+	for f in "$STATE_DIR/$slug.ext4" "$STATE_DIR/$slug-layer.ext4" \
+		"$STATE_DIR/$slug-src.ext4" "$STATE_DIR/$slug-root.ext4" \
+		"$STATE_DIR/$slug.lock" "$STATE_DIR/$slug.layers" \
+		"$STATE_DIR/$slug.imported" "$STATE_DIR/$slug.ephemeral"; do
+		[[ -e $f ]] && printf '%s\n' "$f"
+	done
+	return 0
+}
+
+# The sessions that have state, one slug per line.
+#
+# Named by what is on disk rather than by a registry, because these files
+# outlive the runs that made them and there is nothing else to ask. img-* and
+# ro-* are the image caches (an imported docker layer, a packed --add-dir tree)
+# and belong to no session.
+state_sessions() {
+	local f base
+	for f in "$STATE_DIR"/*.ext4; do
+		[[ -e $f ]] || continue
+		base=$(basename "$f" .ext4)
+		case "$base" in
+		img-* | ro-*) continue ;;
+		esac
+		base=${base%-layer}
+		base=${base%-src}
+		base=${base%-root}
+		printf '%s\n' "$base"
+	done | sort -u
+}
+
+# Is a VM of this session running now? Asked of the run directories, the same
+# way `list`, `ps` and gc ask it - a cgroup holding processes - so nothing here
+# can decide a live VM is finished and delete the disk under it.
+#
+# The run doing the asking names itself and is skipped: a run that is stopping
+# is still in its own cgroup for a moment, and it is the one about to release
+# what it holds.
+session_in_use() {
+	local want=$1 skip=${2:-} id proj
+	[[ -d $RUNS ]] || return 1
+	while IFS=$'\t' read -r id proj _ _; do
+		[[ -n $skip && $id == "$skip" ]] && continue
+		[[ $(project_slug "$proj") == "$want" ]] && return 0
+	done < <(live_runs 2>/dev/null)
+	return 1
 }
 
 # Files in or out of a VM that is running now. Firecracker cannot mount a host
@@ -2679,6 +2758,13 @@ cmd_up() {
 			passthru+=(--no-sync)
 			shift
 			;;
+		--ephemeral)
+			# Taken here as well as passed on, so this process can say what
+			# the VM's lifecycle is when it reports the VM up.
+			EPHEMERAL=1
+			passthru+=(--ephemeral)
+			shift
+			;;
 		--worktree)
 			# The VM is the WORKTREE's, not the directory this was run in -
 			# so that is what to wait for. Waiting on the run directory's own
@@ -2789,9 +2875,12 @@ USAGE
 			# Which lifecycle this is, said up front: whether stopping it
 			# brings the work back is not something to find out afterwards.
 			if ((nosync)); then
-				log "ephemeral: --no-sync, nothing is copied out when it stops"
+				log "no copy-out: --no-sync, so nothing comes back when it stops"
 			else
 				log "the work is copied out when it stops: firecode down waits for it and prints where"
+			fi
+			if ((EPHEMERAL)); then
+				log "ephemeral: its state files are removed once the work is out; down prints what that freed"
 			fi
 			return 0
 		fi
@@ -4188,6 +4277,9 @@ Stop a VM. Its copy of the project is delivered beside the project as
 <project>-<timestamp> - unless:
   --discard   nothing comes back: the VM ran things, it did not make anything
   --no-wait   return at once; the copy-out finishes in the background
+
+An --ephemeral VM's state files are removed once the work is out, and this
+prints how much disk that gave back.
 USAGE
 			return 0
 			;;
@@ -4284,6 +4376,7 @@ USAGE
 	fi
 	down_wait_copy_out "$rd"
 	down_report_verdict "$rd"
+	ephemeral_report "$rd"
 }
 
 # The gate's verdict, as the run recorded it - not as anybody described it.
@@ -4344,6 +4437,30 @@ down_wait_copy_out() {
 	failed*) die "copy-out ${state}" ;;
 	*) die "copy-out: unreadable record '$state' in $rd/copy_out" ;;
 	esac
+}
+
+# What an ephemeral VM gave back, once it stopped.
+#
+# `down` is a different process from the run that removes the files, so it waits
+# for the run's own record - runs/<id>/state_freed - rather than claiming a
+# number it did not measure. Bounded, because the removing process may have
+# died first, and then the honest answer is that the files are still there.
+ephemeral_report() {
+	local rd=$1 bytes waited=0
+	[[ -f $rd/ephemeral ]] || return 0
+	while ((waited < 40)) && [[ ! -f $rd/state_freed ]]; do
+		sleep 0.25
+		waited=$((waited + 1))
+	done
+	if [[ ! -f $rd/state_freed ]]; then
+		log "ephemeral: its state files are still in $STATE_DIR - the run did not get to remove them"
+		log "  firecode gc --state reclaims them"
+		return 0
+	fi
+	bytes=$(cat "$rd/state_freed" 2>/dev/null || echo 0)
+	[[ $bytes =~ ^[0-9]+$ ]] || bytes=0
+	log "ephemeral: freed $(numfmt --to=iec --suffix=B "$bytes") of VM state in $STATE_DIR"
+	return 0
 }
 
 cmd_enter() {
@@ -5078,6 +5195,69 @@ cancel_marker() {
 	return 0
 }
 
+# WHAT AN EPHEMERAL RUN DOES WITH ITS STATE, ONCE ITS WORK IS OUT.
+#
+# The order is the whole design. The copy-out is the only copy of anything the
+# run produced, so the state files go only after runs/<id>/copy_out says the
+# work is delivered (`done <path>`) or that there was nothing to deliver
+# (`none`, which is --discard, --no-sync, or a project the guest did not
+# change). A copy-out that failed or never finished keeps every file and says
+# where: the VM may be gone but its work is still inside the src drive, and
+# `firecode extract` is what reads it back.
+#
+# Never while another VM of the same project is up. Two runs of one project
+# share the layer and the agent home - the second gets a private copy - and
+# deleting the shared one under a live run is the failure this whole change is
+# here to prevent, in the other direction.
+#
+# The number is written to runs/<id>/state_freed, because `down` is another
+# process and reporting it needs a fact rather than a guess.
+ephemeral_release() {
+	[[ -n ${SLUG:-} && -n ${RUN_DIR:-} && -d ${RUN_DIR:-} ]] || return 0
+	local state f sz bytes=0 n=0
+	# Nothing of this session's on disk: a dry run, or a VM that died before
+	# its drives were made. Nothing to release, and nothing to say.
+	local -a files=()
+	while IFS= read -r f; do
+		files+=("$f")
+	done < <(session_state_files "$SLUG")
+	((${#files[@]})) || return 0
+	state=$(cat "$RUN_DIR/copy_out" 2>/dev/null || true)
+	case "$state" in
+	done\ * | none) ;;
+	*)
+		log "ephemeral: keeping this session's state - its copy-out did not finish (${state:-not started})"
+		log "  what it holds is in ${files[*]}"
+		log "  the work is in that src drive: firecode extract ${RUN_DIR##*/}"
+		return 0
+		;;
+	esac
+	if session_in_use "$SLUG" "${RUN_ID:-}"; then
+		log "ephemeral: another VM is using this project's state, so it stays"
+		return 0
+	fi
+	# Our own lock is on a file about to be unlinked: close it, so the next run
+	# of this project locks a fresh inode rather than a deleted one.
+	if [[ -n ${STATE_FD:-} ]]; then
+		exec {STATE_FD}>&- 2>/dev/null || true
+		STATE_FD=""
+	fi
+	# Sizes first: du after the rm reports nothing, and the number is the point.
+	for f in "${files[@]}"; do
+		sz=$(du -B1 "$f" 2>/dev/null | cut -f1) || sz=0
+		[[ $sz =~ ^[0-9]+$ ]] || sz=0
+		bytes=$((bytes + sz))
+	done
+	for f in "${files[@]}"; do
+		rm -f "$f" 2>/dev/null && n=$((n + 1))
+	done
+	# Best effort: this runs in the exit trap, and a run directory somebody has
+	# already swept is not a reason to skip the rest of the teardown.
+	printf '%s\n' "$bytes" >"$RUN_DIR/state_freed" 2>/dev/null || true
+	log "ephemeral: removed $n state file(s), $(numfmt --to=iec --suffix=B "$bytes") reclaimed in $STATE_DIR"
+	return 0
+}
+
 cleanup_run() {
 	local status=$?
 	trap - EXIT INT TERM PIPE HUP
@@ -5111,6 +5291,9 @@ cleanup_run() {
 	if [[ -n $STTY_SAVED ]]; then stty "$STTY_SAVED" 2>/dev/null || true; fi
 	relays_down
 	net_down
+	# After the VM and the relays are gone, and after the copy-out has been
+	# recorded - which is where an ephemeral run's state stops being needed.
+	if ((EPHEMERAL)); then ephemeral_release || true; fi
 	if [[ $KEEP -eq 0 ]]; then
 		# rm can fail here - the jailer makes device nodes as root - and in
 		# "test && command" it is the command's failure that set -e acts on,
@@ -5317,6 +5500,13 @@ launch() {
 			;;
 		--keep)
 			KEEP=1
+			shift
+			;;
+		--ephemeral)
+			# Nobody will resume this VM, so its state files are removed once
+			# the work has been copied out. Not before: the copy-out is the
+			# only copy of anything the run produced.
+			EPHEMERAL=1
 			shift
 			;;
 		--cgroups)
@@ -5644,6 +5834,10 @@ launch() {
 
 	printf '%s\n' "$WORKDIR" >"$RUN_DIR/project"
 	printf '%s\n' "$JAIL_DIR" >"$RUN_DIR/jail"
+	# What the run is for, on the run, before anything expensive happens. `down`
+	# reads it to say what the stop gave back, and the launcher reads it to
+	# decide whether to remove this session's state once the work is out.
+	if ((EPHEMERAL)); then printf 'ephemeral\n' >"$RUN_DIR/ephemeral"; fi
 	# The process that will do the copy-out once the VM stops. `down` waits on
 	# copy_out while this is alive, and knows not to once it is not.
 	printf '%s\n' "$BASHPID" >"$RUN_DIR/launcher"
@@ -5698,6 +5892,9 @@ launch() {
 	trap 'cleanup_run; exit 141' PIPE
 
 	log "run $id  agent=$AGENT  mode=$mode  project=$WORKDIR  mem=${MEM}M  vcpu=$VCPU"
+	if ((EPHEMERAL)); then
+		log "ephemeral: this session's state is removed once its work is copied out"
+	fi
 
 	# Which provider is being stood in for, decided before anything is staged.
 	#
@@ -8587,6 +8784,11 @@ options (before the agent's own arguments):
   --dry-run       say what would happen and stop, without building or booting
   --no-sync       do not copy /src back out
   --keep          keep the run's drives afterwards
+  --ephemeral     nobody will resume this VM: when it stops, its state files
+                  (layer, agent home, working tree, lock) are removed, but only
+                  once the work has been copied out. `down` prints what that
+                  freed. Also FIRECODE_EPHEMERAL=1 for a caller that starts
+                  dozens of short-lived VMs and never resumes them
   --cgroups       also cap the host-side process via jailer cgroups
   --debug-boot    verbose guest boot
   --no-auto-flags do not add -p / --dangerously-skip-permissions
