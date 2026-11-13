@@ -688,9 +688,49 @@ test_gc_keeps_unreachable_work() {
 	contains "and how to land them" "firecode land firecode-20260818-101011-2222" "$out"
 }
 
+# WHERE THE DISKS ARE IS A DECISION, NOT A CONSTANT.
+#
+# state/ and runs/ are the two directories a host runs out of - 800G of state
+# filled / on 2026-11-13 and killed three running VMs - so both are named by a
+# variable. This checks that a command reads the variable rather than the
+# default, for the CLI and for the spawn server, because a second program
+# building these paths by hand is a host that moves its state and has half of
+# firecode still writing to the old disk.
+test_state_and_runs_are_relocatable() {
+	local st rn proj out
+	st="$WORK/reloc-state"
+	rn="$WORK/reloc-runs"
+	proj="$WORK/relocproj"
+	rm -rf "$st" "$rn" "$proj"
+	mkdir -p "$st" "$rn" "$proj"
+	: >"$st/testproj-relocated.ext4"
+
+	out=$(FIRECODE_STATE="$st" "$FIRECODE" state list 2>&1)
+	contains "state list reads FIRECODE_STATE" "testproj-relocated" "$out"
+
+	# A finished run, and nothing else: `list` counts it from wherever RUNS
+	# points, using the run directory as the only record there is.
+	mkdir -p "$rn/firecode-20200101-000000-1"
+	printf '%s\n' "$proj" >"$rn/firecode-20200101-000000-1/project"
+	printf 'relocated\n' >"$rn/firecode-20200101-000000-1/name"
+	printf '999999\n' >"$rn/firecode-20200101-000000-1/launcher"
+	out=$(FIRECODE_RUNS="$rn" "$FIRECODE" list 2>&1)
+	contains "list reads FIRECODE_RUNS" "1 finished run" "$out"
+
+	out=$(
+		FIRECODE_RUNS="$rn" python3 - "$ROOT/mcp/firecode-spawn.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("spawn", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(mod.RUNS_DIR)
+PY
+	)
+	check "the spawn server reads the same FIRECODE_RUNS" "$rn" "$out"
+}
+
 test_ro_image_cached() {
 	local project ref out1
-	project=$(make_project)
 	ref="$WORK/testref"
 	mkdir -p "$ref"
 	echo "reference material" >"$ref/note.txt"
@@ -2555,6 +2595,7 @@ run_test dead_runs_are_cheap
 run_test gc_older_than
 run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
+run_test state_and_runs_are_relocatable
 run_test no_relays
 run_test concurrent_runs
 run_test ro_image_cached

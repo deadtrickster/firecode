@@ -126,7 +126,11 @@ BRIEF = _load("brief.md").decode("utf-8", "replace").strip()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIRECODE = os.path.join(ROOT, "bin", "firecode")
-RUNS_DIR = os.path.join(ROOT, "runs")
+# The same two variables bin/firecode reads. A host that keeps VM state on
+# another disk keeps its run records there too, and this server writes run
+# logs and chat marks beside them - the default would be a directory firecode
+# never writes to, and every reader here would find nothing.
+RUNS_DIR = os.path.abspath(os.environ.get("FIRECODE_RUNS") or os.path.join(ROOT, "runs"))
 
 # What a caller on the HOST presents. A VM is known by its connection - see
 # _peer - and needs nothing; the host is everyone else, which includes any web
@@ -388,7 +392,7 @@ class Runs:
 
             run_id = uuid.uuid4().hex[:12]
             workdir = self.cfg.projects[project]
-            log_dir = os.path.join(ROOT, "runs", "spawn")
+            log_dir = os.path.join(RUNS_DIR, "spawn")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, run_id + ".log")
 
@@ -570,7 +574,7 @@ class Runs:
             # disk - and a caller polling a run it started ten minutes ago
             # gets "no such run", which reads as "you invented that id" rather
             # than "the server was restarted underneath you".
-            log = os.path.join(ROOT, "runs", "spawn", f"{run_id}.log")
+            log = os.path.join(RUNS_DIR, "spawn", f"{run_id}.log")
             if os.path.isfile(log):
                 tail = ""
                 try:
@@ -1561,7 +1565,7 @@ def call_tool(cfg, runs, name, args, caller_run=None):
         # never arrived. A caller then waits its full timeout and concludes it
         # is being ignored, which is exactly what happened.
         limit = min(int(args.get("timeout", 300)), 900)
-        mark_dir = os.path.join(ROOT, "runs")
+        mark_dir = RUNS_DIR
         mark_file = os.path.join(
             mark_dir, "chat-mark-mcp-" + re.sub(r"[^A-Za-z0-9._-]", "-", who))
 

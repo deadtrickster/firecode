@@ -45,8 +45,10 @@ SELF=$(readlink -f "$0")
 # to - so a bare location guess reads the wrong disk and reports nothing to
 # reap, which is a comfortable and completely wrong answer.
 ROOT=${FIRECODE_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}
-STATE_DIR="$ROOT/state"
-RUNS="$ROOT/runs"
+# The same two variables bin/firecode reads, so this script reaps the disks a
+# run actually wrote - not the ones a defaulted path points at.
+STATE_DIR=$(realpath -m "${FIRECODE_STATE:-$ROOT/state}")
+RUNS=$(realpath -m "${FIRECODE_RUNS:-$ROOT/runs}")
 
 days=14
 apply=no

@@ -24,7 +24,7 @@ usage: boot-timings.sh [RUNS_DIR...]
 
 Reads runs/<id>/console.log (and runs-archive/*) and prints, per run, where the
 boot time went, then the median across runs. Default directories: runs and
-runs-archive in this checkout.
+runs-archive where firecode writes them - $ROOT/runs, or FIRECODE_RUNS.
 EOF
 }
 
@@ -37,7 +37,10 @@ esac
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 dirs=("$@")
-((${#dirs[@]})) || dirs=("$ROOT/runs" "$ROOT/runs-archive")
+# The directory a run writes to, as bin/firecode resolves it: FIRECODE_RUNS moves
+# the runs elsewhere, and this would then read an empty one and print nothing.
+RUNS=$(realpath -m "${FIRECODE_RUNS:-$ROOT/runs}")
+((${#dirs[@]})) || dirs=("$RUNS" "$RUNS-archive")
 
 # firecode-YYYYmmdd-HHMMSS-<pid>: the wall clock the run started, to the second.
 id_epoch() {

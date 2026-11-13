@@ -27,6 +27,11 @@ A run owns, and is solely responsible for releasing:
 is a plain directory of plain files on purpose - any process can read it, and
 none of it needs the process that wrote it to still exist.
 
+`runs/` and `state/` are named by `FIRECODE_RUNS` and `FIRECODE_STATE` and are
+nothing else's to build: one line at the top of `bin/firecode` reads both once
+and every path here follows it, so a host can put the disks on another
+filesystem without anything reading the default.
+
 ## Lifetime is a cgroup, not a process tree
 
 Every run gets a subtree under the user's delegated slice:

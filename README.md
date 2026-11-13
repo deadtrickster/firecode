@@ -880,6 +880,30 @@ the state drive.
 `firecode keys` prints the bytes the guest receives for each keypress, which is
 the tool for "this key does nothing in the TUI".
 
+## Where the disks live
+
+Two directories, both read once at startup and used by every path firecode
+builds:
+
+| variable | default | what is in it |
+|---|---|---|
+| `FIRECODE_STATE` | `<checkout>/state` | the disks: per-project layers, agent homes, src drives, locks, checkpoints |
+| `FIRECODE_RUNS` | `<checkout>/runs` | one small directory per run: console log, copy-out record, result path |
+
+State is the one that grows: a layer is 32G sparse and tens of gigabytes real
+after a build, an agent home is 3G, and a src drive is 4G. On a host with a
+small root filesystem, put it somewhere with room:
+
+```sh
+export FIRECODE_STATE=/build/firecode-state
+export FIRECODE_RUNS=/build/firecode-runs   # optional; runs are small
+```
+
+Both are inherited by every run and by the spawn server, `reap-layers.sh` and
+`boot-timings.sh`, so nothing keeps reading the default behind your back.
+`firecode doctor` says how much state there is and how much room is left where
+it lives.
+
 ## Housekeeping
 
 ```sh

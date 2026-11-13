@@ -75,8 +75,18 @@ CONVERTER_IMAGE="${FIRECODE_CONVERTER_IMAGE:-firecode/rootfs:latest}"
 GUEST="$ROOT/guest"
 SCRIPTS="$ROOT/scripts"
 VENDOR="$CACHE/vendor/bin"
-RUNS="$ROOT/runs"
-STATE_DIR="$ROOT/state"
+# WHERE THE DISKS LIVE, read once here and never re-derived.
+#
+# Both default to the checkout, which is what every path used to say, and both
+# are overridable so a host can keep VM state on a big disk instead of on root:
+# state/ is a tens-of-gigabytes-per-project cache and it filled / to 100% on
+# 2026-11-13, killing three running VMs. Nothing below builds one of these two
+# paths by hand - the answer is this line, so ONE variable moves all of it.
+#
+# Absolute, because a run happens in the project's directory and every relative
+# path would then mean something else from inside it.
+RUNS=$(realpath -m "${FIRECODE_RUNS:-$ROOT/runs}")
+STATE_DIR=$(realpath -m "${FIRECODE_STATE:-$ROOT/state}")
 JAIL_BASE="$ROOT/.jail"
 
 # The command as invoked, so a multiplexer session can re-run it verbatim.
@@ -8581,6 +8591,14 @@ options (before the agent's own arguments):
   --debug-boot    verbose guest boot
   --no-auto-flags do not add -p / --dangerously-skip-permissions
   --              everything after this goes to the agent verbatim
+
+where the disks go (also settable in the environment, read once):
+  FIRECODE_STATE DIR  VM state: layers, agent homes, src drives, locks
+                      (default: <checkout>/state, tens of GB per project)
+  FIRECODE_RUNS DIR   run records, console logs and copy-outs
+                      (default: <checkout>/runs, a few files per run)
+  Both are read once at startup and every path uses them, so a host can keep
+  VM state on a big disk: FIRECODE_STATE=/build/firecode-state firecode ...
 
 Given arguments, the agent runs unattended and the VM powers off when it is
 done. Given none, you get an interactive session on the guest console.
