@@ -8809,6 +8809,48 @@ doctor_host_linux() {
 		"systemd should delegate this to your user session - without it a child VM can outlive its parent"
 }
 
+# WHAT state/ IS COSTING, AND HOW MUCH OF IT NOBODY IS COMING BACK TO.
+#
+# The three numbers that answer "why is this host out of disk": how big the
+# state is, how much room is left where it lives, and how many sessions are only
+# being kept because nobody has looked at them. Allocated size, not apparent:
+# a layer is sparse, so 32G of file can be 2G of disk, and the disk is the thing
+# that runs out.
+#
+# A session is "stopped" when no run of it is in progress - neither a VM nor a
+# copy-out, which is run_alive's question.
+doctor_state() {
+	local size free sessions=0 busy=0 reclaimable=0 slug
+	if [[ ! -d $STATE_DIR ]]; then
+		doc_info "state" "none yet ($STATE_DIR)"
+		return 0
+	fi
+	size=$(du -sh "$STATE_DIR" 2>/dev/null | cut -f1)
+	free=$(df -Ph "$STATE_DIR" 2>/dev/null | awk 'NR == 2 { print $4 " free of " $2 }')
+	doc_info "state" "${size:-?} in $STATE_DIR (${free:-space unknown})"
+	index_runs_by_session
+	while IFS= read -r slug; do
+		[[ -n $slug ]] || continue
+		sessions=$((sessions + 1))
+		if [[ -n ${SESSION_RUNNING[$slug]:-} ]]; then
+			busy=$((busy + 1))
+		elif [[ -f $STATE_DIR/$slug.ephemeral ]]; then
+			reclaimable=$((reclaimable + 1))
+		fi
+	done < <(state_sessions)
+	if ((sessions == 0)); then
+		doc_info "sessions with state" "none"
+		return 0
+	fi
+	doc_info "sessions with state" \
+		"$sessions, $((sessions - busy)) stopped ($busy with a VM or run in progress)"
+	if ((reclaimable)); then
+		doc_info "reclaimable now" \
+			"$reclaimable ephemeral session(s) - firecode gc --state"
+	fi
+	return 0
+}
+
 cmd_doctor() {
 	echo "firecode doctor"
 	echo
@@ -8835,6 +8877,7 @@ cmd_doctor() {
 	fi
 	doc_info "disk for images and state" \
 		"$(df -h "$IMAGES" 2>/dev/null | awk 'NR==2{print $4" free of "$2}')"
+	doctor_state
 	# The same test the rest of the harness uses: the kernel publishes a
 	# separate PMU per core type, which is the only honest signal that this is
 	# a hybrid part - /proc/cpuinfo does not say so.

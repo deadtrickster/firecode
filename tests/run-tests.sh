@@ -800,6 +800,48 @@ test_gc_state_pass() {
 	fi
 }
 
+# WHY IS THIS HOST OUT OF DISK, ANSWERED BY ONE COMMAND.
+#
+# doctor has to say the three numbers somebody would otherwise work out by hand
+# from du, df and a listing: how much state there is, how much room is left
+# where it lives, and how many sessions nobody is coming back to. The run index
+# is set here rather than walked, because gc_state_pass's test owns that.
+test_doctor_reports_state() {
+	local st out
+	st="$WORK/docstate"
+	rm -rf "$st"
+	mkdir -p "$st"
+	: >"$st/alpha-11111111.ext4"
+	: >"$st/alpha-11111111-layer.ext4"
+	: >"$st/beta-22222222.ext4"
+	: >"$st/beta-22222222.ephemeral"
+	: >"$st/gamma-33333333-layer.ext4"
+
+	out=$(
+		# shellcheck disable=SC2034  # read by the eval'd doctor_state
+		declare -A SESSION_RUNNING=(["alpha-11111111"]=1)
+		# shellcheck disable=SC2034  # read by the eval'd doctor_state
+		declare -A SESSION_LAST_RUN=()
+		doc_info() { printf '  %-30s %s\n' "$1" "$2"; }
+		index_runs_by_session() { :; }
+		eval "$(sed -n '/^state_sessions() {$/,/^}$/p' "$FIRECODE")"
+		eval "$(sed -n '/^doctor_state() {$/,/^}$/p' "$FIRECODE")"
+		STATE_DIR="$st" RUNS="$WORK/no-such-runs" doctor_state 2>&1
+	)
+	contains "doctor says where the state is" "$st" "$out"
+	contains "and how much of the disk it holds" "sessions with state" "$out"
+	contains "and how many sessions are stopped" "3, 2 stopped (1 with a VM or run in progress)" "$out"
+	contains "and which are reclaimable at any age" "1 ephemeral session(s)" "$out"
+
+	# A host with no state at all is not an error, and does not print a size.
+	out=$(
+		doc_info() { printf '  %-30s %s\n' "$1" "$2"; }
+		eval "$(sed -n '/^doctor_state() {$/,/^}$/p' "$FIRECODE")"
+		STATE_DIR="$WORK/no-such-state" doctor_state 2>&1
+	)
+	contains "no state directory is said plainly" "none yet" "$out"
+}
+
 # A FULL DISK IS EVERYBODY'S DISK, SO IT IS CHECKED BEFORE A LAYER IS MADE.
 #
 # The guard's whole job is to refuse rather than to boot somewhere there is no
@@ -2948,6 +2990,7 @@ run_test gc_keeps_active_scratch
 run_test gc_keeps_unreachable_work
 run_test gc_state_pass
 run_test disk_guard_refuses_before_a_layer
+run_test doctor_reports_state
 run_test state_and_runs_are_relocatable
 run_test ephemeral_state_goes_with_the_work
 run_test ephemeral_vm_releases_state

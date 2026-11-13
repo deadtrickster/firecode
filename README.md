@@ -920,8 +920,10 @@ export FIRECODE_RUNS=/build/firecode-runs   # optional; runs are small
 
 Both are inherited by every run and by the spawn server, `reap-layers.sh` and
 `boot-timings.sh`, so nothing keeps reading the default behind your back.
-`firecode doctor` says how much state there is and how much room is left where
-it lives.
+`firecode doctor` answers "why is this host out of disk" in three lines: how
+much state there is, how much room is left on that filesystem, and how many
+sessions are stopped and still holding it (and of those, how many are ephemeral
+and reclaimable right now with `firecode gc --state`).
 
 **A full disk kills VMs that are not yours.** On 2026-11-13 state/ reached 800G,
 the root filesystem went to 100%, and three agents' VMs died mid-work with
