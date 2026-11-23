@@ -216,6 +216,7 @@ in_vm() {
 # must be what every firecode it starts reads. The failure that motivated all
 # of this - a test without a state override writing a session into the checkout
 # - is the third arm, asserted by name.
+# shellcheck disable=SC2030,SC2031  # REAL_STATE is set inside the arm's subshell on purpose
 test_state_dir_is_never_the_real_one() {
 	local guard out
 	guard=$(sed -n '/^refuse_real_state() {$/,/^}$/p' "$ROOT/tests/run-tests.sh")
@@ -403,7 +404,7 @@ test_state_lifecycle() {
 # target it has to say so - a pass that quietly gave up is how the disk filled
 # up the first time.
 test_gc_budget_pass() {
-	local st out target
+	local st out
 	st="$WORK/budgetstate"
 	rm -rf "$st"
 	mkdir -p "$st"
@@ -497,6 +498,7 @@ test_pool_primitives() {
 	contains "and removes what is untracked and ignored" "git clean -xffdq" "$cmd"
 	contains "keeping the caches that make pooling worth it" "-e target" "$cmd"
 	contains "and clearing the agent's conversation" "rm -rf ~/.claude/projects" "$cmd"
+	# shellcheck disable=SC2088  # the guest command's tilde, not this shell's
 	contains "and the shell history" "~/.bash_history" "$cmd"
 	cmd=$(
 		eval "$(sed -n '/^pool_reseed_command() {$/,/^}$/p' "$FIRECODE")"
@@ -516,7 +518,7 @@ test_pool_primitives() {
 # guest's address, ahead of nothing that would let it through, with the allowed
 # ports named before it when a host has any.
 test_host_guard_rules() {
-	local out rules
+	local out
 	rules() {
 		(
 			eval "$(sed -n '/^host_guard_ports() {$/,/^}$/p' "$FIRECODE")"
