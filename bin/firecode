@@ -233,12 +233,9 @@ OWNER="${FIRECODE_OWNER:-}"
 OWNER_PROJECT="${FIRECODE_OWNER_PROJECT:-}"
 # What the session is for: session, reviewer, ephemeral or test. It decides
 # what `state release` and gc do with it, so a word outside that set is a typo
-# that would silently make a reviewer's state look like a session's.
+# that would silently make a reviewer's state look like a session's. Checked
+# where `die` exists, before anything is built.
 PURPOSE="${FIRECODE_PURPOSE:-}"
-case "$PURPOSE" in
-"" | session | reviewer | ephemeral | test) ;;
-*) die "FIRECODE_PURPOSE is one of session, reviewer, ephemeral, test - not: $PURPOSE" ;;
-esac
 # May this session's VM be kept warm for the next one of its project instead of
 # being deleted when the session ends? --reuse, or FIRECODE_REUSABLE=1.
 REUSABLE=0
@@ -432,6 +429,13 @@ die() {
 	echo "[firecode] error: $*" >&2
 	exit 1
 }
+
+# A PURPOSE from the environment is checked as soon as there is a `die` to say
+# so with: the release path decides what to delete from it.
+case "${PURPOSE:-}" in
+"" | session | reviewer | ephemeral | test) ;;
+*) die "FIRECODE_PURPOSE is one of session, reviewer, ephemeral, test - not: ${PURPOSE:-}" ;;
+esac
 
 # debugfs and mkfs.ext4 live in /usr/sbin, which is not always on a user PATH.
 sbin() {

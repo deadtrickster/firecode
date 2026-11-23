@@ -15,6 +15,45 @@ ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 FIRECODE="$ROOT/bin/firecode"
 WORK=$(mktemp -d /tmp/firecode-tests.XXXXXX)
 
+# THE SUITE NEVER WRITES INTO THE REAL state/.
+#
+# A test that runs the real binary on a temp project used to make a session in
+# the checkout's own state/: it-s-a-project-…, ro-my-notes-…, childproj-…, and
+# 18 of them were found on the host, inside 475G of sessions that no run would
+# ever resume. Nothing named them and nothing reclaimed them.
+#
+# So the suite runs against a state directory of its own, and refuses a value
+# that is the real one - which is what an operator who exported FIRECODE_STATE
+# for their own runs hands it by accident.
+REAL_STATE=$(realpath -m "$ROOT/state")
+refuse_real_state() {
+	local want=${1:-} real_want
+	if [[ -z $want ]]; then
+		echo "refusing to run tests: FIRECODE_STATE is unset, and a test must not
+       create sessions in this checkout's own state/ ($REAL_STATE)." >&2
+		return 2
+	fi
+	real_want=$(realpath -m "$want")
+	if [[ $real_want == "$REAL_STATE" ]]; then
+		echo "refusing to run tests against the real state directory: $real_want
+       Every test gets a temp one; unset FIRECODE_STATE and re-run." >&2
+		return 2
+	fi
+	if [[ $real_want == "$ROOT" || $real_want == "$ROOT"/* ]]; then
+		echo "refusing to run tests with state inside this checkout: $real_want" >&2
+		return 2
+	fi
+	return 0
+}
+# Set for every firecode this suite starts, so the default - this checkout's
+# state/ - is never reached. Unset means the suite picks its own directory
+# rather than refusing: no flags is the normal way to run it.
+if [[ -z ${FIRECODE_STATE:-} ]]; then
+	export FIRECODE_STATE="$WORK/state"
+fi
+refuse_real_state "$FIRECODE_STATE" || exit 2
+mkdir -p "$FIRECODE_STATE" || exit 2
+
 QUICK=0
 ONLY=""
 PASS=0
@@ -36,7 +75,6 @@ done
 
 cleanup() {
 	rm -rf "$WORK"
-	rm -rf "$ROOT/state/testproj-"* "$ROOT/state/ro-testref-"* 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -171,6 +209,79 @@ in_vm() {
 # The one that matters most: importing a session must not touch the host's
 # copy of it. Run against the real ~/.claude, because that is the thing that
 # would hurt, and the guarantee is that it is only ever read.
+# THE SUITE'S OWN STATE DIRECTORY, AND THE GUARD THAT KEEPS IT THAT WAY.
+#
+# Two arms, because one cannot tell "the guard works" from "nothing was
+# checked": the real directory must be refused, and the suite's own temp one
+# must be what every firecode it starts reads. The failure that motivated all
+# of this - a test without a state override writing a session into the checkout
+# - is the third arm, asserted by name.
+test_state_dir_is_never_the_real_one() {
+	local guard out
+	guard=$(sed -n '/^refuse_real_state() {$/,/^}$/p' "$ROOT/tests/run-tests.sh")
+	if [[ -z $guard ]]; then
+		no "the state guard can be read out of the suite" "not found"
+		return
+	fi
+
+	# The function itself, in a subshell of its own, so the arm is the suite's
+	# rule rather than a restatement of it here.
+	arm() {
+		local want=$1 st=$REAL_STATE
+		(
+			eval "$guard"
+			REAL_STATE=$st
+			refuse_real_state "$want"
+		) 2>&1
+	}
+
+	if out=$(arm ""); then
+		no "an unset FIRECODE_STATE is refused" "exited 0"
+	else
+		ok "an unset FIRECODE_STATE is refused"
+	fi
+	contains "and the refusal says what is wrong" "FIRECODE_STATE is unset" "$out"
+
+	if out=$(arm "$REAL_STATE"); then
+		no "the real state directory is refused" "exited 0"
+	else
+		ok "the real state directory is refused"
+	fi
+	contains "and names the directory" "$REAL_STATE" "$out"
+
+	# A temp directory of our own is what it accepts, which is what keeps this
+	# from being a guard that refuses everything.
+	if out=$(arm "$WORK/guard-ok"); then
+		ok "a temp directory is accepted"
+	else
+		no "a temp directory is accepted" "$out"
+	fi
+
+	# And the value is exported, so no firecode the suite starts can fall back
+	# to the checkout's own state/.
+	check "it is exported to everything the suite runs" "$FIRECODE_STATE" \
+		"$(bash -c 'printf %s "${FIRECODE_STATE:-}"')"
+	: >"$FIRECODE_STATE/fixture-0badf00d.ext4"
+	out=$("$FIRECODE" state ls --json 2>&1)
+	contains "and state ls reads it" "fixture-0badf00d" "$out"
+	rm -f "$FIRECODE_STATE/fixture-0badf00d.ext4"
+
+	# The names the leak was found by, none of which may exist in the real
+	# directory, because a fixture session is indistinguishable from work.
+	if [[ -d $REAL_STATE ]]; then
+		out=$(find "$REAL_STATE" -maxdepth 1 \
+			\( -name '*testproj*' -o -name '*it-s-a-project*' -o -name '*childproj*' \) \
+			2>/dev/null | head -3)
+		if [[ -z $out ]]; then
+			ok "no fixture session is in the real state directory"
+		else
+			no "no fixture session is in the real state directory" "$out"
+		fi
+	else
+		ok "no fixture session is in the real state directory (there is none)"
+	fi
+}
+
 test_host_transcripts_untouched() {
 	local real="$HOME/.claude/projects"
 	if [[ ! -d $real ]]; then
@@ -344,7 +455,7 @@ test_session_import_resumable() {
 		ok "imported session is resumable (skipped, needs a VM)"
 		return
 	fi
-	rm -rf "$ROOT/state/$(basename "$project")-"*
+	rm -rf "$FIRECODE_STATE/$(basename "$project")-"*
 	out=$(FIRECODE_CLAUDE_HOME="$fake" in_vm "$project" --import-sessions -- \
 		bash -c "echo \"S=\$(ls ~/.claude/projects/$slug/)\"; echo \"C=\$(head -1 ~/.claude/projects/$slug/aaaa1111-test.jsonl)\"")
 
@@ -1102,7 +1213,7 @@ test_ephemeral_vm_releases_state() {
 	fi
 	local proj state slug out res
 	proj="$WORK/ephvmproj"
-	state=${FIRECODE_STATE:-$ROOT/state}
+	state=${FIRECODE_STATE:?the suite sets it - see refuse_real_state}
 	rm -rf "$proj"
 	mkdir -p "$proj"
 	echo "# ephemeral" >"$proj/README.md"
@@ -1132,22 +1243,22 @@ test_ro_image_cached() {
 		ok "read-only images are cached (skipped, needs a VM)"
 		return
 	fi
-	rm -f "$ROOT/state/ro-testref-"*
+	rm -f "$FIRECODE_STATE/ro-testref-"*
 	in_vm "$project" --add-dir "$ref" -- true >/dev/null
-	out1=$(find "$ROOT/state" -name 'ro-testref-*.ext4' | wc -l)
+	out1=$(find "$FIRECODE_STATE" -name 'ro-testref-*.ext4' | wc -l)
 	check "an image was cached for the reference tree" "1" "$out1"
 
 	local stamp_before stamp_after
-	stamp_before=$(stat -c %Y "$ROOT/state/ro-testref-"*.ext4 2>/dev/null)
+	stamp_before=$(stat -c %Y "$FIRECODE_STATE/ro-testref-"*.ext4 2>/dev/null)
 	sleep 1
 	in_vm "$project" --add-dir "$ref" -- true >/dev/null
-	stamp_after=$(stat -c %Y "$ROOT/state/ro-testref-"*.ext4 2>/dev/null)
+	stamp_after=$(stat -c %Y "$FIRECODE_STATE/ro-testref-"*.ext4 2>/dev/null)
 	check "an unchanged tree is not re-imaged" "$stamp_before" "$stamp_after"
 
 	echo "changed" >>"$ref/note.txt"
 	in_vm "$project" --add-dir "$ref" -- true >/dev/null
 	local stamp_third
-	stamp_third=$(stat -c %Y "$ROOT/state/ro-testref-"*.ext4 2>/dev/null)
+	stamp_third=$(stat -c %Y "$FIRECODE_STATE/ro-testref-"*.ext4 2>/dev/null)
 	if [[ $stamp_third != "$stamp_after" ]]; then
 		ok "a changed tree is re-imaged"
 	else
@@ -1230,7 +1341,7 @@ test_concurrent_runs() {
 		[[ $(cat "$tap" 2>/dev/null) == 0 ]] || continue
 		slot=${tap#/sys/class/net/fccode}
 		slot=${slot%/carrier}
-		lock="$ROOT/state/net/$slot.lock"
+		lock="$FIRECODE_STATE/net/$slot.lock"
 		# No lock file yet means nothing has ever claimed the slot: free.
 		[[ -e $lock ]] || {
 			((free++))
@@ -2920,13 +3031,13 @@ test_layer_inherit() {
 	copy="$WORK/testproj-copy"
 	rm -rf "$copy"
 	cp -R "$src" "$copy"
-	attached_src="$ROOT/state/$(bash -c '
+	attached_src="$FIRECODE_STATE/$(bash -c '
 		dir=$1; h=$(printf "%s" "$dir" | sha256sum | cut -c1-8)
 		echo "$(basename "$dir" | tr -c "A-Za-z0-9._-" "-")-$h"' _ "$(cd "$src" && pwd)").layers"
-	attached_copy="$ROOT/state/$(bash -c '
+	attached_copy="$FIRECODE_STATE/$(bash -c '
 		dir=$1; h=$(printf "%s" "$dir" | sha256sum | cut -c1-8)
 		echo "$(basename "$dir" | tr -c "A-Za-z0-9._-" "-")-$h"' _ "$(cd "$copy" && pwd)").layers"
-	mkdir -p "$ROOT/state"
+	mkdir -p "$FIRECODE_STATE"
 	rm -f "$attached_src" "$attached_copy"
 
 	out=$("$FIRECODE" layer inherit "$src" --project "$copy" 2>&1)
@@ -2993,6 +3104,7 @@ print(",".join(keys))
 echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "full, boots VMs"))"
 
 run_test shellcheck
+run_test state_dir_is_never_the_real_one
 run_test cached_image_matches_guest
 run_test boot_timings_read_a_boot
 run_test guest_memory_is_declared
