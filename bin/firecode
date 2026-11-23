@@ -227,6 +227,22 @@ PARENT_RUN=""
 # from one whose caller is gone. --owner, or FIRECODE_OWNER for a caller that
 # cannot add flags.
 OWNER="${FIRECODE_OWNER:-}"
+# Which project of that caller's this VM is for - letibot's own key, not a path.
+# Recorded beside the owner so a reviewer's state can be found again by the
+# thing that asked for it.
+OWNER_PROJECT="${FIRECODE_OWNER_PROJECT:-}"
+# What the session is for: session, reviewer, ephemeral or test. It decides
+# what `state release` and gc do with it, so a word outside that set is a typo
+# that would silently make a reviewer's state look like a session's.
+PURPOSE="${FIRECODE_PURPOSE:-}"
+case "$PURPOSE" in
+"" | session | reviewer | ephemeral | test) ;;
+*) die "FIRECODE_PURPOSE is one of session, reviewer, ephemeral, test - not: $PURPOSE" ;;
+esac
+# May this session's VM be kept warm for the next one of its project instead of
+# being deleted when the session ends? --reuse, or FIRECODE_REUSABLE=1.
+REUSABLE=0
+if [[ ${FIRECODE_REUSABLE:-0} == 1 ]]; then REUSABLE=1; fi
 # Which hypervisor. firecracker for everything it can do - it starts in
 # milliseconds and restores a snapshot in sixty - and libvirt/qemu for the one
 # thing it cannot: there is no PCI bus in a firecracker VM, so no GPU either.
@@ -1251,6 +1267,57 @@ STATE_PERSISTENT=0
 STATE_DRIVE=""
 SLUG=""
 
+# THE MANIFEST: one JSON beside a session's drives saying whose it is.
+#
+# Everything about a session used to be inferable-and-that-was-the-problem. A
+# state directory of 204 sessions, 475G, could not say which were reviewer VMs,
+# which belonged to sessions that had ended, or whether anything in them had
+# ever been copied out. `state ls` read the drives, so the answer to "what is
+# this 32G file" was a project name and a size.
+#
+# scripts/session-manifest.py owns the file's shape; this file decides what
+# goes in it. Written before the drives are made (like the ephemeral marker)
+# because the crash window has to be the harmless direction: a manifest with no
+# drives is swept, a drive with no manifest is a session nobody can name.
+SESSION_MANIFEST="$SCRIPTS/session-manifest.py"
+
+manifest_path() { printf '%s\n' "$STATE_DIR/$1.json"; }
+
+# Update one session's manifest. Never fatal: bookkeeping that can end a run is
+# worse than bookkeeping that is a line short. `manifest <sub> <slug> ...` is
+# session-manifest.py with the path filled in.
+manifest() {
+	local sub=$1 name=$2 p
+	shift 2
+	p=$(manifest_path "$name")
+	mkdir -p "$STATE_DIR" 2>/dev/null || true
+	python3 "$SESSION_MANIFEST" "$sub" "$p" "$@" 2>/dev/null || true
+}
+
+# What the caller declared about this session, as one word. --purpose, or
+# FIRECODE_PURPOSE, or `ephemeral` from --ephemeral. A purpose that was already
+# recorded is kept when this run says nothing - a reviewer's follow-up run is
+# still the reviewer's.
+manifest_purpose() {
+	local was
+	if ((EPHEMERAL)); then
+		echo ephemeral
+		return 0
+	fi
+	if [[ -n ${PURPOSE:-} ]]; then
+		echo "$PURPOSE"
+		return 0
+	fi
+	if [[ -n ${SLUG:-} ]]; then
+		was=$(python3 "$SESSION_MANIFEST" get "$(manifest_path "$SLUG")" purpose 2>/dev/null || true)
+		if [[ -n $was ]]; then
+			echo "$was"
+			return 0
+		fi
+	fi
+	echo session
+}
+
 project_slug() {
 	local dir=$1 hash
 	hash=$(printf '%s' "$dir" | sha256sum | cut -c1-8)
@@ -1278,6 +1345,17 @@ ensure_state_drive() {
 	else
 		rm -f "$STATE_DIR/$slug.ephemeral"
 	fi
+
+	# Then whose it is, from the same place and for the same reason. Only the
+	# fields this run actually knows are written: a run started by hand must
+	# not erase the owner a letibot session recorded.
+	local -a fields=("purpose=$(manifest_purpose)")
+	[[ -n ${OWNER:-} ]] && fields+=("owner=$OWNER")
+	[[ -n ${OWNER_PROJECT:-} ]] && fields+=("owner_project=$OWNER_PROJECT")
+	[[ -n ${WORKDIR:-} && ${WORKDIR:-} != . ]] && fields+=("worktree=$WORKDIR")
+	[[ -n ${WORKTREE:-} ]] && fields+=("branch=$WORKTREE")
+	manifest set "$slug" "${fields[@]}"
+	[[ -n ${RUN_ID:-} ]] && manifest add-run "$slug" "$RUN_ID"
 
 	if [[ ! -f $img ]]; then
 		disk_guard_for_layer "this project's agent home"
@@ -1486,7 +1564,8 @@ session_state_files() {
 	for f in "$STATE_DIR/$slug.ext4" "$STATE_DIR/$slug-layer.ext4" \
 		"$STATE_DIR/$slug-src.ext4" "$STATE_DIR/$slug-root.ext4" \
 		"$STATE_DIR/$slug.lock" "$STATE_DIR/$slug.layers" \
-		"$STATE_DIR/$slug.imported" "$STATE_DIR/$slug.ephemeral"; do
+		"$STATE_DIR/$slug.imported" "$STATE_DIR/$slug.ephemeral" \
+		"$STATE_DIR/$slug.json"; do
 		[[ -e $f ]] && printf '%s\n' "$f"
 	done
 	return 0
@@ -4703,6 +4782,70 @@ cmd_snapshot() {
 	esac
 }
 
+# WHAT A SESSION COSTS, as three numbers: bytes, files, newest mtime.
+#
+# The manifest is bookkeeping about the session, not the session's weight, so
+# it is not counted - a 400-byte file must not turn a 40G session into 40G+.
+session_metrics() {
+	local slug=$1 f b t bytes=0 n=0 newest=0
+	while IFS= read -r f; do
+		case "$f" in *.json) continue ;; esac
+		b=$(file_bytes "$f")
+		bytes=$((bytes + b))
+		n=$((n + 1))
+		t=$(stat -c %Y "$f" 2>/dev/null) || t=0
+		if [[ $t =~ ^[0-9]+$ ]] && ((t > newest)); then newest=$t; fi
+	done < <(session_state_files "$slug")
+	printf '%s\t%s\t%s\n' "$bytes" "$n" "$newest"
+}
+
+# THE SESSIONS, BY WHAT THEIR MANIFESTS SAY.
+#
+# `state list` answers "what drives are there"; this answers the question
+# somebody reclaiming 475G actually has - whose is this, what was it for, and
+# has its work been copied out. Machine-readable because the caller is a
+# reaper and not a person: --json, one object per session.
+cmd_state_ls() {
+	local json=0 slug m bytes files newest
+	local -a rows=()
+	while (($#)); do
+		case "$1" in
+		--json)
+			json=1
+			shift
+			;;
+		*) die "usage: firecode state ls [--json]" ;;
+		esac
+	done
+	if [[ ! -d $STATE_DIR ]]; then
+		if ((json)); then printf '{"sessions": []}\n'; else echo "no state directory at $STATE_DIR"; fi
+		return 0
+	fi
+	while IFS= read -r slug; do
+		[[ -n $slug ]] || continue
+		m=$(session_metrics "$slug")
+		IFS=$'\t' read -r bytes files newest <<<"$m"
+		((files > 0)) || continue
+		rows+=("$slug"$'\t'"$bytes"$'\t'"$newest"$'\t'"$files")
+	done < <(state_sessions)
+	if ((${#rows[@]} == 0)); then
+		if ((json)); then
+			printf '{"sessions": []}\n'
+		else
+			echo "no session state yet in $STATE_DIR"
+		fi
+		return 0
+	fi
+	# One python for the whole directory: the manifests are the interesting
+	# part and reading 200 of them by forking per file is how a reaper pass
+	# comes to take minutes.
+	if ((json)); then
+		printf '%s\n' "${rows[@]}" | python3 "$SESSION_MANIFEST" report "$STATE_DIR" --json
+	else
+		printf '%s\n' "${rows[@]}" | python3 "$SESSION_MANIFEST" report "$STATE_DIR"
+	fi
+}
+
 cmd_state() {
 	local sub=${1:-list}
 	shift || true
@@ -4717,6 +4860,9 @@ cmd_state() {
 			printf '%-44s %s\n' "$(basename "$f" .ext4)" \
 				"$(du -h --apparent-size "$f" | cut -f1)"
 		done
+		;;
+	ls | table)
+		cmd_state_ls "$@"
 		;;
 	sessions)
 		local dir=${1:-$PWD} img tmp
@@ -4744,11 +4890,11 @@ cmd_state() {
 		img="$STATE_DIR/$(project_slug "$(cd "$dir" && pwd)").ext4"
 		[[ -f $img ]] || die "no state for $dir"
 		rm -f "$img" "${img%.ext4}-src.ext4" "${img%.ext4}-root.ext4" \
-			"${img%.ext4}.imported"
+			"${img%.ext4}.imported" "${img%.ext4}.json"
 		log "removed this project's agent home, working tree and rootfs"
 		;;
 	*)
-		die "usage: firecode state [list|sessions [dir]|reset [dir]]"
+		die "usage: firecode state [list|ls [--json]|sessions [dir]|reset [dir]]"
 		;;
 	esac
 }
@@ -5538,9 +5684,28 @@ launch() {
 		--owner)
 			# `letibot:<session>:<daemon pid>` - who is waiting for this VM.
 			# Recorded on the run so `ps --orphans` can name the ones nobody
-			# is waiting for any more.
+			# is waiting for any more, and in the session's manifest so its
+			# state can still be named after the run directory is swept.
 			OWNER="$2"
 			shift 2
+			;;
+		--owner-project)
+			OWNER_PROJECT="$2"
+			shift 2
+			;;
+		--purpose)
+			case "$2" in
+			session | reviewer | ephemeral | test) PURPOSE="$2" ;;
+			*) die "--purpose is one of session, reviewer, ephemeral, test - not: $2" ;;
+			esac
+			shift 2
+			;;
+		--reuse | --reusable)
+			# A reviewer's VM is a 32G layer and a toolchain somebody already
+			# paid an hour for; rebuilding it per review is the cost this
+			# removes.
+			REUSABLE=1
+			shift
 			;;
 		--vcpu | --cpus)
 			VCPU="$2"
@@ -9059,6 +9224,9 @@ firecode - run a coding agent in a Firecracker microVM
   firecode snapshot rm NAME      drop one
 
   firecode state list            per-project agent state drives
+  firecode state ls [--json]     who each session belongs to, what it was
+                                 for, what it costs, and whether its work
+                                 has been copied out
   firecode state sessions [dir]  session ids you can --resume
   firecode state reset [dir]     forget this project's agent history
 
