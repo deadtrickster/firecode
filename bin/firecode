@@ -10862,8 +10862,31 @@ firecode - run a coding agent in a Firecracker microVM
   firecode state ls [--json]     who each session belongs to, what it was
                                  for, what it costs, and whether its work
                                  has been copied out
+  firecode state release NAME    done with this session (idempotent; what a
+                                 caller runs when its session ends)
+  firecode state reap --owners - --json
+                                 release every session whose owner is gone
   firecode state sessions [dir]  session ids you can --resume
   firecode state reset [dir]     forget this project's agent history
+
+  firecode gc --state --budget 150G
+                                 keep the state under a ceiling, worst first,
+                                 never work that was not copied out
+
+  firecode pool take --project DIR [--json] [--boot]
+                                 a warm VM for this project, if there is one
+  firecode pool return NAME [--json] [--kill] [--sleep]
+                                 give it back: work out, reset, caches kept
+  firecode pool sleep [--idle SEC] [--memory] [--json]
+                                 a reaper's pass over the pool
+  firecode pool status [--json]  what is in the pool, and in what state
+
+  firecode net host-guard [--print | --apply | --remove]
+                                 the rule keeping a guest off this host's own
+                                 services (the LAN and internet stay open)
+
+  scripts/canary-roundtrip.sh    boot, commit, extract, verify, release: the
+                                 check to run after any storage change
 
 options (before the agent's own arguments):
   --workdir DIR   project to put in /src            (default: .)

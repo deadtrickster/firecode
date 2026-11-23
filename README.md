@@ -960,7 +960,31 @@ firecode --vectorized ...     # pin to performance cores, and say what cannot
 firecode --kernel debug       # the traceable kernel: ftrace, kprobes, BTF
 
 firecode state list           # per-project drives
+firecode state ls [--json]    # who each session belongs to, what it was for,
+                              # what it costs, whether its work is out
+firecode state release NAME   # done with this session (the caller's session-end
+                              # hook; idempotent, --json, --dry-run)
+firecode state reap --owners - --json
+                              # release every session whose owner is gone, from
+                              # the list of owners that are still alive
 firecode state reset          # forget this project's history, tree and layer
+
+firecode gc --state --budget 150G   # keep the state under a ceiling: worst
+                                    # first, never unextracted work, and it
+                                    # says when it cannot get there
+
+firecode pool take --project P --json   # is there a warm VM for this project?
+firecode pool return NAME --json        # give it back (work out, reset, caches
+                                        # kept) - or --sleep to stop it now
+firecode pool sleep --idle 300 --json   # a reaper's pass: stop idle members,
+                                        # keep the pool under its caps
+firecode pool status [--json]           # what is in the pool, and in what state
+
+firecode net host-guard --print  # the rule that keeps a guest off this host's
+                                 # own services; the LAN and internet stay open
+
+scripts/canary-roundtrip.sh      # boot, commit, extract, verify, release: the
+                                 # check to run after any storage change
 ```
 
 Per-run drives are deleted when the VM exits unless you pass `--keep`. Console
@@ -970,6 +994,26 @@ job: a project's state outlives the runs that made it (that is what `--continue`
 and a once-paid toolchain are), so it only ever grows. It touches a session only
 when no run of it is in progress, and only when nothing has touched it for the
 age - an ephemeral session's state, which nobody will resume, goes at any age.
+
+Every session carries a **manifest** (`state/<slug>.json`) saying whose it is,
+what it was for, and whether its work was copied out. Every copy-out makes a
+bundle of the tree's refs and verifies that the bundle contains the commit the
+guest was on, so "the work is out" is a recorded fact with a tip rather than a
+log line somebody read. Nothing whose manifest says its work is not out is ever
+deleted by gc or by `state release` - `--force` says so in words, and
+`firecode extract <run> --bundle` is how the work comes out of a session whose
+copy-out failed. Sessions from before manifests read `unknown`, and the pass
+says how many of those it removed blind.
+
+A reviewer's VM (or any session started with `--reuse`) can go back to its
+project's **warm pool** instead of being deleted: `pool return` resets the
+worktree, keeps the caches (`target`, `.sccache`, `node_modules`, `.venv`),
+clears the agent's conversation and shell history, and marks it available;
+`pool take` hands it to the next session of that project. It refuses to pool a
+VM whose work is not out, or one that still has a process running in it -
+those would wake up in the next user's machine. A member sleeps as a clean
+shutdown with its disks kept; a memory snapshot is `--memory`, off by default
+(it costs 4G of disk for a 4G guest, and carries processes across users).
 
 `--vmm libvirt` talks to `qemu:///session` - qemu runs as you, reads the
 images under your home, and uses the same taps. `--gpu` switches to

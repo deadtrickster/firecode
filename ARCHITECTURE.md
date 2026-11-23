@@ -345,6 +345,102 @@ These are what the tests assert, and what any implementation has to hold:
     granted once and so turns supervision into a stream of permission
     prompts. `firecode watch <vm>` takes no flags for a reason.
 
+## What a session is, after it stops
+
+A session is one project's state: the agent home, the workspace layer, the
+source drive, a lock, and a manifest. The manifest is the thing this model was
+missing for a year. A directory of 204 sessions holding 475G could not say
+which were reviewer VMs, which belonged to sessions that had ended, or whether
+anything in them had ever been copied out, so nothing could be reclaimed and
+nobody could safely delete anything.
+
+```
+<state>/<slug>.json      the manifest: owner, purpose, worktree, branch, runs,
+                         extracted {tip, bundle, verified}, pool {project, state}
+<state>/<slug>.ext4      the agent home (sessions, history, todos)
+<state>/<slug>-layer.ext4  the workspace layer: the toolchain, paid for once
+<state>/<slug>-src.ext4  the working tree the guest had
+```
+
+**Work is out, or it is not, and the manifest says which.** Every copy-out
+makes a bundle of the tree's refs (`git bundle create --all`) beside the run,
+verifies that the bundle contains the commit the guest was on, and records the
+tip. Deletion paths - `state release`, `state reap`, both `gc --state` passes -
+refuse a session whose manifest says its work was never extracted, unless
+`--force` says so in words. Sessions from before manifests read `unknown`:
+they are reclaimable on age, as they always were, and the pass says how many it
+removed blind.
+
+**Nothing is on a timer inside firecode.** The verbs are primitives a caller
+runs, and the caller is letibot: `state release` at the end of a session,
+`state reap` on its reaper's pass (with the list of owners that are still
+alive), `gc --state --budget` when the disk needs room, `pool sleep` on a
+timer. This is deliberate - a daemon inside a tool that an agent runs is a
+process nobody owns - and it is why every verb is idempotent and answers
+`--json`.
+
+## The warm pool
+
+A reviewer's VM is a 32G layer, a toolchain somebody installed and a boot; the
+next review of the same project needs exactly that. So a session marked
+`reviewer` (or `--reuse`) can return its VM to the project's pool instead of
+being deleted:
+
+- **return** - the work goes out first (a bundle made in the LIVE guest and
+  verified); then, if any process the agent started is still running, the
+  return is refused unless `--kill`; then the guest resets the worktree
+  (`git reset --hard`, `git clean -xffd`) keeping the declared caches
+  (`target`, `.sccache`, `node_modules`, `.venv`), and removes the agent's
+  conversation and shell history. Only then is the VM available.
+- **take** - a dispatcher asks before booting. A running member is marked
+  in-use; a sleeping one is named with `resume: true` and `--boot` starts it
+  over the state the pool kept, which is what makes its toolchain already
+  there.
+- **sleep** - a reaper's pass. A member unused for `--idle` (300s) is stopped:
+  a clean shutdown with its disks kept. Memory is **not** snapshotted unless
+  `--memory`: a 4G guest costs 4G of disk to save and ~16s, and a resume would
+  carry the previous task's processes into the next user's machine. Caps are
+  two asleep per project, eight a box, deleted after seven days unused.
+
+Disk-only sleep is why the design needs no new storage machinery: the layer
+and the agent home already survive a stop, so a pooled VM's value is on disk
+and a normal `firecode up` collects it. `--memory` reuses the checkpoint path
+below, and the snapshot is dropped after an hour.
+
+### Efficiency work not built here
+
+Measured, reported, deliberately not built in this package:
+
+1. **Fast start for pooled resumes.** `up --fast` already restores a
+   checkpoint in ~60ms against ~2.9s for a cold 4G boot. Making every pool
+   take use it needs the checkpoint's config drive pinned per pool member
+   (already done for checkpoints) and a stamp that ignores the project's
+   content - a pooled VM's project is reset anyway. Estimated: one field in
+   the stamp and a `--fast` in `pool take --boot`. Not built because it is
+   only measurable against a real boot profile, and it would make a resumed
+   guest carry the previous task's memory if the reset ever failed.
+2. **A per-project shared base layer with a per-session overlay.** Two
+   sessions of one project each hold a full 32G layer today. A read-only
+   lower layer plus a per-session upper would cut that to the delta, and the
+   guest already boots through overlayfs - the change is which drives the
+   boot attaches. Not built: it changes the drive table, and the canary does
+   not yet cover restoring a session onto a different lower layer.
+3. **Shared read-only build caches (target, sccache) with a per-VM writable
+   overlay.** The same trick: one host-side cache attached read-only to every
+   VM of a project, with a small writable overlay per session. The risk is
+   that a cache is not read-only in practice - cargo rewrites lock files,
+   sccache writes its index - so it needs a real overlay, not a mount option.
+   The pool already gets most of this benefit for reviewers by keeping the
+   VM's own target directory.
+
+## Canary for every storage change
+
+`scripts/canary-roundtrip.sh` boots one VM, commits inside it, extracts the
+bundle, verifies that the bundle contains the commit, checks the manifest,
+releases the session, and with `--pool` returns the VM and puts it to sleep.
+It is the mandatory check after any change to how state is stored or moved:
+the host-side tests cannot see any of it, because the guest is in the way.
+
 ## Known limits
 
 Stated because each one is quiet rather than loud, and an agent that does not
