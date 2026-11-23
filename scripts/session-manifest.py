@@ -24,6 +24,7 @@ A session with no manifest is `unknown`, not absent: the whole point is that
 state from before this existed is still listed and still reclaimable.
 """
 
+import calendar
 import json
 import os
 import sys
@@ -113,14 +114,20 @@ def cmd_add_run(path, run):
     save(path, data)
 
 
-def cmd_extracted(path, tip=None, bundle=None, verified=False):
+def cmd_extracted(path, tip=None, bundle=None, verified=False, nothing=False):
     data = load(path)
-    data["extracted"] = {
+    mark = {
         "at": now(),
         "tip": tip or None,
         "bundle": bundle or None,
         "verified": bool(verified),
     }
+    if nothing:
+        # A run that committed nothing - no repository, or no commits - has
+        # work that is out the moment its directory is. Saying so is what lets
+        # its state be reclaimed; leaving it null would pin 3G forever.
+        mark["nothing"] = True
+    data["extracted"] = mark
     save(path, data)
 
 
@@ -145,6 +152,15 @@ def cmd_pool(path, project=None, state=None, snapshot=None, nbytes=None,
     pool["last_used"] = now()
     data["pool"] = pool
     save(path, data)
+
+
+def epoch_of(stamp):
+    if not stamp:
+        return 0
+    try:
+        return int(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return 0
 
 
 def row_for(name, data, nbytes, mtime, files):
@@ -174,6 +190,29 @@ def row_for(name, data, nbytes, mtime, files):
         out["last_used_source"] = "mtime"
     else:
         out["last_used_source"] = "manifest"
+    out["last_used_epoch"] = epoch_of(out["last_used"]) or int(mtime or 0)
+    # What a reaper may do with it. "out" means the manifest says the work was
+    # copied out; "in" means it says it was never; "unknown" is state from
+    # before manifests, which is reclaimable on age but never called safe.
+    if isinstance(extracted, dict):
+        out["work"] = "out"
+    elif not out["manifest"]:
+        out["work"] = "unknown"
+    elif out["runs"]:
+        out["work"] = "in"
+    else:
+        # A manifest written by a run that never got as far as starting: its
+        # drives are empty, so there is nothing to lose by reclaiming them.
+        out["work"] = "nothing"
+    # Unextracted work is never deleted automatically, and a session old enough
+    # to be worth telling somebody about is flagged rather than quietly kept.
+    if out["work"] == "in":
+        days = (time.time() - out["last_used_epoch"]) / 86400.0
+        out["unextracted_days"] = round(days, 1)
+        out["flagged"] = days >= 3
+    else:
+        out["unextracted_days"] = None
+        out["flagged"] = False
     return out
 
 
@@ -184,7 +223,7 @@ def human(n):
         n /= 1024.0
 
 
-def cmd_report(state_dir, as_json, rows):
+def cmd_report(state_dir, as_json, rows, as_tsv=False):
     sessions = []
     for line in rows:
         line = line.rstrip("\n")
@@ -195,6 +234,20 @@ def cmd_report(state_dir, as_json, rows):
         sessions.append(row_for(name, load(path), int(nbytes), int(mtime),
                                 int(files)))
     sessions.sort(key=lambda s: s["name"])
+    if as_tsv:
+        # The reapers' input: one line a session, in a shape bash can read
+        # without a fork per field. Two reapers and `state ls` read the same
+        # facts from here, so no two of them can disagree about an age.
+        for s in sessions:
+            pool = s["pool"] or {}
+            print("\t".join([
+                s["name"], str(s["bytes"]), str(s["files"]),
+                s["purpose"], s["work"], str(s["last_used_epoch"]),
+                "1" if s["manifest"] else "0",
+                pool.get("state") or "-",
+                pool.get("project") or "-",
+            ]))
+        return
     if as_json:
         json.dump({"sessions": sessions}, sys.stdout, indent=1, sort_keys=True)
         sys.stdout.write("\n")
@@ -252,7 +305,7 @@ def main(argv):
     elif cmd == "add-run":
         cmd_add_run(rest[0], rest[1])
     elif cmd == "extracted":
-        opts = dict(tip=None, bundle=None, verified=False)
+        opts = dict(tip=None, bundle=None, verified=False, nothing=False)
         it = iter(rest[1:])
         for a in it:
             if a == "--tip":
@@ -261,6 +314,8 @@ def main(argv):
                 opts["bundle"] = next(it)
             elif a == "--verified":
                 opts["verified"] = True
+            elif a == "--nothing":
+                opts["nothing"] = True
             else:
                 sys.exit("extracted: unknown option %r" % a)
         cmd_extracted(rest[0], **opts)
@@ -284,7 +339,8 @@ def main(argv):
         cmd_pool(rest[0], **opts)
     elif cmd == "report":
         as_json = "--json" in rest
-        cmd_report(rest[0], as_json, sys.stdin)
+        as_tsv = "--tsv" in rest
+        cmd_report(rest[0], as_json, sys.stdin, as_tsv)
     else:
         sys.exit("unknown command: %s" % cmd)
 

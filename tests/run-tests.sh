@@ -282,6 +282,167 @@ test_state_dir_is_never_the_real_one() {
 	fi
 }
 
+# A SESSION'S FILES AND ITS MANIFEST ARE THE SAME THING, and the verbs that
+# read them are what a reaper calls. Everything here is on a state directory
+# under $WORK: no VM, no boot, no real session touched.
+#
+# The four arms that matter are the ones that can lose work: a bundle that
+# verifies but predates the commit, a release that removes drives whose work
+# never came out, a gc pass that treats "no manifest" as "safe", and a reaper
+# that runs with no list of the living.
+test_state_lifecycle() {
+	local st proj s1 s2 s3 out rc base
+	st="$WORK/lifecycle"
+	rm -rf "$st"
+	mkdir -p "$st"
+	manifest() { python3 "$ROOT/scripts/session-manifest.py" "$@"; }
+	# A session with real bytes, as a project under $WORK would have.
+	mksession() {
+		local proj=$1 slug
+		slug=$(printf '%s-%s\n' "$(basename "$proj" | tr -c 'A-Za-z0-9._-' '-')" \
+			"$(printf '%s' "$proj" | sha256sum | cut -c1-8)")
+		dd if=/dev/zero of="$st/$slug.ext4" bs=1024 count=64 status=none
+		dd if=/dev/zero of="$st/$slug-layer.ext4" bs=1024 count=64 status=none
+		: >"$st/$slug-src.ext4"
+		: >"$st/$slug.lock"
+		echo "$slug"
+	}
+
+	# THE BUNDLE, which is the proof a session's work is out.
+	(
+		eval "$(sed -n '/^bundle_verify() {$/,/^}$/p' "$FIRECODE")"
+		base="$WORK/bundle-repo"
+		rm -rf "$base"
+		git init -q "$base"
+		git -C "$base" config user.email t@t
+		git -C "$base" config user.name t
+		git -C "$base" config commit.gpgsign false
+		echo one >"$base/f"
+		git -C "$base" add f
+		git -C "$base" commit -qm one
+		tip=$(git -C "$base" rev-parse HEAD)
+		git -C "$base" bundle create "$WORK/good.bundle" --all >/dev/null 2>&1
+		[[ $(bundle_verify "$WORK/good.bundle" "$tip") == ok* ]] &&
+			echo verified >"$WORK/bundle.1" || echo failed >"$WORK/bundle.1"
+		: >"$WORK/bundle.1.bad"
+		echo two >"$base/f"
+		git -C "$base" commit -qam two
+		new=$(git -C "$base" rev-parse HEAD)
+		[[ $(bundle_verify "$WORK/good.bundle" "$new") == bad* ]] &&
+			echo refused >"$WORK/bundle.2" || echo accepted >"$WORK/bundle.2"
+		[[ $(bundle_verify "$WORK/no-such" "") == bad* ]] &&
+			echo refused >"$WORK/bundle.3" || echo accepted >"$WORK/bundle.3"
+	)
+	check "a bundle that contains the commit it was made from verifies" verified "$(cat "$WORK/bundle.1")"
+	check "and one that predates the tip is refused" refused "$(cat "$WORK/bundle.2")"
+	check "a file that is not there is refused, not a crash" refused "$(cat "$WORK/bundle.3")"
+
+	# RELEASE: reviewer state goes at once, a session's only once its work is out.
+	proj="$WORK/lifecycle-a"
+	mkdir -p "$proj"
+	s1=$(mksession "$proj")
+	manifest set "$st/$s1.json" purpose=reviewer owner=letibot:aaa
+	manifest add-run "$st/$s1.json" firecode-20260101-000000-9
+	manifest extracted "$st/$s1.json" --nothing
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state release "$s1" --json 2>&1)
+	contains "a reviewer whose work is out is released" '"released":true' "$out"
+	check "and its files are gone" no "$([[ -e $st/$s1.ext4 ]] && echo yes || echo no)"
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state release "$s1" --json 2>&1)
+	contains "releasing it again is not an error" '"reason":"no such session"' "$out"
+
+	s2=$(mksession "$WORK/lifecycle-b")
+	manifest set "$st/$s2.json" purpose=session owner=letibot:bbb
+	manifest add-run "$st/$s2.json" firecode-20260101-000000-8
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state release "$s2" --json 2>&1)
+	rc=$?
+	contains "a session whose work was never copied out is refused" '"released":false' "$out"
+	contains "and the refusal carries the fix for a machine to follow" '"hint"' "$out"
+	contains "the fix names extract" 'firecode extract' "$out"
+	check "with a status a hook can act on" 3 "$rc"
+	check "and it kept every file" yes "$([[ -e $st/$s2.ext4 ]] && echo yes || echo no)"
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state release "$s2" --force 2>&1)
+	contains "--force releases it anyway" released "$out"
+
+	s3=$(mksession "$WORK/lifecycle-c")
+	mkdir -p "$WORK/lifecycle-c"
+	manifest set "$st/$s3.json" purpose=reviewer
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state release \
+		--project "$WORK/lifecycle-c" --json 2>&1)
+	contains "a session is named by its project as well as by its slug" "\"name\":\"$s3\"" "$out"
+
+	# REAP: the caller that died cannot call release, so its VMs are found by
+	# asking which owners are still alive. With no list it must refuse.
+	local live dead
+	live=$(mksession "$WORK/lifecycle-live")
+	dead=$(mksession "$WORK/lifecycle-dead")
+	manifest set "$st/$live.json" purpose=reviewer owner=letibot:alive:1
+	manifest set "$st/$dead.json" purpose=reviewer owner=letibot:crashed:99
+	manifest extracted "$st/$dead.json" --nothing
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state reap 2>&1)
+	rc=$?
+	check "reap refuses to run without a list of live owners" 1 "$rc"
+	contains "and says why, with the command to use" "--owners" "$out"
+	out=$(printf 'alive\n' | FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" \
+		"$FIRECODE" state reap --owners - --json 2>&1)
+	contains "a session whose owner is gone is reaped" "\"$dead\"" "$out"
+	check "and the live owner's session stays" there "$([[ -e $st/$live.ext4 ]] && echo there || echo gone)"
+	check "the reaped one is gone" gone "$([[ -e $st/$dead.ext4 ]] && echo there || echo gone)"
+
+	# THE TABLE, and its machine-readable twin.
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state ls --json 2>&1)
+	contains "state ls --json carries the owner" '"owner": "letibot:alive:1"' "$out"
+	contains "and what its extraction state is" '"work": "nothing"' "$out"
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/lifecycle-runs" "$FIRECODE" state ls 2>&1)
+	contains "and the table shows the purpose" reviewer "$out"
+}
+
+# THE BUDGET PASS, WHICH IS THE ONE THAT CAN DELETE A LOT.
+#
+# Its order is the rule: what is free to give up goes first, and a session whose
+# manifest says its work is not out never goes at all. When it cannot reach the
+# target it has to say so - a pass that quietly gave up is how the disk filled
+# up the first time.
+test_gc_budget_pass() {
+	local st out target
+	st="$WORK/budgetstate"
+	rm -rf "$st"
+	mkdir -p "$st"
+	manifest() { python3 "$ROOT/scripts/session-manifest.py" "$@"; }
+	mk() {
+		local name=$1 size=$2 slug
+		slug=$(printf '%s-%s\n' "${name}" "$(printf '%s' "$WORK/$name" | sha256sum | cut -c1-8)")
+		dd if=/dev/zero of="$st/$slug.ext4" bs=1024 count="$size" status=none
+		touch -d '5 days ago' "$st/$slug.ext4"
+		echo "$slug"
+	}
+	local t rev out_s pinned
+	t=$(mk test1 1024)
+	rev=$(mk rev1 1024)
+	out_s=$(mk out1 1024)
+	pinned=$(mk pin1 4096)
+	manifest set "$st/$t.json" purpose=test
+	manifest set "$st/$rev.json" purpose=reviewer
+	manifest set "$st/$out_s.json" purpose=session
+	manifest extracted "$st/$out_s.json" --tip 0000000000000000000000000000000000000000 --verified
+	manifest set "$st/$pinned.json" purpose=session last_used=2026-11-10T00:00:00Z
+	manifest add-run "$st/$pinned.json" firecode-20260101-000000-7
+	manifest set "$st/$pinned.json" last_used=2026-11-10T00:00:00Z
+
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/budget-runs" "$FIRECODE" \
+		gc --state --budget 4M --max-age 1d --json --dry-run 2>&1)
+	contains "the budget pass answers in JSON" '"dry_run":true' "$out"
+	contains "and names the class it would give up first" '"purpose":"test"' "$out"
+	check "and removes nothing yet" 4 \
+		"$(find "$st" -maxdepth 1 -name '*.ext4' ! -name '*-layer.ext4' ! -name '*-src.ext4' | wc -l | tr -d ' ')"
+
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/budget-runs" "$FIRECODE" \
+		gc --state --budget 4M --max-age 1d 2>&1)
+	contains "a real pass removes something" removed "$out"
+	check "the test session goes first" no "$([[ -e $st/$t.ext4 ]] && echo yes || echo no)"
+	check "a session whose work is not out is pinned" there "$([[ -e $st/$pinned.ext4 ]] && echo there || echo gone)"
+	contains "and the pass says it could not reach the target" "could not reach" "$out"
+}
+
 test_host_transcripts_untouched() {
 	local real="$HOME/.claude/projects"
 	if [[ ! -d $real ]]; then
@@ -3105,6 +3266,8 @@ echo "firecode tests  ($([[ $QUICK -eq 1 ]] && echo "quick, no VMs" || echo "ful
 
 run_test shellcheck
 run_test state_dir_is_never_the_real_one
+run_test state_lifecycle
+run_test gc_budget_pass
 run_test cached_image_matches_guest
 run_test boot_timings_read_a_boot
 run_test guest_memory_is_declared

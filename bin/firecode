@@ -1358,6 +1358,10 @@ ensure_state_drive() {
 	[[ -n ${OWNER_PROJECT:-} ]] && fields+=("owner_project=$OWNER_PROJECT")
 	[[ -n ${WORKDIR:-} && ${WORKDIR:-} != . ]] && fields+=("worktree=$WORKDIR")
 	[[ -n ${WORKTREE:-} ]] && fields+=("branch=$WORKTREE")
+	# A reusable session's VM may go back to its project's warm pool rather
+	# than being deleted when the session ends. Recorded, not inferred: the
+	# next caller of this session may not pass the flag again.
+	((REUSABLE)) && fields+=("reusable=1")
 	manifest set "$slug" "${fields[@]}"
 	[[ -n ${RUN_ID:-} ]] && manifest add-run "$slug" "$RUN_ID"
 
@@ -4850,6 +4854,323 @@ cmd_state_ls() {
 	fi
 }
 
+# A SESSION, NAMED THE WAY THE CALLER HAS IT: the slug `state ls` prints, or
+# the project directory it belongs to.
+session_resolve() {
+	local name=${1:-} proj=${2:-}
+	if [[ -n $proj ]]; then
+		[[ -d $proj ]] || die "no such directory: $proj"
+		project_slug "$(cd "$proj" && pwd)"
+		return 0
+	fi
+	[[ -n $name ]] || return 1
+	printf '%s\n' "$name"
+}
+
+# The newest run directory that belongs to a session, or nothing. The reaper
+# needs it to name the VM it has to stop; `down` takes a project, and this is
+# how a session becomes one without a guess.
+newest_run_of() {
+	local want=$1 d proj best="" bestt=0 t
+	[[ -d $RUNS ]] || return 1
+	for d in "$RUNS"/*/; do
+		[[ -f $d/project ]] || continue
+		proj=$(cat "$d/project" 2>/dev/null || true)
+		[[ -n $proj ]] || continue
+		[[ $(project_slug "$proj") == "$want" ]] || continue
+		t=$(stat -c %Y "${d%/}" 2>/dev/null) || t=0
+		if [[ $t =~ ^[0-9]+$ ]] && ((t > bestt)); then
+			bestt=$t
+			best=${d%/}
+		fi
+	done
+	[[ -n $best ]] || return 1
+	printf '%s\n' "$best"
+}
+
+# The session a run's owner names: `letibot:<session>:<pid>` is the convention,
+# and anything else is taken whole rather than guessed at.
+owner_session() {
+	local o=${1:-}
+	[[ -n $o ]] || return 1
+	o=${o#letibot:}
+	printf '%s\n' "${o%%:*}"
+}
+
+# RELEASE A SESSION: what the caller runs when its session ends.
+#
+# The rules, in the order they matter:
+#   - nothing of it on disk is success, not an error: a caller that runs this
+#     twice, or late, is the normal case and must not see a failure.
+#   - a VM still running is not this verb's to kill: stop it first (`down`), or
+#     let the reaper (`state reap`) do both, which is what an owner that
+#     crashed needs.
+#   - reviewer and ephemeral state goes at once; a session's goes once its work
+#     is out. "Is it out" is the manifest's answer, not this command's hope.
+#   - work that is NOT out is refused, with the two ways to get it out named.
+cmd_state_release() {
+	local name="" proj="" json=0 dry=0 force=0
+	while (($#)); do
+		case "$1" in
+		--project)
+			proj=$2
+			shift 2
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		--dry-run)
+			dry=1
+			shift
+			;;
+		--force)
+			force=1
+			shift
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode state release <name> [--json] [--dry-run] [--force]
+       firecode state release --project DIR [...]
+
+  What a caller runs when the session that asked for a VM is over. Reviewer
+  and ephemeral state is removed at once; a session's is removed once its
+  manifest says its work was copied out. A session whose work is NOT out is
+  refused - the drives may be the only copy - unless --force says otherwise.
+
+  Idempotent: a session that is not there any more answers "nothing to do"
+  and exits 0, so a hook that runs twice is harmless. --dry-run says what it
+  would do; --json is the same answer for a reaper.
+USAGE
+			return 0
+			;;
+		*)
+			if [[ -z $name ]]; then name=$1; fi
+			shift
+			;;
+		esac
+	done
+	local slug
+	slug=$(session_resolve "$name" "$proj") || die "usage: firecode state release <name> [--json] [--dry-run] [--force]"
+
+	local purpose work bytes=0
+	local -a files=()
+	local f
+	while IFS= read -r f; do files+=("$f"); done < <(session_state_files "$slug")
+	if ((${#files[@]} == 0)); then
+		if ((json)); then
+			printf '{"released":false,"name":"%s","reason":"no such session"}\n' "$slug"
+		else
+			log "$slug: no state of its own - nothing to release"
+		fi
+		return 0
+	fi
+	purpose=$(manifest_field "$slug" purpose)
+	[[ -n $purpose ]] || purpose=unknown
+	work=$(session_work_state "$slug")
+	bytes=$(session_metrics "$slug" | cut -f1)
+
+	local running=0
+	if session_in_use "$slug"; then running=1; fi
+	if ((running)); then
+		if ((json)); then
+			printf '{"released":false,"name":"%s","purpose":"%s","reason":"a VM is running for it","vm_running":true}\n' "$slug" "$purpose"
+		else
+			log "$slug: a VM is still running for it - firecode down --project <dir>, or let firecode state reap do both"
+		fi
+		return 1
+	fi
+
+	# A session with no manifest is state from before manifests: we cannot say
+	# whether its work is out, and this verb's whole job is to be sure. One whose
+	# run never started holds nothing at all, and "nothing" is releasable.
+	if [[ $work == in || $work == unknown ]] && ((! force)); then
+		local why hint
+		if [[ $work == in ]]; then
+			why="its work was never copied out"
+		else
+			why="it has no manifest, so its extraction is unknown"
+		fi
+		hint="firecode extract <run-id> --bundle (then release again), or firecode state release $slug --force"
+		if ((json)); then
+			printf '{"released":false,"name":"%s","purpose":"%s","reason":"%s","unextracted":%s,"bytes":%s,"hint":"%s"}\n' \
+				"$slug" "$purpose" "$why" \
+				"$([[ $work == in ]] && echo true || echo false)" "$bytes" "$hint"
+		else
+			log "$slug: refusing to release it - $why"
+			log "  the drives may be the only copy: $(session_state_files "$slug" | tr '\n' ' ')"
+			log "  $hint"
+		fi
+		return 3
+	fi
+
+	if ((dry)); then
+		if ((json)); then
+			printf '{"released":false,"dry_run":true,"name":"%s","purpose":"%s","extraction":"%s","would_free_bytes":%s}\n' \
+				"$slug" "$purpose" "$work" "$bytes"
+		else
+			log "$slug: would release it ($purpose, extraction $work, $(numfmt --to=iec --suffix=B "$bytes"))"
+		fi
+		return 0
+	fi
+
+	local freed
+	freed=$(remove_session "$slug")
+	if ((json)); then
+		printf '{"released":true,"name":"%s","purpose":"%s","extraction":"%s","bytes":%s}\n' \
+			"$slug" "$purpose" "$work" "$freed"
+	else
+		log "$slug: released ($purpose, freed $(numfmt --to=iec --suffix=B "$freed"))"
+	fi
+	return 0
+}
+
+# REAP THE VMS WHOSE OWNER IS GONE - what an owner that crashed cannot do for
+# itself.
+#
+# `release` is called by a caller that is still alive. The failure it cannot
+# cover is the caller that died: its VM runs on, holding a tap and 4G, and
+# nothing will ever call anything on its behalf. So the reaper asks a different
+# question - "is this owner in the list of owners that are still alive" - and
+# the list comes FROM the caller, because only it knows.
+#
+# Given no list this refuses: a reaper with an empty list of the living would
+# conclude that everything is dead, which is the most destructive possible
+# reading of a missing argument.
+cmd_state_reap() {
+	local json=0 dry=0 force=0 stop=1 owners_file=""
+	local -a owners=()
+	while (($#)); do
+		case "$1" in
+		--owners)
+			owners_file=$2
+			shift 2
+			;;
+		--owner)
+			owners+=("$2")
+			shift 2
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		--dry-run)
+			dry=1
+			shift
+			;;
+		--force)
+			force=1
+			shift
+			;;
+		--no-stop)
+			stop=0
+			shift
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode state reap (--owners FILE | --owners - | --owner ID ...)
+                           [--json] [--dry-run] [--force] [--no-stop]
+
+  Releases every session whose owner is not in the list of owners that are
+  still alive. A VM belonging to one of them is stopped first (and its work
+  copied out); the state is removed only once the manifest says the work is
+  out. Nothing is removed on a missing argument: --owners is required.
+
+      cat live-session-ids | firecode state reap --owners - --json
+
+  --owners FILE   live owner ids, one per line (`-` reads stdin). A line is
+                  taken whole, or as the middle field of letibot:<id>:<pid>.
+  --no-stop       never stop a VM; report what would be reaped instead.
+  --force         release even work whose manifest says it was never copied out.
+USAGE
+			return 0
+			;;
+		*) die "reap: unknown option $1 (see firecode state reap --help)" ;;
+		esac
+	done
+	if [[ -n $owners_file ]]; then
+		if [[ $owners_file == - ]]; then
+			while IFS= read -r l; do [[ -n $l ]] && owners+=("$l"); done
+		else
+			[[ -r $owners_file ]] || die "reap: cannot read $owners_file"
+			while IFS= read -r l; do [[ -n $l ]] && owners+=("$l"); done <"$owners_file"
+		fi
+	fi
+	if ((${#owners[@]} == 0)); then
+		die "reap: refusing to run without a list of live owners.
+
+       With no list every owner would look gone, and every VM with one would be
+       stopped and its session released. Pass the ones that are alive:
+
+         firecode state reap --owners - --json   < live-ids.txt"
+	fi
+	local -A live=()
+	local o id slug purpose work owner running kept_unextracted=0
+	local -a reaped_rows=() kept_rows=()
+	for o in "${owners[@]}"; do
+		live["$(owner_session "$o")"]=1
+	done
+	local -a keys=()
+	state_index
+	mapfile -t keys < <(printf '%s\n' "${!S_BYTES[@]}" | sed '/^$/d' | sort)
+	for slug in ${keys[@]+"${keys[@]}"}; do
+		owner=$(manifest_field "$slug" owner)
+		[[ -n $owner ]] || continue
+		id=$(owner_session "$owner")
+		[[ -n ${live[$id]:-} ]] && continue
+		purpose=${S_PURPOSE[$slug]:-unknown}
+		work=${S_WORK[$slug]:-unknown}
+		running=${S_RUNNING[$slug]:-}
+		if [[ -n $running ]] && ((! dry)); then
+			if ((stop)); then
+				local rd proj
+				if rd=$(newest_run_of "$slug") && proj=$(cat "$rd/project" 2>/dev/null); then
+					log "reap: $slug - its owner $owner is gone; stopping the VM and copying its work out"
+					"$SELF" down --project "$proj" >/dev/null 2>&1 || true
+					running=""
+				fi
+			fi
+		fi
+		if [[ -n $running ]]; then
+			kept_rows+=("$slug")
+			continue
+		fi
+		if [[ $work == in || $work == unknown ]] && ((! force)); then
+			kept_rows+=("$slug")
+			kept_unextracted=$((kept_unextracted + 1))
+			continue
+		fi
+		if ((dry)); then
+			reaped_rows+=("$slug")
+			continue
+		fi
+		if remove_session "$slug" >/dev/null; then reaped_rows+=("$slug"); fi
+	done
+	if ((json)); then
+		printf '{"dry_run":%s,"reaped":[' "$([[ $dry == 1 ]] && echo true || echo false)"
+		local sep="" s
+		for s in ${reaped_rows[@]+"${reaped_rows[@]}"}; do
+			printf '%s"%s"' "$sep" "$s"
+			sep=,
+		done
+		printf '],"kept":['
+		sep=""
+		for s in ${kept_rows[@]+"${kept_rows[@]}"}; do
+			printf '%s"%s"' "$sep" "$s"
+			sep=,
+		done
+		printf '],"kept_unextracted":%s}\n' "$kept_unextracted"
+	else
+		if ((${#reaped_rows[@]} == 0)); then
+			log "reap: nothing to do - ${#owners[@]} owner(s) alive, no session left by a dead one"
+		else
+			log "reap: $([[ $dry == 1 ]] && echo 'would release' || echo 'released') ${#reaped_rows[@]} session(s) whose owner is gone: ${reaped_rows[*]}"
+		fi
+		((${#kept_rows[@]})) && log "  kept ${#kept_rows[@]} (${kept_rows[*]}) - $kept_unextracted hold work that is not out"
+	fi
+	return 0
+}
+
 cmd_state() {
 	local sub=${1:-list}
 	shift || true
@@ -4867,6 +5188,12 @@ cmd_state() {
 		;;
 	ls | table)
 		cmd_state_ls "$@"
+		;;
+	release)
+		cmd_state_release "$@"
+		;;
+	reap)
+		cmd_state_reap "$@"
 		;;
 	sessions)
 		local dir=${1:-$PWD} img tmp
@@ -4898,7 +5225,7 @@ cmd_state() {
 		log "removed this project's agent home, working tree and rootfs"
 		;;
 	*)
-		die "usage: firecode state [list|ls [--json]|sessions [dir]|reset [dir]]"
+		die "usage: firecode state [list|ls [--json]|release NAME|reap|sessions [dir]|reset [dir]]"
 		;;
 	esac
 }
@@ -5407,6 +5734,181 @@ cancel_marker() {
 	} >"$RUN_DIR/cancelled" 2>/dev/null || true
 	log "cancelled (SIG$sig) - marker written, this run did not fail"
 	return 0
+}
+
+# ---------------------------------------------------- the work, provably out
+#
+# A SESSION'S WORK IS EITHER COPIED OUT AND VERIFIED, OR IT IS NOT. Until this
+# existed, "the work is out" meant a log line somebody had read, and a state
+# directory could be 475G of drives nobody could date, attribute, or promise
+# anything about. The manifest says (`extracted`), the bundle proves, and every
+# deletion path asks before it removes anything.
+#
+# The bundle is made in the LIVE guest, from the guest's own repository: the
+# guest is the only thing that knows which refs it created, and a VM that has
+# stopped or gone to sleep has a disk image nobody should be reading from the
+# host while anything else may touch it.
+
+# Make a bundle of every ref in the guest's worktree, pull it out over vsock,
+# and print the commit it recorded. Nothing on stdout means nothing to extract:
+# no git, or a repository with no commits.
+#
+# The file lands beside the run (runs/<id>/work.bundle), not in the delivered
+# tree: the tree is somebody's work, and this is the receipt for it.
+guest_bundle() {
+	local sock=$1 dest=$2 dir=${3:-${WORKDIR:-$PWD}} tmp out tip cmd
+	[[ -n $sock && -n $dest ]] || return 1
+	tmp="/tmp/firecode-work.$$.bundle"
+	# One script, run in the guest. A repository with no commits is not a
+	# failure - there is simply nothing to bundle - so it says "none".
+	printf -v cmd 'cd %q 2>/dev/null || exit 0\n' "$dir"
+	cmd+='git rev-parse --git-dir >/dev/null 2>&1 || { echo none; exit 0; }'$'\n'
+	cmd+='git rev-parse HEAD >/dev/null 2>&1 || { echo none; exit 0; }'$'\n'
+	cmd+="rm -f $tmp"$'\n'
+	cmd+="git bundle create $tmp --all >/dev/null 2>&1 || { echo failed; exit 0; }"$'\n'
+	cmd+="chmod 0644 $tmp 2>/dev/null; git rev-parse HEAD"$'\n'
+	out=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "$cmd" 2>/dev/null) || return 1
+	tip=$(printf '%s\n' "$out" | grep -E '^[0-9a-f]{40}$' | head -1 || true)
+	if [[ -z $tip ]]; then
+		case "$out" in
+		*none*) log "nothing to bundle: the guest's worktree has no commits" ;;
+		*) log "could not bundle the guest's work: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
+		esac
+		return 1
+	fi
+	mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+	if ! python3 "$SCRIPTS/vsock-cp.py" "$sock" "$FILES_PORT" get "$tmp" "$dest" 2>/dev/null; then
+		log "could not copy the bundle out of the guest"
+		return 1
+	fi
+	printf '%s\n' "$tip"
+}
+
+# Verify a bundle and answer with the commit it holds: "ok<TAB><sha>" or
+# "bad<TAB>why".
+#
+# Two questions, and the second is the one that matters: is the file a bundle
+# git can read, and does it actually CONTAIN the commit the guest said it was
+# on? A bundle that verifies but predates the last commit is the failure this
+# layer exists to catch, and `bundle verify` alone cannot see it.
+bundle_verify() {
+	local file=$1 want=${2:-} tip repo
+	[[ -f $file ]] || {
+		printf 'bad\tno such file\n'
+		return 1
+	}
+	if ! git bundle verify "$file" >/dev/null 2>&1; then
+		printf 'bad\tnot a bundle git can read\n'
+		return 1
+	fi
+	tip=$(git bundle list-heads "$file" 2>/dev/null | head -1 | cut -d' ' -f1)
+	if [[ -n $want ]]; then
+		repo=$(mktemp -d)
+		git -C "$repo" init -q 2>/dev/null || true
+		# Into its own namespace: a fresh repository has master checked out,
+		# and git refuses to fetch over a checked-out branch.
+		if ! git -C "$repo" fetch -q "$file" '+refs/*:refs/firecode/*' 2>/dev/null ||
+			! git -C "$repo" cat-file -e "${want}^{commit}" 2>/dev/null; then
+			rm -rf "$repo"
+			printf 'bad\tthe bundle does not contain %s\n' "$want"
+			return 1
+		fi
+		rm -rf "$repo"
+		tip=$want
+	fi
+	if [[ -z $tip ]]; then
+		printf 'bad\tno refs\n'
+		return 1
+	fi
+	printf 'ok\t%s\n' "$tip"
+}
+
+# Record that this session's work is out, in the two places that ask: the
+# session's manifest (what `state ls`, release and gc read) and the run
+# directory (for a caller that has the run id and not the state).
+record_extraction() {
+	local slug=${1:-${SLUG:-}} tip=${2:-} bundle=${3:-} nothing=${4:-0}
+	local -a args=()
+	[[ -n $slug ]] || return 0
+	if ((nothing)); then
+		manifest extracted "$slug" --nothing
+	elif [[ -n $tip ]]; then
+		args=(--tip "$tip" --verified)
+		[[ -n $bundle ]] && args+=(--bundle "$bundle")
+		manifest extracted "$slug" "${args[@]}"
+	else
+		return 0
+	fi
+	if [[ -n ${RUN_DIR:-} && -d $RUN_DIR ]]; then
+		{
+			printf 'at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			printf 'tip %s\n' "${tip:-none}"
+			printf 'bundle %s\n' "${bundle:-none}"
+		} >"$RUN_DIR/extracted" 2>/dev/null || true
+	fi
+	return 0
+}
+
+# The copy-out's half: a bundle of the delivered tree's history, verified, then
+# recorded. Called from the copy-out paths once the tree is whole, so `done
+# <path>` never means less than "the work is out and its commits are in a
+# bundle".
+#
+# A tree with no git - most fixtures, and anything not under version control -
+# is not a failure: there are no commits to lose, and the directory IS the
+# work. Recorded as "nothing to extract" rather than left unknown, so a session
+# that only built things can still be reclaimed.
+bundle_copy_out() {
+	local tree=$1 tip bundle verdict count
+	[[ -n ${SLUG:-} ]] || return 0
+	if [[ ! -d $tree/.git ]] || ! tip=$(git -C "$tree" rev-parse HEAD 2>/dev/null); then
+		record_extraction "$SLUG" "" "" 1
+		return 0
+	fi
+	bundle="${RUN_DIR:-$tree}/work.bundle"
+	if ! git -C "$tree" bundle create "$bundle" --all >/dev/null 2>&1; then
+		log "WARNING: could not bundle this run's commits - the work is delivered, its commits are only in $tree"
+		return 0
+	fi
+	if ! verdict=$(bundle_verify "$bundle" "$tip"); then
+		log "WARNING: the bundle of this run's commits did not verify: ${verdict#*$'\t'}"
+		log "  the work is delivered and its history is in $tree - nothing is lost, it is not recorded"
+		return 0
+	fi
+	record_extraction "$SLUG" "$tip" "$bundle" 0
+	count=$(git -C "$tree" rev-list --count "$tip" 2>/dev/null || true)
+	log "commits: ${tip:0:8} verified in $(basename "$bundle")${count:+, ${count} deep}"
+}
+
+# WHETHER A SESSION'S WORK IS OUT, asked once for every deletion path.
+#
+#   out      its manifest says so: extracted, with the tip and the bundle
+#   nothing  a manifest whose run never started: empty drives, nothing to lose
+#   in       the manifest says it was never extracted - REFUSE, the drives are
+#            the only copy
+#   unknown  no manifest: state from before manifests. The age rules still
+#            apply, as they always did, and the pass SAYS how many of these it
+#            removed blind - a 475G backlog cannot be reclaimed otherwise, and
+#            a silent reclaim would look like a promise it did not make.
+session_work_state() {
+	local slug=$1 p mark runs
+	p=$(manifest_path "$slug")
+	if [[ ! -f $p ]]; then
+		printf 'unknown\n'
+		return 0
+	fi
+	mark=$(python3 "$SESSION_MANIFEST" get "$p" extracted 2>/dev/null || true)
+	if [[ -n $mark ]]; then
+		printf 'out\n'
+		return 0
+	fi
+	# A manifest whose run never started has empty drives: nothing to lose.
+	runs=$(python3 "$SESSION_MANIFEST" get "$p" runs 2>/dev/null || true)
+	if [[ -z $runs || $runs == "[]" ]]; then
+		printf 'nothing\n'
+	else
+		printf 'in\n'
+	fi
 }
 
 # WHAT AN EPHEMERAL RUN DOES WITH ITS STATE, ONCE ITS WORK IS OUT.
@@ -7322,6 +7824,17 @@ EOF
 		# agent's work. Before the record says done, because whatever reads
 		# that record reads the verdict next.
 		mounted_markers
+		# Mounted means the work never left the consumer's tree, so its
+		# commits are already where they belong and there is no bundle to
+		# carry. Verified by asking that repository, which is the only
+		# question that matters for "is it out".
+		local mhead=""
+		mhead=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null || true)
+		if [[ -n $mhead ]]; then
+			record_extraction "$SLUG" "$mhead" "" 0
+		else
+			record_extraction "$SLUG" "" "" 1
+		fi
 		copy_out_mark "done $WORKDIR"
 	else
 		((SYNC_BACK)) || copy_out_mark none
@@ -7351,6 +7864,17 @@ EOF
 		# Then whatever it did not commit.
 		rsync -a --delete --exclude=.git "$tmp"/ "$WORKDIR"/ 2>/dev/null || true
 		rm -rf "$tmp"
+		# The commits are in the worktree now, which is where they belong:
+		# the branch was moved onto them two lines up. Recorded from that
+		# repository rather than bundled, because a bundle of the consumer's
+		# whole repository is not a receipt for this run.
+		local whead=""
+		whead=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null || true)
+		if [[ -z $whead ]]; then
+			record_extraction "$SLUG" "" "" 1
+		else
+			record_extraction "$SLUG" "$whead" "" 0
+		fi
 		copy_out_mark "done $WORKDIR"
 
 		echo
@@ -7461,6 +7985,10 @@ EOF
 		if [[ -z $DELIVER ]] && same_history "$WORKDIR" "$staging" &&
 			diff -rq --exclude=.git "$WORKDIR" "$staging" >/dev/null 2>&1; then
 			rm -rf "$staging"
+			# Nothing was delivered, so nothing is left in the drives that
+			# is not in the project already - which is what lets this
+			# session's state go. Said as "out", with the reason.
+			record_extraction "$SLUG" "" "" 1
 			copy_out_mark none
 			log "nothing changed, so no result directory"
 			echo
@@ -7481,6 +8009,9 @@ EOF
 		printf '%s\n' "$WORKDIR" >"$RUN_DIR/workdir"
 		# The same string as runs/<id>/result, so the two never disagree.
 		[[ $out_dir == /* ]] || out_dir=$(realpath -m -- "$out_dir")
+		# THE COMMITS, BUNDLED AND VERIFIED, before the record says done.
+		# After the rename, because the tree it bundles is the delivered one.
+		bundle_copy_out "$out_dir"
 		copy_out_mark "done $out_dir"
 
 		echo
@@ -7644,13 +8175,46 @@ defang_git() {
 # ---------------------------------------------------------------- commands
 
 cmd_extract() {
-	local id=${1:-}
-	[[ -n $id ]] || die "usage: firecode extract <run-id> [dest]"
+	local id="" dest="" bundle=0 a
+	while (($#)); do
+		case "$1" in
+		--bundle)
+			bundle=1
+			shift
+			;;
+		*)
+			if [[ -z $id ]]; then id=$1; else dest=$1; fi
+			shift
+			;;
+		esac
+	done
+	[[ -n $id ]] || die "usage: firecode extract <run-id> [dest] [--bundle]"
 	local img="$RUNS/$id/src.ext4"
 	[[ -f $img ]] || die "no src drive for run $id (already cleaned up?)"
-	local dest=${2:-$RUNS/$id/src}
+	[[ -n $dest ]] || dest="$RUNS/$id/src"
 	log "extracting $img to $dest"
 	extract_image "$img" "$dest"
+	if ((bundle)); then
+		# A run whose copy-out failed leaves its work in this drive and
+		# nothing else. `--bundle` is how a caller turns that drive into a
+		# verifiable repository bundle and records the session as extracted,
+		# which is what `state release` and gc then trust.
+		local proj slug="" tip="" file="$RUNS/$id/work.bundle"
+		proj=$(cat "$RUNS/$id/project" 2>/dev/null || true)
+		[[ -n $proj ]] && slug=$(project_slug "$proj")
+		if [[ ! -d $dest/.git ]] || ! tip=$(git -C "$dest" rev-parse HEAD 2>/dev/null); then
+			log "this run's tree has no git history to bundle - the directory is the work"
+			[[ -n $slug ]] && record_extraction "$slug" "" "" 1
+		else
+			if git -C "$dest" bundle create "$file" --all >/dev/null 2>&1 &&
+				bundle_verify "$file" "$tip" >/dev/null; then
+				log "bundle verified: ${tip:0:8} in $file"
+				[[ -n $slug ]] && record_extraction "$slug" "$tip" "$file" 0
+			else
+				die "the bundle did not verify - nothing was recorded, and $(basename "$dest") still holds the work"
+			fi
+		fi
+	fi
 	echo "$dest"
 }
 
@@ -8512,66 +9076,157 @@ index_runs_by_session() {
 # `ephemeral` (third argument) restricts the pass to those - what the disk guard
 # runs before refusing to boot, so a full disk costs an ephemeral session rather
 # than the operator's toolchain caches.
-gc_state_pass() {
-	local older=$1 dry=$2 only_ephemeral=${3:-0}
-	local minutes slug f t newest ephemeral bytes total=0 n=0 sessions=0
-	local kept_live=0 kept_other=0 grace cutoff
+# THE SESSIONS AS THE REAPERS SEE THEM, read once.
+#
+# Two passes and a release verb all need the same facts - how big, how old,
+# what for, and whether its work is out - and they must not disagree about any
+# of them. The facts are computed in one place (scripts/session-manifest.py,
+# from what is on disk) and read into these arrays once, because asking per
+# session costs a python per session and this host has 204 of them.
+declare -A S_BYTES=() S_LAST=() S_PURPOSE=() S_WORK=() S_POOL=() S_POOLPROJ=() S_RUNNING=()
+
+# One line per session for the python report: name, bytes, files, newest mtime.
+state_rows() {
+	local slug m bytes files newest
+	while IFS= read -r slug; do
+		[[ -n $slug ]] || continue
+		m=$(session_metrics "$slug")
+		IFS=$'\t' read -r bytes files newest <<<"$m"
+		((files > 0)) || continue
+		printf '%s\t%s\t%s\t%s\n' "$slug" "$bytes" "$newest" "$files"
+	done < <(state_sessions)
+}
+
+state_index() {
+	local slug bytes files purpose work last manifest pool poolproj runlast
+	S_BYTES=() S_LAST=() S_PURPOSE=() S_WORK=() S_POOL=() S_RUNNING=()
+	index_runs_by_session
+	[[ -d $STATE_DIR ]] || return 0
+	while IFS=$'\t' read -r slug bytes files purpose work last manifest pool poolproj; do
+		[[ -n $slug ]] || continue
+		S_BYTES[$slug]=$bytes
+		S_PURPOSE[$slug]=$purpose
+		S_WORK[$slug]=$work
+		# shellcheck disable=SC2034  # read by the pool verbs, which need to know which sessions may sleep
+		S_POOL[$slug]=$pool
+		# shellcheck disable=SC2034  # as S_POOL: the pool's key is project + purpose + image
+		S_POOLPROJ[$slug]=$poolproj
+		S_LAST[$slug]=$last
+		# A run directory's mtime is "somebody used this session then" and
+		# outranks an old drive: the question is not how old the disk is but
+		# how long ago it was wanted.
+		runlast=${SESSION_LAST_RUN[$slug]:-0}
+		if [[ $runlast =~ ^[0-9]+$ ]] && ((runlast > ${S_LAST[$slug]:-0})); then
+			S_LAST[$slug]=$runlast
+		fi
+		if [[ -n ${SESSION_RUNNING[$slug]:-} ]]; then
+			S_RUNNING[$slug]=1
+		else
+			unset "S_RUNNING[$slug]"
+		fi
+	done < <(state_rows | python3 "$SESSION_MANIFEST" report "$STATE_DIR" --tsv)
+	return 0
+}
+
+# What all the sessions hold together. Bytes, because the budget is bytes.
+state_used() {
+	local slug total=0
+	local -a keys=("${!S_BYTES[@]}")
+	for slug in ${keys[@]+"${keys[@]}"}; do
+		total=$((total + ${S_BYTES[$slug]:-0}))
+	done
+	printf '%s\n' "$total"
+}
+
+# Remove one session: every file it owns, and the manifest last, so a crash
+# halfway leaves the manifest (which says what is missing) rather than a pile of
+# drives nobody can name. Prints the bytes it freed.
+remove_session() {
+	local slug=$1 f b bytes=0
 	local -a files=()
-	local -a rows=()
+	while IFS= read -r f; do files+=("$f"); done < <(session_state_files "$slug")
+	for f in ${files[@]+"${files[@]}"}; do
+		b=$(file_bytes "$f")
+		bytes=$((bytes + b))
+	done
+	for f in ${files[@]+"${files[@]}"}; do
+		[[ $f == *.json ]] && continue
+		rm -f "$f" 2>/dev/null || true
+	done
+	rm -f "$(manifest_path "$slug")" 2>/dev/null || true
+	printf '%s\n' "$bytes"
+}
+
+# One field of a session's manifest, or nothing.
+manifest_field() {
+	local slug=$1 key=$2
+	python3 "$SESSION_MANIFEST" get "$(manifest_path "$slug")" "$key" 2>/dev/null || true
+}
+
+gc_state_pass() {
+	local older=$1 dry=$2 only_ephemeral=${3:-0} force=${4:-0} json=${5:-0}
+	local minutes slug now grace cutoff purpose work last bytes total=0 n=0 sessions=0
+	local kept_live=0 kept_other=0 kept_unextracted=0 flagged=0
+	local -a chosen=() rows=()
 	minutes=$(age_minutes "$older") ||
 		die "--older-than takes an age like 90m, 12h or 2d, not: $older"
 	if [[ ! -d $STATE_DIR ]]; then
 		log "no state directory at $STATE_DIR"
 		return 0
 	fi
-	grace=$(($(date +%s) - ${FIRECODE_STATE_GRACE_MIN:-10} * 60))
-	cutoff=$(($(date +%s) - minutes * 60))
-	index_runs_by_session
-
-	while IFS= read -r slug; do
-		[[ -n $slug ]] || continue
-		if [[ -n ${SESSION_RUNNING[$slug]:-} ]]; then
+	now=$(date +%s)
+	grace=$((now - ${FIRECODE_STATE_GRACE_MIN:-10} * 60))
+	cutoff=$((now - minutes * 60))
+	local -a keys=()
+	state_index
+	mapfile -t keys < <(printf '%s\n' "${!S_BYTES[@]}" | sed '/^$/d' | sort)
+	for slug in ${keys[@]+"${keys[@]}"}; do
+		if [[ -n ${S_RUNNING[$slug]:-} ]]; then
 			kept_live=$((kept_live + 1))
 			continue
 		fi
-		files=()
-		while IFS= read -r f; do files+=("$f"); done < <(session_state_files "$slug")
-		# Nothing on disk to weigh: a lock whose drives are already gone, or a
-		# session that vanished between the listing and here.
-		((${#files[@]})) || continue
-		ephemeral=0
-		[[ -f $STATE_DIR/$slug.ephemeral ]] && ephemeral=1
-		if ((only_ephemeral)) && ((! ephemeral)); then
+		purpose=${S_PURPOSE[$slug]:-unknown}
+		work=${S_WORK[$slug]:-unknown}
+		last=${S_LAST[$slug]:-0}
+		# An EPHEMERAL marker is the fact; the purpose is what the manifest
+		# says, and state from before manifests has only the marker.
+		if [[ -f $STATE_DIR/$slug.ephemeral ]]; then purpose=ephemeral; fi
+		# NEVER SILENTLY Unextracted. A manifest that says the work was not
+		# copied out is a drive that may be the only copy; it stays until
+		# somebody extracts it, or says --force in so many words.
+		if [[ $work == in ]] && ((! force)); then
+			kept_unextracted=$((kept_unextracted + 1))
+			if ((now - last > 3 * 86400)); then flagged=$((flagged + 1)); fi
+			continue
+		fi
+		if ((only_ephemeral)) && [[ $purpose != ephemeral ]]; then
 			kept_other=$((kept_other + 1))
 			continue
 		fi
-		newest=${SESSION_LAST_RUN[$slug]:-0}
-		for f in "${files[@]}"; do
-			t=$(stat -c %Y "$f" 2>/dev/null) || t=0
-			[[ $t =~ ^[0-9]+$ ]] || t=0
-			((t > newest)) && newest=$t
-		done
 		# Too recent to reason about - see FIRECODE_STATE_GRACE_MIN.
-		if ((newest > grace)); then
+		if ((last > grace)); then
 			kept_other=$((kept_other + 1))
 			continue
 		fi
-		# An ephemeral session is reclaimable at any age; everything else has
-		# to have been left alone for AGE.
-		if ((! ephemeral)) && ((newest > cutoff)); then
+		# An ephemeral session is reclaimable at any age; everything else
+		# has to have been left alone for AGE.
+		if [[ $purpose != ephemeral ]] && ((last > cutoff)); then
 			kept_other=$((kept_other + 1))
 			continue
 		fi
+		chosen+=("$slug")
+	done
+
+	for slug in ${chosen[@]+"${chosen[@]}"}; do
 		sessions=$((sessions + 1))
-		bytes=0
-		for f in "${files[@]}"; do
-			t=$(file_bytes "$f")
-			bytes=$((bytes + t))
-			rows+=("$t|$f")
-		done
-		total=$((total + bytes))
-		n=$((n + ${#files[@]}))
-	done < <(state_sessions)
+		local f
+		while IFS= read -r f; do
+			[[ $f == *.json ]] && continue
+			rows+=("$(file_bytes "$f")|$f")
+			n=$((n + 1))
+		done < <(session_state_files "$slug")
+		total=$((total + ${S_BYTES[$slug]:-0}))
+	done
 
 	if ((${#rows[@]})); then
 		local row
@@ -8581,29 +9236,208 @@ gc_state_pass() {
 				"$(date -r "${row#*|}" '+%Y-%m-%d')" "$(basename "${row#*|}")"
 		done
 	fi
-	if ((n == 0)); then
-		log "state: nothing to remove in $STATE_DIR ($kept_live session(s) with a VM, $kept_other not removable)"
+	if ((json)); then
+		printf '{"dry_run":%s,"sessions":[' "$([[ $dry == 1 ]] && echo true || echo false)"
+		local sep="" s
+		for s in ${chosen[@]+"${chosen[@]}"}; do
+			printf '%s{"name":"%s","bytes":%s,"purpose":"%s","extraction":"%s","last_used_epoch":%s}' \
+				"$sep" "$s" "${S_BYTES[$s]:-0}" "${S_PURPOSE[$s]:-unknown}" \
+				"${S_WORK[$s]:-unknown}" "${S_LAST[$s]:-0}"
+			sep=,
+		done
+		printf '],"freed_bytes":%s,"files":%s,"kept":{"running":%s,"unextracted":%s,"flagged":%s,"other":%s}}\n' \
+			"$total" "$n" "$kept_live" "$kept_unextracted" "$flagged" "$kept_other"
+	else
+		if ((n == 0)); then
+			log "state: nothing to remove in $STATE_DIR ($kept_live session(s) with a VM, $kept_other not removable)"
+		else
+			if ((dry)); then
+				log "state: would remove $n file(s), $(numfmt --to=iec --suffix=B "$total") from $sessions session(s) in $STATE_DIR"
+			else
+				for s in ${chosen[@]+"${chosen[@]}"}; do remove_session "$s" >/dev/null || true; done
+				log "state: removed $n file(s), $(numfmt --to=iec --suffix=B "$total") from $sessions session(s) in $STATE_DIR"
+			fi
+			log "  kept $kept_live session(s) with a VM running, $kept_other not removable (older-than $older)"
+		fi
+	fi
+	if ((kept_unextracted)); then
+		log "state: $kept_unextracted session(s) hold work that was never copied out - kept"
+		if ((flagged)); then
+			log "  $flagged of them have not been touched for 3 days or more: firecode extract <run> --bundle,"
+			log "  or firecode state release <name> once it is out. They are never removed automatically."
+		fi
+	fi
+	return 0
+}
+
+# THE BUDGET PASS: keep the state under a ceiling, worst first.
+#
+# The age pass asks "is anybody coming back to this"; this asks "what has to go
+# for the disk to be usable", which is a different and much less forgiving
+# question - a host at 100% cannot boot anything, whatever the ages say.
+#
+# Order, and each step is a rule about what may be lost:
+#   test, ephemeral   free by construction
+#   reviewer          a pool member, rebuilt from its image
+#   extracted         its work is out and verified by the manifest
+#   unknown           no manifest: reclaimable on AGE, and SAID to be blind
+# Never a running VM, never work a manifest says is unextracted, never anything
+# inside the grace period.
+#
+# Removes from the high-water mark (80% of budget) down to the low one (60%),
+# so an ordinary pass does nothing and a full disk gets real room back. When it
+# cannot reach the target it says so and why - a pass that quietly gave up is
+# how the disk fills up for a second time.
+gc_state_budget() {
+	local budget=$1 maxage=$2 dry=$3 force=${4:-0} json=${5:-0}
+	local now high low used slug rank total=0 removed=0 sessions=0
+	local kept_live=0 kept_unextracted=0 kept_young=0 flagged=0 reason=""
+	local -a plan=() removed_rows=()
+	if [[ ! -d $STATE_DIR ]]; then
+		log "no state directory at $STATE_DIR"
 		return 0
 	fi
-	if ((dry)); then
-		log "state: would remove $n file(s), $(numfmt --to=iec --suffix=B "$total") from $sessions session(s) in $STATE_DIR"
-	else
-		local row
-		for row in "${rows[@]}"; do rm -f "${row#*|}" || true; done
-		log "state: removed $n file(s), $(numfmt --to=iec --suffix=B "$total") from $sessions session(s) in $STATE_DIR"
+	state_index
+	used=$(state_used)
+	high=$((budget * 80 / 100))
+	low=$((budget * 60 / 100))
+	now=$(date +%s)
+	if ((used <= high)); then
+		if ((json)); then
+			printf '{"dry_run":%s,"used_bytes":%s,"budget_bytes":%s,"high_bytes":%s,"low_bytes":%s,"removed":[],"freed_bytes":0,"target_reached":true}\n' \
+				"$([[ $dry == 1 ]] && echo true || echo false)" "$used" "$budget" "$high" "$low"
+		else
+			log "state: $(numfmt --to=iec --suffix=B "$used") of a $(numfmt --to=iec --suffix=B "$budget") budget, under the $(numfmt --to=iec --suffix=B "$high") high-water mark - nothing to remove"
+		fi
+		return 0
 	fi
-	log "  kept $kept_live session(s) with a VM running, $kept_other not removable (older-than $older)"
+
+	# Rank, then oldest first. Rank is what may be lost most cheaply.
+	local -a order=() keys=()
+	local maxsec=0
+	maxsec=$(($(age_minutes "$maxage") * 60))
+	mapfile -t keys < <(printf '%s\n' "${!S_BYTES[@]}" | sed '/^$/d' | sort)
+	for slug in ${keys[@]+"${keys[@]}"}; do
+		if [[ -n ${S_RUNNING[$slug]:-} ]]; then
+			kept_live=$((kept_live + 1))
+			continue
+		fi
+		if [[ ${S_WORK[$slug]:-unknown} == in ]] && ((! force)); then
+			kept_unextracted=$((kept_unextracted + 1))
+			if ((now - ${S_LAST[$slug]:-0} > 3 * 86400)); then flagged=$((flagged + 1)); fi
+			continue
+		fi
+		if ((now - ${S_LAST[$slug]:-0} < ${FIRECODE_STATE_GRACE_MIN:-10} * 60)); then
+			kept_young=$((kept_young + 1))
+			continue
+		fi
+		# The marker is the fact for state from before manifests.
+		if [[ -f $STATE_DIR/$slug.ephemeral ]]; then
+			S_PURPOSE[$slug]=ephemeral
+		fi
+		case ${S_PURPOSE[$slug]:-unknown} in
+		test) rank=0 ;;
+		ephemeral) rank=1 ;;
+		reviewer) rank=2 ;;
+		*)
+			if [[ ${S_WORK[$slug]:-unknown} == unknown ]]; then
+				# State from before manifests: only reachable by age, and
+				# said to be so in the report.
+				((now - ${S_LAST[$slug]:-0} < maxsec)) && {
+					kept_young=$((kept_young + 1))
+					continue
+				}
+				rank=4
+			else
+				rank=3
+			fi
+			;;
+		esac
+		order+=("$rank $((${S_LAST[$slug]:-0})) $slug")
+	done
+	# An empty list must produce an empty file, not one blank line: `printf
+	# '%s\n'` with no arguments prints an empty string, and an empty slug then
+	# reads as a bad array subscript below.
+	if ((${#order[@]})); then
+		while IFS= read -r line; do
+			[[ -n $line ]] && plan+=("${line##* }")
+		done < <(printf '%s\n' "${order[@]}" | sort -n -k1,1 -k2,2)
+	fi
+
+	for slug in ${plan[@]+"${plan[@]}"}; do
+		((used - total <= low)) && break
+		total=$((total + ${S_BYTES[$slug]:-0}))
+		removed=$((removed + 1))
+		removed_rows+=("$slug")
+		sessions=$((sessions + 1))
+		if ((! dry)); then remove_session "$slug" >/dev/null || true; fi
+	done
+
+	if ((used - total > low)); then
+		reason="only $(numfmt --to=iec --suffix=B "$total") was reclaimable"
+		if ((kept_unextracted)); then
+			reason+="; $kept_unextracted session(s) hold unextracted work"
+		fi
+		if ((kept_live)); then
+			reason+="; $kept_live have a VM running"
+		fi
+	fi
+	if ((json)); then
+		printf '{"dry_run":%s,"used_bytes":%s,"budget_bytes":%s,"high_bytes":%s,"low_bytes":%s,"freed_bytes":%s,"removed":[' \
+			"$([[ $dry == 1 ]] && echo true || echo false)" "$used" "$budget" "$high" "$low" "$total"
+		local sep="" s
+		for s in ${removed_rows[@]+"${removed_rows[@]}"}; do
+			printf '%s{"name":"%s","bytes":%s,"purpose":"%s","extraction":"%s"}' \
+				"$sep" "$s" "${S_BYTES[$s]:-0}" "${S_PURPOSE[$s]:-unknown}" "${S_WORK[$s]:-unknown}"
+			sep=,
+		done
+		printf '],"target_reached":%s,"reason":' "$([[ $reason ]] && echo false || echo true)"
+		if [[ -n $reason ]]; then printf '"%s"' "${reason//\"/}"; else printf 'null'; fi
+		printf ',"kept":{"running":%s,"unextracted":%s,"flagged":%s,"young":%s}}\n' \
+			"$kept_live" "$kept_unextracted" "$flagged" "$kept_young"
+	else
+		if ((removed == 0)); then
+			log "state: $(numfmt --to=iec --suffix=B "$used") over the $(numfmt --to=iec --suffix=B "$high") high-water mark, and nothing may be removed: $reason"
+		else
+			log "state: $(numfmt --to=iec --suffix=B "$used") was over the $(numfmt --to=iec --suffix=B "$high") high-water mark; $([[ $dry == 1 ]] && echo 'would remove' || echo 'removed') $removed session(s), $(numfmt --to=iec --suffix=B "$total") - now $(numfmt --to=iec --suffix=B "$((used - total))") of a $(numfmt --to=iec --suffix=B "$budget") budget"
+		fi
+		if [[ -n $reason ]]; then
+			log "  could not reach the $(numfmt --to=iec --suffix=B "$low") target: $reason"
+		fi
+	fi
+	if ((kept_unextracted)); then
+		log "  $kept_unextracted session(s) hold work that was never copied out - never removed automatically$( ((flagged)) && echo ", $flagged for 3 days or more")"
+	fi
 	return 0
 }
 
 cmd_gc() {
 	local keep=5 older="" sweep=0 state=0 dry=0 n=0 d
+	local budget="" maxage="" force=0 json=0
 	local -a stuck=()
 	while [[ ${1:-} == -* ]]; do
 		case "$1" in
 		--older-than)
 			older=${2:?--older-than needs an age: 90m, 12h or 2d}
 			shift 2
+			;;
+		--max-age)
+			maxage=${2:?--max-age needs an age: 90m, 12h or 14d}
+			shift 2
+			;;
+		--budget)
+			budget=${2:?--budget needs a size: 100G, 150GiB}
+			shift 2
+			;;
+		--force)
+			# Remove sessions whose manifest says their work was never copied
+			# out. Never implied: this is the one flag that can lose work.
+			force=1
+			shift
+			;;
+		--json)
+			json=1
+			shift
 			;;
 		--state)
 			state=1
@@ -8616,7 +9450,8 @@ cmd_gc() {
 		-h | --help)
 			cat <<'USAGE'
 usage: firecode gc [KEEP] [--older-than AGE]
-       firecode gc --state [--older-than AGE] [--dry-run]
+       firecode gc --state [--older-than AGE] [--dry-run] [--force] [--json]
+       firecode gc --state [--budget SIZE] [--max-age AGE] [--dry-run] [--json]
 
   KEEP              finished runs to keep (default 5). Older ones are removed
                     outright; the newest KEEP lose only their drives.
@@ -8634,7 +9469,21 @@ usage: firecode gc [KEEP] [--older-than AGE]
                     (default 2d), listing each with its size. An EPHEMERAL
                     session's state goes at any age - nobody will resume it -
                     and `--dry-run` lists without removing. Nothing of a
-                    running VM's is ever touched.
+                    running VM's is ever touched, and nothing whose manifest
+                    says its work was never copied out.
+
+  --budget SIZE     a different question: keep the state under SIZE (default
+                    150G). Nothing happens below 80% of it; above that,
+                    sessions go oldest-first by class - test, ephemeral,
+                    reviewer, work verified out - until it is back to 60%.
+                    Says so plainly when it cannot get there, and why.
+  --max-age AGE     with --budget, the age at which state with no manifest at
+                    all may be reclaimed (default 14d). Never applies to work a
+                    manifest says is unextracted.
+  --force           include sessions whose work is not out. Without it they are
+                    kept and reported, however old they are.
+  --json            one object, for a reaper: what was removed, what was kept
+                    and why, and whether the target was reached.
 USAGE
 			return 0
 			;;
@@ -8654,9 +9503,17 @@ USAGE
 	if ((state)); then
 		# Its own pass, touching state/ and nothing else: that is what makes
 		# --dry-run an honest list of everything this command would do.
-		gc_state_pass "${older:-2d}" "$dry"
+		if [[ -n $budget ]]; then
+			gc_state_budget "$(numfmt --from=iec "$budget" 2>/dev/null || echo "$budget")" \
+				"${maxage:-${FIRECODE_STATE_POOL_MAX_AGE:-14d}}" "$dry" "$force" "$json"
+			return 0
+		fi
+		[[ -n $maxage ]] && die "--max-age goes with --budget"
+		gc_state_pass "${older:-2d}" "$dry" 0 "$force" "$json"
 		return 0
 	fi
+	[[ -n $budget ]] && die "--budget goes with --state"
+	[[ -n $maxage ]] && die "--max-age goes with --state --budget"
 	[[ -d $RUNS ]] || return 0
 	# Each `up` keeps its own log beside the runs. One a day untouched belongs
 	# to a VM long gone - a running one is still writing to its own.
