@@ -5322,14 +5322,22 @@ printf "%s%s\n" "$c" "$n"'
 # Printed rather than inlined so the rule is readable, testable and the same on
 # both platforms.
 pool_reset_command() {
-	local dir=${1:-/work} keep e
+	local dir=${1:-/work} home=${2:-${FIRECODE_HOME:-$HOME}} keep e
 	local -a clean=()
 	keep=${FIRECODE_POOL_KEEP:-target,.sccache,node_modules,.venv}
 	for e in ${keep//,/ }; do clean+=(-e "$e"); done
 	printf 'cd %q 2>/dev/null || exit 0\n' "$dir"
-	printf 'git rev-parse --git-dir >/dev/null 2>&1 && { git reset --hard -q; git clean -xffdq %s; }' "${clean[*]}"
-	printf '\n'
-	printf '%s\n' 'rm -rf ~/.claude/projects ~/.claude/todos ~/.claude/shell-snapshots ~/.claude.json ~/.opencode ~/.local/share/opencode ~/.bash_history ~/.zsh_history'
+	# A reset that half happened is worse than one that did not: git failing
+	# here leaves the last user's files in the tree, so it ends the script with
+	# a status the caller refuses to pool on rather than one it ignores.
+	printf 'if git rev-parse --git-dir >/dev/null 2>&1; then git reset --hard -q || exit 3; git clean -xffdq %s || exit 3; fi\n' "${clean[*]}"
+	# THE RUN USER'S HOME, not root's. The guest runs the agent as
+	# FIRECODE_USER, so `~` in a script the host sends as root pointed at
+	# /root and cleared none of the conversation the reset exists to clear.
+	# Fixed paths rather than a variable: this text is quoted for the guest's
+	# shell, and a home with a space in it is not a thing the guest has.
+	printf 'rm -rf %q/.claude/projects %q/.claude/todos %q/.claude/shell-snapshots %q/.claude.json %q/.opencode %q/.local/share/opencode %q/.bash_history %q/.zsh_history\n' \
+		"$home" "$home" "$home" "$home" "$home" "$home" "$home" "$home"
 	printf '%s\n' 'rm -rf /tmp/* /tmp/.[!.]* /var/tmp/* 2>/dev/null || true'
 	printf '%s\n' 'echo reset-ok'
 }
@@ -5433,7 +5441,74 @@ session_project() {
 	printf '%s\n' "$p"
 }
 
-# RETURN A VM TO ITS PROJECT'S POOL, when the session that had it is over.
+# ONE REFUSAL, in whichever of the two voices the caller asked for: a caller that
+# parses --json and one reading the log both have to be able to act on it.
+#
+# Always answers 0: refusals differ in what a caller should DO with them - a
+# session nobody can locate is nothing to return, while one whose drives are the
+# only copy is an alarm - and the caller says which by its own exit status.
+# (Under `set -e` a helper returning 1 ends the command on the spot, which is how
+# every refusal became an empty answer.)
+pool_return_refuse() {
+	local slug=$1 json=$2 reason=$3 detail=${4:-}
+	detail=$(printf '%s' "$detail" | sed 's/["\\]//g' | tr '\n' ' ')
+	if ((json)); then
+		printf '{"returned":false,"name":"%s","reason":"%s"%s}\n' "$slug" "$reason" \
+			"${detail:+,\"detail\":\"$detail\"}"
+	else
+		log "$slug: $reason"
+		[[ -n $detail ]] && log "  $detail"
+	fi
+	return 0
+}
+
+# THE DISKS, WHEN THE VM HAS ALREADY STOPPED.
+#
+# `exec` runs one command: when it returns, its VM has shut down and the
+# copy-out has delivered the work. So a reusable session's VM is usually GONE
+# by the time its caller gives the session back, and refusing then threw away
+# the only thing a pool is for - the toolchain the next review needs - while
+# the design says a member is a clean shutdown with its disks kept.
+#
+# What no guest can do once its VM is gone is the reset. So it is OWED:
+# recorded here, paid by the next boot, in the guest and before the new user's
+# command (launch passes it, agent-entrypoint.sh runs it, and a reset that
+# fails ends that run rather than handing over the last user's conversation).
+pool_return_disks() {
+	local slug=$1 path=$2 pkey=$3 json=$4 dry=$5 work
+	if [[ ! -e $STATE_DIR/$slug.ext4 ]]; then
+		pool_return_refuse "$slug" "$json" "no such session" \
+			"nothing of it is left in $STATE_DIR"
+		return 0
+	fi
+	work=$(session_work_state "$slug")
+	if [[ $work != out ]]; then
+		pool_return_refuse "$slug" "$json" "its VM is stopped and its work is not out" \
+			"its drives are the only copy: firecode extract <run> --bundle, or firecode up then return it"
+		return 1
+	fi
+	if ((dry)); then
+		if ((json)); then
+			printf '{"returned":false,"dry_run":true,"name":"%s","project":"%s","work":"%s","state":"sleeping","reset":"owed"}\n' \
+				"$slug" "$pkey" "$work"
+		else
+			log "$slug: would pool its disks (work $work, no VM, reset owed to the next boot)"
+		fi
+		return 0
+	fi
+	manifest pool "$slug" --project "$pkey" --state sleeping
+	manifest set "$slug" "pool.reset_owed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	log "$slug: back in the pool for $pkey - its VM had already stopped, so its disks are kept"
+	log "  and the reset it could not run in a live guest is owed: the next boot runs it before the command"
+	if ((json)); then
+		printf '{"returned":true,"name":"%s","project":"%s","state":"sleeping","work":"%s","reset":"owed"}\n' \
+			"$slug" "$pkey" "$work"
+	fi
+	return 0
+}
+
+# RETURN A VM, OR ITS DISKS, TO ITS PROJECT'S POOL when the session that had it
+# is over.
 #
 # The order is the whole safety argument, and it is the same one the copy-out
 # uses: work out first (bundle, from the live guest, verified), then nothing
@@ -5476,6 +5551,10 @@ usage: firecode pool return <name> [--json] [--dry-run] [--kill] [--sleep]
   Before any of that: a bundle of its commits is made IN THE GUEST and verified,
   and if any process the agent started is still running the return is REFUSED
   unless --kill says to end it. --sleep stops the VM now (a disk-only sleep).
+
+  A session whose VM has already stopped - what `exec` leaves behind - returns
+  its DISKS: they are kept, the member is asleep, and the reset no guest was
+  there to run is owed to the next boot.
 USAGE
 			return 0
 			;;
@@ -5490,13 +5569,23 @@ USAGE
 	local path pkey sock procs count names work tip bundle rd
 	path=$(session_project "$slug")
 	pkey=$(project_slug "${path:-$slug}")
-	if [[ -z $path ]] || ! sock=$(live_vm_socket "$path" 2>/dev/null); then
-		if ((json)); then
-			printf '{"returned":false,"name":"%s","reason":"no VM is running for it"}\n' "$slug"
+	if [[ -z $path ]]; then
+		# Its drives may still be there - state from before manifests, or a
+		# manifest whose worktree was never recorded - and that is a different
+		# answer from "nothing of it exists": one says there is a file nobody
+		# can name, the other says the session is gone.
+		if [[ -e $STATE_DIR/$slug.ext4 ]]; then
+			pool_return_refuse "$slug" "$json" "no project recorded for it" \
+				"$slug.ext4 exists and nothing names its worktree: firecode state ls"
 		else
-			log "$slug: no VM is running for it - nothing to return (its state is already there)"
+			pool_return_refuse "$slug" "$json" "no such session" \
+				"nothing of it on disk: its work was copied out and its state released"
 		fi
 		return 0
+	fi
+	if ! sock=$(live_vm_socket "$path" 2>/dev/null); then
+		pool_return_disks "$slug" "$path" "$pkey" "$json" "$dry"
+		return $?
 	fi
 
 	procs=$(guest_agent_procs "$sock" 2>/dev/null || true)
@@ -5556,10 +5645,18 @@ USAGE
 		return 0
 	fi
 
-	# THE RESET, in the guest, and only once the work is provably out.
-	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "$(pool_reset_command "$path")" \
-		>/dev/null 2>&1 || log "$slug: the reset reported an error - the next user may see the last one's files"
+	# THE RESET, in the guest, and only once the work is provably out. A reset
+	# that failed leaves the last user's files or transcript where the next one
+	# will read them, so the member does not become available: the VM is still
+	# up, and the caller can retry or fix what the guest reported.
+	local why
+	if ! why=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "$(pool_reset_command "$path")" 2>&1); then
+		pool_return_refuse "$slug" "$json" "the guest's reset failed, so it is not fit for the next user" \
+			"$(printf '%s' "$why" | tail -3 | tr '\n' ' ')"
+		return 1
+	fi
 	manifest pool "$slug" --project "$pkey" --state running
+	manifest set "$slug" "pool.reset_owed="
 	log "$slug: back in the pool for $pkey (caches kept, worktree reset, conversation cleared)"
 	if ((and_sleep)); then
 		pool_sleep_one "$slug" "$path" "$pkey" 0
@@ -5752,9 +5849,12 @@ usage: firecode pool sleep [--idle SEC] [--memory] [--dry-run] [--json]
 
   What a reaper calls. A pooled VM that nothing has used for --idle seconds
   (default 300) is stopped - a clean shutdown with its disks kept, which is
-  what a pool member is. Memory is NOT snapshotted unless --memory is given: a
-  4G snapshot costs 4G of disk, and resuming one carries the previous task's
-  processes into the next user's machine.
+  what a pool member is. One marked running or in-use whose VM is not there
+  any more is asleep already, and is put to bed the same way: "slept" is
+  every member this pass left asleep, however it got there. Memory is NOT
+  snapshotted unless --memory is given: a 4G snapshot costs 4G of disk, and
+  resuming one carries the previous task's processes into the next user's
+  machine.
 
   Then the pool is kept under its caps: two asleep per project, eight a box,
   and nothing unused for a week. Those deletions are of VMs whose work was
@@ -5764,23 +5864,39 @@ USAGE
 			;;
 		esac
 	done
-	local now slug project state last path count=0 slept=0 deleted=0
+	local now slug project purpose state last path count=0 slept=0 deleted=0
 	local -a slept_rows=() deleted_rows=()
 	now=$(date +%s)
 	local -a rows=()
-	while IFS=$'\t' read -r slug project state last; do
+	# FIVE FIELDS, as pool_rows prints them: slug, project, PURPOSE, state, last.
+	# Read as four, the last variable swallowed two columns and every row's
+	# `state` was the purpose - so no member ever matched `running` and this pass
+	# had never stopped a VM or evicted one, which read exactly like a pool that
+	# was always tidy.
+	while IFS=$'\t' read -r slug project purpose state last; do
 		[[ -n $slug ]] || continue
 		rows+=("$slug"$'\t'"$project"$'\t'"$state"$'\t'"$last")
 	done < <(pool_rows)
 
 	for r in ${rows[@]+"${rows[@]}"}; do
 		IFS=$'\t' read -r slug project state last <<<"$r"
-		[[ $state == running ]] || continue
+		# What this pass may put to bed: `running` is a member a return left
+		# up, `in-use` is one a session took and never gave back. A row that
+		# nothing reclaims holds 35G, is invisible to `take`, and outlives
+		# the caps - a taker that died must not strand a VM for a week.
+		case "$state" in
+		running | in-use) ;;
+		*) continue ;;
+		esac
 		if ((now - last < idle)); then continue; fi
 		path=$(session_project "$slug")
 		if [[ -z $path ]] || ! live_vm_socket "$path" >/dev/null 2>&1; then
-			# Marked running, nothing answering: it is asleep in fact.
+			# Marked running or in-use, nothing answering: asleep in fact, and
+			# said so. Counted, because a member this pass leaves asleep is one
+			# it put to bed whether or not there was a VM to stop.
 			((! dry)) && manifest pool "$slug" --project "$project" --state sleeping
+			slept_rows+=("$slug")
+			slept=$((slept + 1))
 			continue
 		fi
 		count=$((count + 1))
@@ -6758,6 +6874,26 @@ ephemeral_release() {
 	return 0
 }
 
+# THE DEBT A POOL MEMBER OWED, settled by the run that paid it.
+#
+# `pool return` records it when the member's VM had already stopped, and the
+# guest runs the reset before this run's command (agent-entrypoint.sh) - so a
+# run that ended 0 owed nothing any more, and one that did not still owes it and
+# is reset again before the next. Here rather than in the report because a run
+# has several ways to end (a result directory, nothing changed, a mounted
+# worktree, a failure) and only one of them is the last line of the report.
+#
+# Never on a cancelled run: it was stopped, not finished, and a reset it may
+# have been in the middle of is not evidence of anything.
+pool_reset_settle() {
+	[[ -n ${SLUG:-} && -n ${RUN_DIR:-} && -f $RUN_DIR/pool-reset ]] || return 0
+	[[ -f $RUN_DIR/cancelled ]] && return 0
+	[[ $(cat "$RUN_DIR/exit-status" 2>/dev/null) == 0 ]] || return 0
+	manifest set "$SLUG" "pool.reset_owed="
+	log "pool: the owed reset ran in the guest - this member is fit for the next one"
+	return 0
+}
+
 cleanup_run() {
 	local status=$?
 	trap - EXIT INT TERM PIPE HUP
@@ -6793,6 +6929,7 @@ cleanup_run() {
 	net_down
 	# After the VM and the relays are gone, and after the copy-out has been
 	# recorded - which is where an ephemeral run's state stops being needed.
+	pool_reset_settle || true
 	if ((EPHEMERAL)); then ephemeral_release || true; fi
 	if [[ $KEEP -eq 0 ]]; then
 		# rm can fail here - the jailer makes device nodes as root - and in
@@ -7579,6 +7716,32 @@ launch() {
 	fi
 	local state_drive=$STATE_DRIVE
 
+	# --- a pool member on its way back out
+	#
+	# Two things follow a session that has been through the pool. It is not
+	# available while this run has it - a row that says otherwise is one the
+	# reaper may stop (or, past the caps, delete) under a live VM. And if it was
+	# RETURNED while its VM had already stopped, the reset that return could not
+	# run in a guest is OWED: the same text `pool return` runs on a live VM goes
+	# to the guest, which runs it before the command (agent-entrypoint.sh) and
+	# ends the run if it fails. The reseed is the other half of coming back from
+	# somebody else's disks: a restored guest must not keep their machine id,
+	# their ssh host keys or their kernel randomness.
+	POOL_RESET_SCRIPT=""
+	POOL_RESEED_SCRIPT=""
+	if [[ -n ${SLUG:-} && -f $(manifest_path "$SLUG") ]] &&
+		[[ -n $(manifest_field "$SLUG" pool.state) ]]; then
+		local pool_proj
+		pool_proj=$(manifest_field "$SLUG" pool.project)
+		manifest pool "$SLUG" --project "${pool_proj:-$(project_slug "$WORKDIR")}" --state in-use
+		POOL_RESEED_SCRIPT=$(pool_reseed_command)
+		if [[ -n $(manifest_field "$SLUG" pool.reset_owed) ]]; then
+			POOL_RESET_SCRIPT=$(pool_reset_command "$WORKDIR")
+			printf 'owed\n' >"$RUN_DIR/pool-reset"
+			log "pool: this member's reset is owed from a return after its VM stopped - it runs before the command"
+		fi
+	fi
+
 	# Whether this is a restore has to be settled here, before the drives get
 	# built: a restore uses none of them, and building them costs more than
 	# the restore does. Everything the stamp needs is cheap to get - the base
@@ -7719,6 +7882,11 @@ launch() {
 		env_line FIRECODE_GID "$(id -g)"
 		env_line FIRECODE_HOME "$HOME"
 		env_line FIRECODE_PROJECT "$WORKDIR"
+		# What the guest owes a pool member before this run's command: the
+		# reset a return could not run, and the reseed every return to somebody
+		# else's disks needs. Both are scripts in the guest's own shell.
+		[[ -n $POOL_RESET_SCRIPT ]] && env_line FIRECODE_POOL_RESET "$POOL_RESET_SCRIPT"
+		[[ -n $POOL_RESEED_SCRIPT ]] && env_line FIRECODE_POOL_RESEED "$POOL_RESEED_SCRIPT"
 		# An explicit endpoint wins over the relay: the relay authenticates
 		# against the real API, and pointing it at a local model would send
 		# your token somewhere it does not belong.
@@ -8811,6 +8979,9 @@ EOF
 		fi
 		echo
 	fi
+
+	# THE DEBT A POOL MEMBER OWED goes in the teardown (pool_reset_settle),
+	# because a run ends in several places and only one of them is this line.
 
 	return "$rc"
 }

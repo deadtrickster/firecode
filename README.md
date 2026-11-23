@@ -983,8 +983,9 @@ firecode pool status [--json]           # what is in the pool, and in what state
 firecode net host-guard --print  # the rule that keeps a guest off this host's
                                  # own services; the LAN and internet stay open
 
-scripts/canary-roundtrip.sh      # boot, commit, extract, verify, release: the
-                                 # check to run after any storage change
+scripts/canary-roundtrip.sh      # boot, commit, extract, verify, release, and
+                                 # --pool: back to the pool: the check to run
+                                 # after any storage change
 ```
 
 Per-run drives are deleted when the VM exits unless you pass `--keep`. Console
@@ -1014,6 +1015,12 @@ VM whose work is not out, or one that still has a process running in it -
 those would wake up in the next user's machine. A member sleeps as a clean
 shutdown with its disks kept; a memory snapshot is `--memory`, off by default
 (it costs 4G of disk for a 4G guest, and carries processes across users).
+
+A reusable session's VM has usually stopped already by the time anyone gives it
+back - `exec` runs one command and shuts its VM down. So `pool return` returns
+its **disks**: they are kept, the member is asleep, and the reset no guest was
+there to run is owed to the next boot, which runs it in the guest before the
+new user's command and fails the run if it cannot.
 
 `--vmm libvirt` talks to `qemu:///session` - qemu runs as you, reads the
 images under your home, and uses the same taps. `--gpu` switches to

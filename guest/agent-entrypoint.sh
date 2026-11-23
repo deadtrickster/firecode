@@ -57,6 +57,36 @@ cd "$PROJECT" 2>/dev/null || cd "$RUN_HOME" || exit 1
 log "running as $RUN_USER in $(pwd): $AGENT ${ARGS[*]}"
 echo
 
+# WHAT THIS GUEST OWES A POOL MEMBER, before the new user's command runs.
+#
+# A member returned while its VM had already stopped could not be reset in a
+# live guest, so the reset is owed and arrives here as the same script
+# `pool return` would have run. It runs first, and a failure ENDS THE RUN: a
+# machine that may still hold the last user's files or transcripts is not one
+# to hand over, and a run that fails is visible where a warning is not.
+#
+# The reseed is the other half of coming back from somebody else's disks: a
+# kept disk is the same machine id, the same ssh host keys and the same kernel
+# randomness, which is how two VMs that look identical produce identical
+# "random" keys.
+if [[ -n ${FIRECODE_POOL_RESEED:-} ]]; then
+	log "reseed: this guest came back from a pooled member's disks"
+	eval "$FIRECODE_POOL_RESEED" || log "WARNING: the reseed reported an error"
+fi
+if [[ -n ${FIRECODE_POOL_RESET:-} ]]; then
+	log "reset: this member was returned while stopped, so its reset is owed"
+	if ! reset_out=$(eval "$FIRECODE_POOL_RESET" 2>&1); then
+		log "ERROR: the pool reset FAILED, so this VM is not fit for the next user"
+		printf '%s\n' "$reset_out" | sed 's/^/[firecode] /'
+		# The run's verdict goes where every other verdict does - the marker the
+		# host reads out of the delivered tree - or the copy-out finds no status
+		# and reports the VMM's clean shutdown as a run that passed.
+		printf '%s\n' 3 >"$PROJECT/.firecode-exit-status" 2>/dev/null || true
+		exit 3
+	fi
+	log "reset: ok - the worktree, the conversation and the history are the next user's"
+fi
+
 # Claude Code refuses --dangerously-skip-permissions as root unless it is
 # told it is in a sandbox. It is: that is the entire point of this harness.
 declare -a ENV=(

@@ -391,16 +391,24 @@ being deleted:
   return is refused unless `--kill`; then the guest resets the worktree
   (`git reset --hard`, `git clean -xffd`) keeping the declared caches
   (`target`, `.sccache`, `node_modules`, `.venv`), and removes the agent's
-  conversation and shell history. Only then is the VM available.
+  conversation and shell history. Only then is the VM available. A reset that
+  fails refuses the return, because the next user would read the last one's
+  files.
+  A session whose VM has already stopped - what `exec` leaves behind - returns
+  its **disks** instead: kept, marked asleep, with the reset recorded as owed
+  in the manifest and run by the next boot before that run's command.
 - **take** - a dispatcher asks before booting. A running member is marked
   in-use; a sleeping one is named with `resume: true` and `--boot` starts it
   over the state the pool kept, which is what makes its toolchain already
-  there.
+  there. Any boot of a pool member marks it in-use and reseeds the machine id,
+  the ssh host keys and the kernel randomness.
 - **sleep** - a reaper's pass. A member unused for `--idle` (300s) is stopped:
-  a clean shutdown with its disks kept. Memory is **not** snapshotted unless
-  `--memory`: a 4G guest costs 4G of disk to save and ~16s, and a resume would
-  carry the previous task's processes into the next user's machine. Caps are
-  two asleep per project, eight a box, deleted after seven days unused.
+  a clean shutdown with its disks kept, and one marked running or in-use whose
+  VM is not there any more is put to bed the same way - a taker that died must
+  not strand 35G where `take` cannot see it. Memory is **not** snapshotted
+  unless `--memory`: a 4G guest costs 4G of disk to save and ~16s, and a resume
+  would carry the previous task's processes into the next user's machine. Caps
+  are two asleep per project, eight a box, deleted after seven days unused.
 
 Disk-only sleep is why the design needs no new storage machinery: the layer
 and the agent home already survive a stop, so a pooled VM's value is on disk
@@ -435,9 +443,12 @@ Measured, reported, deliberately not built in this package:
 
 ## Canary for every storage change
 
-`scripts/canary-roundtrip.sh` boots one VM, commits inside it, extracts the
-bundle, verifies that the bundle contains the commit, checks the manifest,
-releases the session, and with `--pool` returns the VM and puts it to sleep.
+`scripts/canary-roundtrip.sh` boots one VM with a session that outlives the run,
+commits inside it, extracts the bundle, verifies that the bundle contains the
+commit, checks the manifest, and releases the session. Then an ephemeral run of
+the same project, to see it release its own state. Then, with `--pool`, a
+reusable run, its disks going back to the pool, the next session taking them,
+and the sleep pass putting them to bed.
 It is the mandatory check after any change to how state is stored or moved:
 the host-side tests cannot see any of it, because the guest is in the way.
 
