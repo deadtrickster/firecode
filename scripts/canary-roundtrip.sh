@@ -88,7 +88,7 @@ git -C "$PROJ" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
 	commit -qm base
 
 out=$(cd "$PROJ" && timeout 900 "$FIRECODE" exec --no-jail --no-net --ephemeral \
-	--purpose test --agent claude -- bash -c '
+	--purpose test -- bash -c '
 		echo "from the guest" >> README.md
 		git add -A
 		git -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
@@ -181,7 +181,7 @@ fi
 # reset in the guest that must not fail and must not be skipped.
 if ((POOL)); then
 	out=$(cd "$PROJ" && timeout 900 "$FIRECODE" exec --no-jail --no-net \
-		--purpose reviewer --reuse --agent claude -- sh -c 'echo pool >> README.md' 2>&1)
+		--purpose reviewer --reuse -- sh -c 'echo pool >> README.md' 2>&1)
 	if printf '%s' "$out" | grep -q 'result:'; then
 		ok "a reusable run finished"
 	else
