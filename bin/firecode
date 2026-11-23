@@ -2486,34 +2486,37 @@ changed_files() {
 # of a hundred megabytes is the normal case - and a full copy of it beside
 # every run is what turns a project directory into landfill.
 #
-# So the files that came back identical become hardlinks to the ones already
-# on disk. The directory still looks and diffs exactly the same; it just stops
-# costing anything.
+# The files that came back identical used to be HARDLINKS into the project,
+# which is the same inode: `sed -i` on one of them edited the project through
+# the result, and so did a shell append. A result directory that can silently
+# modify its source is the opposite of what a result is for, and the saving was
+# never worth that.
 #
-# The tradeoff is real and worth stating out loud: a hardlink is the same
-# inode, so writing to one of those files *in place* writes to the project
-# too. Editors that save by writing a temp file and renaming it - which is
-# most of them, Emacs included - break the link first and are safe. sed -i and
-# a shell append are not.
-link_unchanged() {
-	local src=$1 out=$2 rel linked=0 saved=0 sz
+# So they are cloned where the filesystem can (`cp --reflink=auto`: btrfs and
+# xfs share the blocks, ext4 copies them) and copied where it cannot. Reading
+# one is the same either way; writing to one can no longer reach the project.
+reflink_unchanged() {
+	local src=$1 out=$2 rel n=0 saved=0 sz
 	[[ -d $src && -d $out ]] || return 0
 
 	while IFS= read -r -d '' f; do
 		rel=${f#"$out"/}
 		[[ -f "$src/$rel" ]] || continue
-		# Same file on both sides, so keep one of them.
+		# Identical on both sides: the result keeps its own copy of it.
 		cmp -s "$f" "$src/$rel" || continue
 		sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
-		if ln -f "$src/$rel" "$f" 2>/dev/null; then
-			linked=$((linked + 1))
+		rm -f "$f"
+		if cp --reflink=auto --preserve=mode,timestamps "$src/$rel" "$f" 2>/dev/null; then
+			n=$((n + 1))
 			saved=$((saved + sz))
+		else
+			log "could not copy an unchanged file into the result: $f"
 		fi
 	done < <(find "$out" -type f -not -path "$out/.git/*" -print0)
 
-	((linked)) || return 0
-	printf '%s of it is hardlinked to the project (%s files unchanged)\n' \
-		"$(numfmt --to=iec "$saved" 2>/dev/null || echo "$saved bytes")" "$linked"
+	((n)) || return 0
+	printf '%s of it came back unchanged, and is a copy of the project (%s files)\n' \
+		"$(numfmt --to=iec "$saved" 2>/dev/null || echo "$saved bytes")" "$n"
 }
 
 # --- who owns what ------------------------------------------------------
@@ -4973,6 +4976,19 @@ USAGE
 	local running=0
 	if session_in_use "$slug"; then running=1; fi
 	if ((running)); then
+		# A reviewer's VM, or one the caller marked reusable, goes back to the
+		# pool rather than being thrown away: that is what makes the next
+		# review of this project cheap instead of a rebuild. `pool return`
+		# does the refusing (work out, nothing running) and the reset.
+		local reusable=0
+		reusable=$(manifest_field "$slug" reusable)
+		if [[ $purpose == reviewer || -n $reusable ]]; then
+			local -a args=("$slug")
+			((json)) && args+=(--json)
+			((dry)) && args+=(--dry-run)
+			cmd_pool_return "${args[@]}"
+			return $?
+		fi
 		if ((json)); then
 			printf '{"released":false,"name":"%s","purpose":"%s","reason":"a VM is running for it","vm_running":true}\n' "$slug" "$purpose"
 		else
@@ -5230,7 +5246,620 @@ cmd_state() {
 	esac
 }
 
-# ---------------------------------------------------------------- networking
+# ---------------------------------------------------------------- warm pool
+#
+# A reviewer's VM is a 32G layer, a toolchain somebody installed, and a guest
+# that took minutes to boot. Deleting it at the end of a review and building
+# the same thing for the next one is most of what made firecode inconvenient.
+# So a reviewer (or any session marked reusable) can go back to its project's
+# pool instead: worktree reset, caches kept, VM stopped - and the next reviewer
+# of that project takes it instead of booting.
+#
+# WHAT A POOLED VM MAY COST, by default:
+#
+#   asleep, not running   a pool member is a clean shutdown with its disks
+#                         kept. A running one is allowed for the short while
+#                         between `return` and the reaper's pass.
+#   disk, not memory      a memory snapshot of a 4G guest costs 4G of disk and
+#                         a resume carries the previous task's PROCESSES into
+#                         the next user. Opt in with `pool sleep --memory`,
+#                         and it is dropped after an hour.
+#   2 per project, 8 a box  a floor under the disk, enforced by `pool sleep`.
+#   7 days                a pool member nobody has taken for a week is deleted.
+#                         Age is always from last use.
+#
+# Nothing here is a daemon: `take`, `return`, `sleep` and `status` are verbs a
+# caller (letibot) runs from its dispatch and its reaper. Firecode owns the
+# guest-side rules - what a reset must clear, what a resume must reseed - and
+# the manifest, so there is exactly one answer to "is this mine to use".
+
+POOL_IDLE_DEFAULT=${FIRECODE_POOL_IDLE:-300}
+POOL_PER_PROJECT=${FIRECODE_POOL_PER_PROJECT:-2}
+POOL_PER_BOX=${FIRECODE_POOL_PER_BOX:-8}
+POOL_MAX_AGE_DAYS=${FIRECODE_POOL_MAX_AGE_DAYS:-7}
+
+# The processes an agent left running, counted from inside the guest.
+#
+# The marker is the run's own environment: everything the entrypoint starts
+# inherits FIRECODE_RUN, so a process whose environment carries it outlived the
+# command that started it - a build in the background, a server, a test that
+# never returned. A pooled VM must have none: those processes would wake up in
+# the next user's machine.
+guest_agent_procs() {
+	local sock=$1 out cmd
+	# shellcheck disable=SC2016  # the GUEST's shell expands these, not this one
+	cmd='c=0; n=""
+for e in /proc/[0-9]*/environ; do
+  grep -qa "^FIRECODE_RUN=" "$e" 2>/dev/null || continue
+  p=${e#/proc/}; p=${p%/environ}
+  [ "$p" = "$$" ] && continue
+  [ "$p" = "$PPID" ] && continue
+  c=$((c+1)); n="$n $(cat /proc/$p/comm 2>/dev/null)"
+done
+printf "%s%s\n" "$c" "$n"'
+	out=$(python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "$cmd" 2>/dev/null) || return 1
+	printf '%s\n' "$(printf '%s\n' "$out" | grep -E '^[0-9]+' | tail -1)"
+}
+
+# What makes a pooled VM fit for somebody else.
+#
+# Three things must not survive: the previous user's FILES (a worktree reset),
+# their CONVERSATION (the agent's session directory - the whole reason a
+# `--continue` must not find somebody else's transcripts), and their shell
+# history. What makes pooling worth anything - target/, sccache, node_modules,
+# the venv - is a named exception and stays.
+#
+# Printed rather than inlined so the rule is readable, testable and the same on
+# both platforms.
+pool_reset_command() {
+	local dir=${1:-/work} keep e
+	local -a clean=()
+	keep=${FIRECODE_POOL_KEEP:-target,.sccache,node_modules,.venv}
+	for e in ${keep//,/ }; do clean+=(-e "$e"); done
+	printf 'cd %q 2>/dev/null || exit 0\n' "$dir"
+	printf 'git rev-parse --git-dir >/dev/null 2>&1 && { git reset --hard -q; git clean -xffdq %s; }' "${clean[*]}"
+	printf '\n'
+	printf '%s\n' 'rm -rf ~/.claude/projects ~/.claude/todos ~/.claude/shell-snapshots ~/.claude.json ~/.opencode ~/.local/share/opencode ~/.bash_history ~/.zsh_history'
+	printf '%s\n' 'rm -rf /tmp/* /tmp/.[!.]* /var/tmp/* 2>/dev/null || true'
+	printf '%s\n' 'echo reset-ok'
+}
+
+# What a resumed guest must not inherit: the kernel's randomness and identity.
+#
+# A restored snapshot (or a disk kept from another user) is the same machine id
+# and the same RNG state, which is how two VMs that look identical to each
+# other produce identical "random" keys. The entropy comes from the host
+# because after a resume there is no device to ask - firecracker has no RNG -
+# and writing to /dev/random is what mixes it into the pool.
+pool_reseed_command() {
+	# shellcheck disable=SC2016  # the GUEST's shell expands these, not this one
+	printf '%s\n' 'h=$(head -c 64 /dev/urandom 2>/dev/null | base64 2>/dev/null)'
+	# shellcheck disable=SC2016  # the GUEST's shell expands these, not this one
+	printf '%s\n' '[ -n "$h" ] && echo "$h" | base64 -d > /dev/random 2>/dev/null'
+	printf '%s\n' 'rm -f /var/lib/systemd/random-seed 2>/dev/null; rm -f /etc/machine-id 2>/dev/null'
+	printf '%s\n' 'systemd-machine-id-setup >/dev/null 2>&1 || true'
+	printf '%s\n' 'rm -f /etc/ssh/ssh_host_* 2>/dev/null; ssh-keygen -A >/dev/null 2>&1 || true'
+	printf '%s\n' 'echo reseeded'
+}
+
+# The pool's key: project, purpose and image. A VM built from a different base
+# image, or for a different purpose, is not the next caller's to reuse.
+pool_key() {
+	local project=$1 purpose=$2 image=""
+	[[ -f $IMAGES/agent-firecode.ext4 ]] &&
+		image=$(stat -c '%s:%Y' "$IMAGES/agent-firecode.ext4" 2>/dev/null || true)
+	printf '%s|%s|%s\n' "$project" "$purpose" "${image:-none}"
+}
+
+# Every pooled session, as "slug<TAB>project<TAB>purpose<TAB>state<TAB>last_used".
+pool_rows() {
+	local slug
+	state_index
+	for slug in $(printf '%s\n' "${!S_POOL[@]}" | sed '/^$/d' | sort); do
+		[[ -n ${S_POOL[$slug]:-} && ${S_POOL[$slug]} != - ]] || continue
+		printf '%s\t%s\t%s\t%s\t%s\n' "$slug" "${S_POOLPROJ[$slug]:--}" \
+			"${S_PURPOSE[$slug]:-unknown}" "${S_POOL[$slug]}" "${S_LAST[$slug]:-0}"
+	done
+}
+
+# Pool state, for the dispatch that asks before booting and for the reaper.
+cmd_pool_status() {
+	local json=0 want="" slug project purpose state last
+	while (($#)); do
+		case "$1" in
+		--json)
+			json=1
+			shift
+			;;
+		--project)
+			want=$(project_slug "$(cd "$2" && pwd)")
+			shift 2
+			;;
+		*) die "usage: firecode pool status [--json] [--project DIR]" ;;
+		esac
+	done
+	local -a rows=()
+	while IFS=$'\t' read -r slug project purpose state last; do
+		[[ -n $slug ]] || continue
+		[[ -n $want && $project != "$want" ]] && continue
+		rows+=("$slug"$'\t'"$project"$'\t'"$purpose"$'\t'"$state"$'\t'"$last"$'\t'"${S_BYTES[$slug]:-0}")
+	done < <(pool_rows)
+	if ((json)); then
+		printf '{"pool":['
+		local sep="" r bytes
+		for r in ${rows[@]+"${rows[@]}"}; do
+			IFS=$'\t' read -r slug project purpose state last bytes <<<"$r"
+			printf '%s{"name":"%s","project":"%s","purpose":"%s","state":"%s","last_used_epoch":%s,"bytes":%s}' \
+				"$sep" "$slug" "$project" "$purpose" "$state" "$last" "$bytes"
+			sep=,
+		done
+		printf '],"limits":{"per_project":%s,"per_box":%s,"max_age_days":%s}}\n' \
+			"$POOL_PER_PROJECT" "$POOL_PER_BOX" "$POOL_MAX_AGE_DAYS"
+		return 0
+	fi
+	if ((${#rows[@]} == 0)); then
+		echo "  the pool is empty"
+		return 0
+	fi
+	printf '  %-34s %-10s %-9s %-7s %s\n' NAME PURPOSE PROJECT STATE 'LAST USED'
+	for r in ${rows[@]+"${rows[@]}"}; do
+		IFS=$'\t' read -r slug project purpose state last <<<"$r"
+		printf '  %-34s %-10s %-9s %-7s %s\n' "$slug" "$purpose" \
+			"${project##*-}" "$state" "$(date -d "@$last" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$last")"
+	done
+	echo
+	printf '  %s per project, %s a box, removed after %s days unused\n' \
+		"$POOL_PER_PROJECT" "$POOL_PER_BOX" "$POOL_MAX_AGE_DAYS"
+}
+
+# The project a session belongs to: what its manifest recorded, or the one the
+# newest run of it named.
+session_project() {
+	local slug=$1 p rd
+	p=$(manifest_field "$slug" worktree)
+	if [[ -z $p ]] && rd=$(newest_run_of "$slug"); then
+		p=$(cat "$rd/project" 2>/dev/null || true)
+	fi
+	printf '%s\n' "$p"
+}
+
+# RETURN A VM TO ITS PROJECT'S POOL, when the session that had it is over.
+#
+# The order is the whole safety argument, and it is the same one the copy-out
+# uses: work out first (bundle, from the live guest, verified), then nothing
+# running (refused unless --kill), then the reset that makes it somebody else's,
+# and only then the manifest that says it is available.
+cmd_pool_return() {
+	local name="" proj="" json=0 dry=0 kill=0 and_sleep=0
+	while (($#)); do
+		case "$1" in
+		--project)
+			proj=$2
+			shift 2
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		--dry-run)
+			dry=1
+			shift
+			;;
+		--kill)
+			kill=1
+			shift
+			;;
+		--sleep)
+			and_sleep=1
+			shift
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode pool return <name> [--json] [--dry-run] [--kill] [--sleep]
+       firecode pool return --project DIR [...]
+
+  Given back a VM this session no longer needs, without throwing away what it
+  cost: the worktree is reset, the agent's conversation and shell history are
+  removed, the caches (target, sccache, node_modules, .venv) are kept, and the
+  VM is marked available to the next session of that project.
+
+  Before any of that: a bundle of its commits is made IN THE GUEST and verified,
+  and if any process the agent started is still running the return is REFUSED
+  unless --kill says to end it. --sleep stops the VM now (a disk-only sleep).
+USAGE
+			return 0
+			;;
+		*)
+			[[ -z $name ]] && name=$1
+			shift
+			;;
+		esac
+	done
+	local slug
+	slug=$(session_resolve "$name" "$proj") || die "usage: firecode pool return <name> [--json]"
+	local path pkey sock procs count names work tip bundle rd
+	path=$(session_project "$slug")
+	pkey=$(project_slug "${path:-$slug}")
+	if [[ -z $path ]] || ! sock=$(live_vm_socket "$path" 2>/dev/null); then
+		if ((json)); then
+			printf '{"returned":false,"name":"%s","reason":"no VM is running for it"}\n' "$slug"
+		else
+			log "$slug: no VM is running for it - nothing to return (its state is already there)"
+		fi
+		return 0
+	fi
+
+	procs=$(guest_agent_procs "$sock" 2>/dev/null || true)
+	count=${procs%% *}
+	names=${procs#* }
+	[[ $count =~ ^[0-9]+$ ]] || count=0
+	if ((count > 0 && ! kill)); then
+		if ((json)); then
+			printf '{"returned":false,"name":"%s","running_processes":%s,"processes":"%s","reason":"work is still running in the guest","hint":"end it, or firecode pool return %s --kill"}\n' \
+				"$slug" "$count" "${names# }" "$slug"
+		else
+			log "$slug: $count process(es) still running in the guest:${names}"
+			log "  not pooling a VM with work in it - end them, or --kill"
+		fi
+		return 1
+	fi
+	if ((count > 0 && kill)); then
+		# shellcheck disable=SC2016  # the GUEST's shell expands these, not this one
+		python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - \
+			'for e in /proc/[0-9]*/environ; do grep -qa "^FIRECODE_RUN=" "$e" || continue; p=${e#/proc/}; p=${p%/environ}; [ "$p" = "$$" ] && continue; kill -9 "$p" 2>/dev/null; done' \
+			>/dev/null 2>&1 || true
+		log "$slug: ended the processes the agent left running (${names# })"
+	fi
+
+	# THE WORK, OUT OF THE LIVE GUEST, BEFORE ANYTHING IS RESET. A reset that ran
+	# first would delete the only copy.
+	work=$(session_work_state "$slug")
+	if [[ $work != out ]] && ((! dry)); then
+		rd=$(newest_run_of "$slug" || true)
+		bundle="${rd:-$STATE_DIR}/work.bundle"
+		if tip=$(guest_bundle "$sock" "$bundle" "$path"); then
+			if bundle_verify "$bundle" "$tip" >/dev/null; then
+				record_extraction "$slug" "$tip" "$bundle" 0
+				work=out
+				log "$slug: its commits are out (${tip:0:8}) and verified"
+			fi
+		fi
+	fi
+	if [[ $work != out ]] && ((! dry)); then
+		if ((json)); then
+			printf '{"returned":false,"name":"%s","reason":"its work could not be copied out","work":"%s"}\n' "$slug" "$work"
+		else
+			log "$slug: not pooling it - its work could not be copied out, and a reset would delete it"
+			log "  the VM is still up: firecode in --project $path 'git status'"
+		fi
+		return 1
+	fi
+
+	if ((dry)); then
+		if ((json)); then
+			printf '{"returned":false,"dry_run":true,"name":"%s","project":"%s","work":"%s","would_reset":true}\n' \
+				"$slug" "$pkey" "$work"
+		else
+			log "$slug: would return it to the pool (work $work, processes $count)"
+			pool_reset_command "$path" >&2
+		fi
+		return 0
+	fi
+
+	# THE RESET, in the guest, and only once the work is provably out.
+	python3 "$SCRIPTS/vsock-exec.py" "$sock" "$EXEC_PORT" - "$(pool_reset_command "$path")" \
+		>/dev/null 2>&1 || log "$slug: the reset reported an error - the next user may see the last one's files"
+	manifest pool "$slug" --project "$pkey" --state running
+	log "$slug: back in the pool for $pkey (caches kept, worktree reset, conversation cleared)"
+	if ((and_sleep)); then
+		pool_sleep_one "$slug" "$path" "$pkey" 0
+	fi
+	if ((json)); then
+		printf '{"returned":true,"name":"%s","project":"%s","state":"%s","work":"%s"}\n' \
+			"$slug" "$pkey" "$([[ $and_sleep == 1 ]] && echo sleeping || echo running)" "$work"
+	fi
+	return 0
+}
+
+# Stop one pooled VM: clean shutdown, disks kept. The work is already out, so
+# there is nothing to copy back - and a copy-out here would leave a result
+# directory nobody asked for.
+pool_sleep_one() {
+	local slug=$1 path=$2 pkey=$3 memory=${4:-0} out
+	[[ -n $path ]] || return 0
+	if ((memory)); then
+		if "$SELF" checkpoint --project "$path" >/dev/null 2>&1; then
+			local dir nbytes
+			dir="$STATE_DIR/mem-$slug"
+			nbytes=$(du -sb "$dir" 2>/dev/null | cut -f1 || echo 0)
+			manifest pool "$slug" --project "$pkey" --state running --snapshot "$dir" --bytes "${nbytes:-0}"
+		else
+			log "$slug: no memory snapshot - sleeping on disk only (which is the default for a reason)"
+		fi
+	fi
+	"$SELF" down --project "$path" --discard >/dev/null 2>&1 || true
+	manifest pool "$slug" --project "$pkey" --state sleeping
+	log "$slug: asleep (disks kept: its toolchain and caches are what the next one takes)"
+}
+
+# TAKE A VM FOR A NEW SESSION: a pooled one if there is one, and a plain "boot
+# your own" if not.
+#
+# Nothing is booted here unless --boot says so, because the caller knows
+# whether it wants a VM at all; what this answers is "is there one of ours".
+cmd_pool_take() {
+	local proj="" json=0 boot=0 fast=0 purpose=reviewer slug project state last
+	while (($#)); do
+		case "$1" in
+		--project)
+			proj=$2
+			shift 2
+			;;
+		--purpose)
+			purpose=$2
+			shift 2
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		--boot)
+			boot=1
+			shift
+			;;
+		--fast)
+			fast=1
+			boot=1
+			shift
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode pool take --project DIR [--purpose reviewer] [--json]
+                         [--boot | --fast]
+
+  The first call a dispatcher makes: is there a warm VM for this project?
+  A running pool member is marked in-use and named; a sleeping one is named
+  with "resume": true, and with --boot (or --fast) it is started here - the
+  same `up` a cold boot uses, over the state the pool kept, so its toolchain and
+  its caches are already inside.
+
+  "taken": false with reason "empty" means: boot a fresh one, and return it to
+  the pool when the session ends.
+USAGE
+			return 0
+			;;
+		*) die "pool take: unknown option $1" ;;
+		esac
+	done
+	[[ -n $proj ]] || die "usage: firecode pool take --project DIR [--json] [--boot]"
+	[[ -d $proj ]] || die "no such directory: $proj"
+	local path pkey chosen="" cstate=""
+	path=$(cd "$proj" && pwd)
+	pkey=$(project_slug "$path")
+
+	# A running one beats a sleeping one: taking it costs a reset, taking a
+	# sleeping one costs a boot.
+	local r
+	while IFS=$'\t' read -r slug project state last; do
+		[[ -n $slug ]] || continue
+		[[ $project == "$pkey" ]] || continue
+		case "$state" in
+		running)
+			if live_vm_socket "$(session_project "$slug")" >/dev/null 2>&1; then
+				chosen=$slug cstate=running
+				break
+			fi
+			;;
+		sleeping)
+			[[ -z $chosen ]] && {
+				chosen=$slug
+				cstate=sleeping
+			}
+			;;
+		esac
+	done < <(pool_rows | awk -F'\t' -v p="$pkey" '$2 == p { print $1 "\t" $2 "\t" $4 "\t" $5 }')
+
+	if [[ -z $chosen ]]; then
+		if ((json)); then
+			printf '{"taken":false,"reason":"empty","project":"%s"}\n' "$pkey"
+		else
+			log "no pooled VM for $pkey - boot one (firecode up), and return it when the session ends"
+		fi
+		return 0
+	fi
+
+	manifest set "$chosen" "purpose=$purpose"
+	[[ -n ${OWNER:-} ]] && manifest set "$chosen" "owner=$OWNER"
+	manifest pool "$chosen" --project "$pkey" --state in-use
+	if [[ $cstate == sleeping ]] && ((boot)); then
+		local -a upargs=(--project "$path")
+		((fast)) && upargs+=(--fast)
+		if "$SELF" up "${upargs[@]}" >/dev/null 2>&1; then
+			log "$chosen: resumed for this session"
+			manifest pool "$chosen" --project "$pkey" --state running
+			cstate=running
+		else
+			log "$chosen: it did not come back up - a fresh VM is the fallback"
+		fi
+	fi
+	if ((json)); then
+		# `state` after the take, `was` before it, and `resume` for the one
+		# thing the caller still has to do: boot a sleeping member.
+		printf '{"taken":true,"name":"%s","project":"%s","state":"in-use","was":"%s","resume":%s,"project_path":"%s"}\n' \
+			"$chosen" "$pkey" "$cstate" "$([[ $cstate == running ]] && echo false || echo true)" "$path"
+	else
+		log "$chosen: taken for $pkey ($cstate)"
+	fi
+	return 0
+}
+
+# SLEEP THE POOL, AND KEEP IT UNDER ITS CEILING.
+#
+# `--idle SECONDS` is how long a pooled VM may sit there running - no exec, no
+# console, no lease - before it is stopped. The default is five minutes: long
+# enough for the next review of the same project to take it warm, short enough
+# that a forgotten VM is not holding 4G for an afternoon.
+#
+# Then the caps: two asleep per project, eight a box, and nothing older than a
+# week. Age is always from last use, never from creation.
+cmd_pool_sleep() {
+	local idle=$POOL_IDLE_DEFAULT memory=0 json=0 dry=0 per_proj=$POOL_PER_PROJECT
+	local per_box=$POOL_PER_BOX max_age=$POOL_MAX_AGE_DAYS
+	while (($#)); do
+		case "$1" in
+		--idle)
+			idle=$2
+			shift 2
+			;;
+		--memory)
+			memory=1
+			shift
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		--dry-run)
+			dry=1
+			shift
+			;;
+		--limit-project)
+			per_proj=$2
+			shift 2
+			;;
+		--limit-box)
+			per_box=$2
+			shift 2
+			;;
+		--max-age)
+			max_age=${2%d}
+			shift 2
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode pool sleep [--idle SEC] [--memory] [--dry-run] [--json]
+                           [--limit-project N] [--limit-box N] [--max-age Nd]
+
+  What a reaper calls. A pooled VM that nothing has used for --idle seconds
+  (default 300) is stopped - a clean shutdown with its disks kept, which is
+  what a pool member is. Memory is NOT snapshotted unless --memory is given: a
+  4G snapshot costs 4G of disk, and resuming one carries the previous task's
+  processes into the next user's machine.
+
+  Then the pool is kept under its caps: two asleep per project, eight a box,
+  and nothing unused for a week. Those deletions are of VMs whose work was
+  verified out at return, and they are the only ones this verb removes.
+USAGE
+			return 0
+			;;
+		esac
+	done
+	local now slug project state last path count=0 slept=0 deleted=0
+	local -a slept_rows=() deleted_rows=()
+	now=$(date +%s)
+	local -a rows=()
+	while IFS=$'\t' read -r slug project state last; do
+		[[ -n $slug ]] || continue
+		rows+=("$slug"$'\t'"$project"$'\t'"$state"$'\t'"$last")
+	done < <(pool_rows)
+
+	for r in ${rows[@]+"${rows[@]}"}; do
+		IFS=$'\t' read -r slug project state last <<<"$r"
+		[[ $state == running ]] || continue
+		if ((now - last < idle)); then continue; fi
+		path=$(session_project "$slug")
+		if [[ -z $path ]] || ! live_vm_socket "$path" >/dev/null 2>&1; then
+			# Marked running, nothing answering: it is asleep in fact.
+			((! dry)) && manifest pool "$slug" --project "$project" --state sleeping
+			continue
+		fi
+		count=$((count + 1))
+		slept_rows+=("$slug")
+		if ((! dry)); then pool_sleep_one "$slug" "$path" "$project" "$memory"; fi
+		slept=$((slept + 1))
+	done
+
+	# Caps, over what is asleep now. Oldest last-used first.
+	local -a order=()
+	for r in ${rows[@]+"${rows[@]}"}; do
+		IFS=$'\t' read -r slug project state last <<<"$r"
+		[[ -e $STATE_DIR/$slug.ext4 ]] || continue
+		# Only what is asleep may be evicted here: a running pool member is
+		# stopped by the sleep pass, and an in-use one is somebody's VM.
+		[[ $state == sleeping ]] || continue
+		order+=("$last $project $slug")
+	done
+	while read -r last project slug; do
+		[[ -n $slug ]] || continue
+		local age_days=$(((now - last) / 86400))
+		local nproj
+		nproj=$(for o in ${order[@]+"${order[@]}"}; do [[ ${o#* } == "$project "* ]] && echo x; done | wc -l | tr -d ' ')
+		if ((age_days >= max_age)) || ((nproj > per_proj)) || ((${#order[@]} > per_box)); then
+			deleted_rows+=("$slug")
+			((! dry)) && remove_session "$slug" >/dev/null
+			deleted=$((deleted + 1))
+			# One removal changes the counts the next row is judged by.
+			local -a rest=()
+			for o in "${order[@]}"; do [[ $o == *" $slug" ]] || rest+=("$o"); done
+			order=(${rest[@]+"${rest[@]}"})
+		fi
+	done < <(printf '%s\n' ${order[@]+"${order[@]}"} | sort -n | sed '/^$/d')
+
+	if ((json)); then
+		printf '{"dry_run":%s,"slept":[' "$([[ $dry == 1 ]] && echo true || echo false)"
+		local sep="" s
+		for s in ${slept_rows[@]+"${slept_rows[@]}"}; do
+			printf '%s"%s"' "$sep" "$s"
+			sep=,
+		done
+		printf '],"deleted":['
+		sep=""
+		for s in ${deleted_rows[@]+"${deleted_rows[@]}"}; do
+			printf '%s"%s"' "$sep" "$s"
+			sep=,
+		done
+		printf '],"memory_snapshot":%s}\n' "$([[ $memory == 1 ]] && echo true || echo false)"
+	else
+		if ((slept + deleted == 0)); then
+			log "pool: nothing idle for ${idle}s, and nothing past the caps"
+		else
+			log "pool: $([[ $dry == 1 ]] && echo would || echo did) sleep $slept, delete $deleted"
+		fi
+	fi
+	return 0
+}
+
+cmd_pool() {
+	local sub=${1:-status}
+	shift || true
+	case "$sub" in
+	status | ls)
+		cmd_pool_status "$@"
+		;;
+	return)
+		cmd_pool_return "$@"
+		;;
+	take)
+		cmd_pool_take "$@"
+		;;
+	sleep | reap)
+		cmd_pool_sleep "$@"
+		;;
+	-h | --help | help | "")
+		cat <<'USAGE'
+usage: firecode pool take --project DIR [--json] [--boot]
+       firecode pool return <name|--project DIR> [--json] [--kill] [--sleep]
+       firecode pool sleep [--idle SEC] [--memory] [--json] [--dry-run]
+       firecode pool status [--json] [--project DIR]
+
+A warm pool of VMs per project, for reviewers and any session marked
+--reuse. `take` before booting, `return` when the session ends, `sleep` from
+a reaper's pass. See each verb's --help.
+USAGE
+		;;
+	*) die "unknown pool verb: $sub (try: firecode pool --help)" ;;
+	esac
+}
 
 NET_SLOT=""
 TAP_DEV=""
@@ -7997,7 +8626,7 @@ EOF
 			return "$rc"
 		fi
 		local saved
-		saved=$(link_unchanged "$WORKDIR" "$staging")
+		saved=$(reflink_unchanged "$WORKDIR" "$staging")
 		# THE RENAME IS THE ANNOUNCEMENT, and it is the last thing that
 		# happens: until then the tree is under a name nothing watches for, and
 		# afterwards every file of it is there. runs/<id>/copy_out is written
@@ -10285,6 +10914,10 @@ gc)
 state)
 	shift
 	cmd_state "$@"
+	;;
+pool)
+	shift
+	cmd_pool "$@"
 	;;
 snapshot | snap)
 	shift

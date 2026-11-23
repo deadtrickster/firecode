@@ -443,6 +443,70 @@ test_gc_budget_pass() {
 	contains "and the pass says it could not reach the target" "could not reach" "$out"
 }
 
+# THE POOL'S VERBS, on state directories that cost nothing and NO VM.
+#
+# What a dispatcher calls before booting (`take`), a session end calls
+# (`return`), and a reaper calls on a timer (`sleep`). The guest-side rules -
+# what a reset clears, what a resume reseeds - are asserted as text here, and
+# they are the arms that decide whether the next user sees the last one's files
+# or conversation.
+test_pool_primitives() {
+	local st proj slug pkey out cmd
+	st="$WORK/poolstate"
+	proj="$WORK/poolproj"
+	rm -rf "$st" "$proj"
+	mkdir -p "$st" "$proj"
+	manifest() { python3 "$ROOT/scripts/session-manifest.py" "$@"; }
+	slug=$(printf '%s-%s\n' "$(basename "$proj" | tr -c 'A-Za-z0-9._-' '-')" \
+		"$(printf '%s' "$proj" | sha256sum | cut -c1-8)")
+	pkey=$slug
+	dd if=/dev/zero of="$st/$slug.ext4" bs=1024 count=64 status=none
+	: >"$st/$slug-src.ext4"
+
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool status --json 2>&1)
+	contains "an empty pool answers in JSON" '"pool":[]' "$out"
+	contains "and carries its caps" '"per_project":2' "$out"
+
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool take \
+		--project "$proj" --json 2>&1)
+	contains "take says plainly when the pool is empty" '"reason":"empty"' "$out"
+
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool return "$slug" --json 2>&1)
+	check "return of a VM that is not running exits 0, so a hook may call it twice" 0 "$?"
+	contains "and says there was nothing to return" '"returned":false' "$out"
+
+	# A pool member, marked asleep, is what a dispatcher should find.
+	manifest set "$st/$slug.json" purpose=reviewer owner=letibot:x:1 worktree="$proj"
+	manifest extracted "$st/$slug.json" --nothing
+	manifest pool "$st/$slug.json" --project "$pkey" --state sleeping
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool status --json 2>&1)
+	contains "a sleeping member is listed with its state" '"state":"sleeping"' "$out"
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool take \
+		--project "$proj" --json 2>&1)
+	contains "take finds it" '"taken":true' "$out"
+	contains "and says it would have to resume it" '"resume":true' "$out"
+	contains "and marks it in use, not available" '"state":"in-use"' "$out"
+
+	# THE RULES a reset and a resume carry, as text. These are the two places
+	# where a pooled VM could leak one user into the next.
+	cmd=$(
+		eval "$(sed -n '/^pool_reset_command() {$/,/^}$/p' "$FIRECODE")"
+		pool_reset_command /work
+	)
+	contains "a reset hard-resets the worktree" "git reset --hard" "$cmd"
+	contains "and removes what is untracked and ignored" "git clean -xffdq" "$cmd"
+	contains "keeping the caches that make pooling worth it" "-e target" "$cmd"
+	contains "and clearing the agent's conversation" "rm -rf ~/.claude/projects" "$cmd"
+	contains "and the shell history" "~/.bash_history" "$cmd"
+	cmd=$(
+		eval "$(sed -n '/^pool_reseed_command() {$/,/^}$/p' "$FIRECODE")"
+		pool_reseed_command
+	)
+	contains "a resume reseeds the machine id" "machine-id" "$cmd"
+	contains "and mixes host entropy into /dev/random" "/dev/random" "$cmd"
+	contains "and regenerates the ssh host keys" "ssh-keygen -A" "$cmd"
+}
+
 test_host_transcripts_untouched() {
 	local real="$HOME/.claude/projects"
 	if [[ ! -d $real ]]; then
@@ -654,19 +718,30 @@ test_results_come_back() {
 		no "the original project did not get it" "NEWFILE.txt leaked into the source tree"
 	fi
 
-	# A result is mostly the project it came from, and a full second copy of
-	# it per run is what turns a project directory into landfill. What came
-	# back unchanged should cost nothing.
-	local a b
+	# A result is mostly the project it came from, and a hardlink into the
+	# project was how that was made cheap - which meant `sed -i` on one of
+	# those files edited the project THROUGH the result. It is a copy now.
+	# What came back identical is still cheap where the filesystem can clone
+	# (btrfs, xfs) and a real copy where it cannot (ext4); either way it is a
+	# file of its own.
+	local a b project_body after
 	a=$(stat -c %i "$project/README.md" 2>/dev/null)
 	b=$(stat -c %i "$result/README.md" 2>/dev/null)
-	if [[ -n $a && $a == "$b" ]]; then
-		ok "an unchanged file is not a second copy"
+	if [[ -n $a && $b != "$a" ]]; then
+		ok "an unchanged file in the result is not the project's inode"
 	else
-		no "an unchanged file is not a second copy" "inodes $a vs $b"
+		no "an unchanged file in the result is not the project's inode" "inodes $a vs $b"
 	fi
-	# ...but what the run actually wrote has to be its own file, or writing
-	# to the result would write to the project.
+	# The arm that matters: writing to it in place must not reach the project.
+	project_body=$(cat "$project/README.md")
+	echo "edited in the result" >>"$result/README.md"
+	after=$(cat "$project/README.md")
+	if [[ $after == "$project_body" ]]; then
+		ok "and an in-place edit of the result does not touch the project"
+	else
+		no "and an in-place edit of the result does not touch the project" \
+			"the project's README now reads: $after"
+	fi
 	if [[ $(stat -c %h "$result/NEWFILE.txt" 2>/dev/null) == "1" ]]; then
 		ok "and what changed is a file of its own"
 	else
@@ -3268,6 +3343,7 @@ run_test shellcheck
 run_test state_dir_is_never_the_real_one
 run_test state_lifecycle
 run_test gc_budget_pass
+run_test pool_primitives
 run_test cached_image_matches_guest
 run_test boot_timings_read_a_boot
 run_test guest_memory_is_declared

@@ -983,12 +983,12 @@ doctor` checks). `LIBVIRT_DEFAULT_URI` overrides either.
   authenticates through this host and leaves the VM holding none. The
   isolation is of the host filesystem; without the relay it is not of your
   API keys.
-- The result directory looks like a full copy of the project, but the files
-  that came back unchanged are hardlinks to the ones already on disk, so it
-  costs what the run actually changed. Diff it, read it, delete it freely.
-  Editing one of those files *in place* edits the project, since they are the
-  same file - editors that save by rename (most, Emacs included) break the
-  link first and are safe; `sed -i` and shell appends are not.
+- The result directory looks like a full copy of the project, and the files
+  that came back unchanged are copies of the ones on disk: cloned where the
+  filesystem supports it (`cp --reflink=auto`, so btrfs and xfs share the
+  blocks and it costs nothing) and a real copy on ext4. Diff it, read it, edit
+  it in place, delete it freely - a `sed -i` in the result cannot reach the
+  project. That used to be a hardlink, which meant it could.
 - Two runs at once on one project: the second gets throwaway copies of the
   state drive and the workspace layer, so what it installs is not kept and its
   session is not resumable. It says so at the time. (Until recently the layer
