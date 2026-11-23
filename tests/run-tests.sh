@@ -1274,6 +1274,7 @@ test_disk_guard_refuses_before_a_layer() {
 				fi
 			}
 			gc_state_pass() { printf 'reclaimed: [%s]\n' "$*" >&2; }
+			gc_state_budget() { printf 'budget: [%s]\n' "$*" >&2; }
 			eval "$(sed -n '/^disk_guard_for_layer() {$/,/^}$/p' "$FIRECODE")"
 			disk_guard_for_layer "a workspace layer" 2>&1
 		)
@@ -1297,6 +1298,7 @@ test_disk_guard_refuses_before_a_layer() {
 	out=$(guard 10 10)
 	rc=$?
 	check "short of room with nothing to reclaim refuses to boot" "3" "$rc"
+	contains "and the boot pass tries the budget before refusing" "budget: [161061273600 14d 0 0 0]" "$out"
 	contains "and says how much is left" "10G free on the filesystem holding" "$out"
 	contains "and what to do about it" "firecode gc --state" "$out"
 	contains "and the variable that moves the floor" "FIRECODE_MIN_FREE" "$out"

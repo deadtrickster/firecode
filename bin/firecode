@@ -1517,6 +1517,16 @@ disk_guard_for_layer() {
 	avail=$(free_gb_of "$STATE_DIR")
 	[[ -n $avail ]] || return 0
 	((avail >= min)) && return 0
+	# Then the budget pass, which is the only thing that may remove a session
+	# whose work is out. This is the one place firecode reclaims without being
+	# asked: a guest that fills the filesystem kills every VM on the host, so
+	# the moment before a new disk is made is the moment to act.
+	log "  still short: keeping the state under ${FIRECODE_STATE_BUDGET:-150G} (firecode gc --state --budget)"
+	gc_state_budget "$(numfmt --from=iec "${FIRECODE_STATE_BUDGET:-150G}" 2>/dev/null || echo 161061273600)" \
+		"${FIRECODE_STATE_MAX_AGE:-14d}" 0 0 0
+	avail=$(free_gb_of "$STATE_DIR")
+	[[ -n $avail ]] || return 0
+	((avail >= min)) && return 0
 	die "refusing to start a VM: ${avail}G free on the filesystem holding $STATE_DIR,
        and ${what} needs to make a new disk there (the floor is ${min}G).
        A guest that fills this filesystem kills every VM on the host, so this
