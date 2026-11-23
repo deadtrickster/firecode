@@ -5957,6 +5957,146 @@ alloc_net_slot() {
 	return 1
 }
 
+# THE HOST'S OWN SERVICES ARE NOT THE GUEST'S BUSINESS.
+#
+# Shielding the guest from the network is not the point - the LAN and the
+# internet stay open on purpose, because an agent that cannot fetch a crate is
+# not useful. What a guest should NOT be able to do is use this machine's own
+# addresses to reach services that were never meant to be public: sshd, a dev
+# server on 0.0.0.0, a database somebody started for a test. From inside the
+# guest those are just "the LAN", and the host's own firewall allowed
+# everything.
+#
+# Everything a guest legitimately needs from the host - the model relay, the
+# room, MCP ports - arrives over VSOCK, not over IP, so the default allow-list
+# is empty. A host whose resolver or gateway the guests use says so by listing
+# the ports: FIRECODE_HOST_ALLOW_PORTS="53 8080".
+#
+# The rules are printed by a function rather than written inline, because a rule
+# nobody can read is a rule nobody checks - `firecode net host-guard --print`
+# and the test of its text are the two things that keep this honest.
+host_guard_ports() {
+	local p
+	for p in ${FIRECODE_HOST_ALLOW_PORTS:-}; do
+		[[ $p =~ ^[0-9]+$ ]] && printf '%s\n' "$p"
+	done
+}
+
+host_guard_rules() {
+	local slot=$1 guest ports
+	guest="172.16.$slot.2"
+	ports=$(host_guard_ports | sort -un | tr '\n' ' ')
+	ports=${ports% }
+	if [[ -n $ports ]]; then
+		# Ahead of the drop, and only on INPUT: this is the host's own
+		# door, not the way out to the LAN.
+		printf -- '-A INPUT -s %s/32 -p tcp -m multiport --dports %s -j ACCEPT\n' \
+			"$guest" "${ports// /,}"
+		printf -- '-A INPUT -s %s/32 -p udp -m multiport --dports %s -j ACCEPT\n' \
+			"$guest" "${ports// /,}"
+	fi
+	printf -- '-A INPUT -s %s/32 -j DROP\n' "$guest"
+}
+
+# Apply or remove one slot's guard. Idempotent: a rule that is already there is
+# not added twice, which matters because a tap made by net-setup applies it
+# once and every run over it would otherwise add another copy.
+host_guard_apply() {
+	local slot=$1 rule
+	command -v iptables >/dev/null 2>&1 || return 0
+	while IFS= read -r rule; do
+		[[ -n $rule ]] || continue
+		# shellcheck disable=SC2086  # an iptables rule is words by construction
+		priv iptables -C $rule 2>/dev/null ||
+			priv iptables ${rule/-A INPUT/-I INPUT} || true
+	done < <(host_guard_rules "$slot")
+}
+
+host_guard_remove() {
+	local slot=$1 rule
+	command -v iptables >/dev/null 2>&1 || return 0
+	while IFS= read -r rule; do
+		[[ -n $rule ]] || continue
+		# shellcheck disable=SC2086  # as above
+		priv iptables -D $rule 2>/dev/null || true
+	done < <(host_guard_rules "$slot")
+}
+
+cmd_net_host_guard() {
+	local slot=${NET_SLOT:-0} mode=print json=0
+	while (($#)); do
+		case "$1" in
+		--slot)
+			slot=$2
+			shift 2
+			;;
+		--print)
+			mode=print
+			shift
+			;;
+		--apply)
+			mode=apply
+			shift
+			;;
+		--remove)
+			mode=remove
+			shift
+			;;
+		--json)
+			json=1
+			shift
+			;;
+		-h | --help)
+			cat <<'USAGE'
+usage: firecode net host-guard [--slot N] [--print | --apply | --remove] [--json]
+
+  The rules that stop a guest reaching this host's own services on this host's
+  own addresses, while leaving the LAN and the internet alone (they are the
+  FORWARD rules, and they are not touched).
+
+  A guest needs nothing over IP from this host: the model relay, the room and
+  MCP ports all arrive over vsock. A host whose DNS or gateway the guests use
+  lists the ports: FIRECODE_HOST_ALLOW_PORTS="53 8080".
+
+  --print (default) shows the rules and changes nothing; --apply inserts them
+  at the head of INPUT (needs root, like every other network rule); --remove
+  takes them out.
+USAGE
+			return 0
+			;;
+		*) die "usage: firecode net host-guard [--slot N] [--print|--apply|--remove]" ;;
+		esac
+	done
+	if [[ $mode == print ]]; then
+		if ((json)); then
+			local sep="" p
+			printf '{"slot":%s,"allow_ports":[' "$slot"
+			while IFS= read -r p; do
+				printf '%s%s' "$sep" "$p"
+				sep=,
+			done < <(host_guard_ports)
+			printf '],"rules":['
+			sep=""
+			while IFS= read -r p; do
+				printf '%s"%s"' "$sep" "$p"
+				sep=,
+			done < <(host_guard_rules "$slot")
+			printf ']}\n'
+		else
+			host_guard_rules "$slot"
+		fi
+		return 0
+	fi
+	if [[ $mode == apply ]]; then
+		host_guard_apply "$slot"
+		log "host guard applied on 172.16.$slot.2 (only vsock reaches this host, by design)"
+	else
+		host_guard_remove "$slot"
+		log "host guard removed on 172.16.$slot.2"
+	fi
+	return 0
+}
+
 # One-time root setup for a tap. Made persistent and owned by the invoking
 # user, so afterwards firecracker can open it with no privileges at all.
 net_create_tap() {
@@ -6011,6 +6151,9 @@ net_create_tap() {
 		priv iptables -I FORWARD 1 -i "$dev" -j ACCEPT
 	priv iptables -C FORWARD -o "$dev" -j ACCEPT 2>/dev/null ||
 		priv iptables -I FORWARD 1 -o "$dev" -j ACCEPT
+	# And the host's own door. The LAN is forward traffic; this is INPUT, and
+	# it is the only place a guest could reach this machine's own services.
+	host_guard_apply "$slot"
 }
 
 net_up() {
@@ -6045,6 +6188,7 @@ net_down() {
 			! -o "$TAP_DEV" -j MASQUERADE 2>/dev/null || true
 		priv iptables -D FORWARD -i "$TAP_DEV" -j ACCEPT 2>/dev/null || true
 		priv iptables -D FORWARD -o "$TAP_DEV" -j ACCEPT 2>/dev/null || true
+		host_guard_remove "$NET_SLOT"
 		priv ip link del "$TAP_DEV" 2>/dev/null || true
 	fi
 	TAP_DEV=""
@@ -6076,6 +6220,7 @@ cmd_net_setup() {
 					! -o "$dev" -j MASQUERADE 2>/dev/null || true
 				priv iptables -D FORWARD -i "$dev" -j ACCEPT 2>/dev/null || true
 				priv iptables -D FORWARD -o "$dev" -j ACCEPT 2>/dev/null || true
+				host_guard_remove "$s"
 				priv ip link del "$dev" 2>/dev/null || true
 				log "removed $dev"
 			done
@@ -10926,6 +11071,25 @@ snapshot | snap)
 net-setup)
 	shift
 	cmd_net_setup "$@"
+	;;
+net)
+	shift
+	sub=${1:-}
+	shift || true
+	case "$sub" in
+	host-guard | guard) cmd_net_host_guard "$@" ;;
+	setup) cmd_net_setup "$@" ;;
+	*)
+		cat <<'USAGE'
+usage: firecode net host-guard [--slot N] [--print | --apply | --remove]
+       firecode net setup [--count N] [--teardown]
+
+  host-guard  the rule that stops a guest reaching this host's own services,
+              leaving the LAN and the internet open (--print shows it)
+  setup       pre-create taps so ordinary runs need no root
+USAGE
+		;;
+	esac
 	;;
 spawn-server)
 	shift

@@ -507,6 +507,55 @@ test_pool_primitives() {
 	contains "and regenerates the ssh host keys" "ssh-keygen -A" "$cmd"
 }
 
+# THE HOST'S OWN DOOR, AS A RULE THAT CAN BE READ.
+#
+# The guest is allowed the LAN and the internet on purpose - that is not what
+# this guards. What it stops is a guest reaching this machine's own services on
+# this machine's own addresses, which the FORWARD rules never covered. The rule
+# is asserted as TEXT because that is the whole review: an INPUT drop for the
+# guest's address, ahead of nothing that would let it through, with the allowed
+# ports named before it when a host has any.
+test_host_guard_rules() {
+	local out rules
+	rules() {
+		(
+			eval "$(sed -n '/^host_guard_ports() {$/,/^}$/p' "$FIRECODE")"
+			eval "$(sed -n '/^host_guard_rules() {$/,/^}$/p' "$FIRECODE")"
+			host_guard_rules "$1"
+		)
+	}
+
+	out=$(rules 3)
+	contains "the guest's own address is dropped on INPUT" \
+		"-A INPUT -s 172.16.3.2/32 -j DROP" "$out"
+	check "and nothing is allowed to the host by default" "1" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+	if [[ $out == *FORWARD* ]]; then
+		no "the LAN and the internet are not touched" "$out"
+	else
+		ok "the LAN and the internet are not touched"
+	fi
+
+	# A host that runs something the guests need says so, and the allowance is
+	# inserted AHEAD of the drop - a rule after it would never be reached.
+	out=$(FIRECODE_HOST_ALLOW_PORTS="53 8080" rules 2)
+	contains "an allowed port gets an ACCEPT" "--dports 53,8080 -j ACCEPT" "$out"
+	contains "for tcp" "-p tcp" "$out"
+	contains "and udp" "-p udp" "$out"
+	check "before the drop" "yes" \
+		"$(printf '%s\n' "$out" | awk '/ACCEPT/ {a = NR} /DROP/ {d = NR} END {print (a && d && a < d) ? "yes" : "no"}')"
+
+	# And the same text comes out of the command a person runs, with no root.
+	out=$("$FIRECODE" net host-guard --slot 4 --print 2>&1)
+	contains "net host-guard --print shows the rule" "172.16.4.2/32" "$out"
+	out=$("$FIRECODE" net host-guard --slot 4 --json 2>&1)
+	contains "--json carries the same rules" '"rules":[' "$out"
+	if "$FIRECODE" net host-guard --nonsense >/dev/null 2>&1; then
+		no "an unknown host-guard flag is refused" "exited 0"
+	else
+		ok "an unknown host-guard flag is refused"
+	fi
+}
+
 test_host_transcripts_untouched() {
 	local real="$HOME/.claude/projects"
 	if [[ ! -d $real ]]; then
@@ -3344,6 +3393,7 @@ run_test state_dir_is_never_the_real_one
 run_test state_lifecycle
 run_test gc_budget_pass
 run_test pool_primitives
+run_test host_guard_rules
 run_test cached_image_matches_guest
 run_test boot_timings_read_a_boot
 run_test guest_memory_is_declared
