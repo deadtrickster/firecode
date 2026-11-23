@@ -472,14 +472,41 @@ test_pool_primitives() {
 		--project "$proj" --json 2>&1)
 	contains "take says plainly when the pool is empty" '"reason":"empty"' "$out"
 
+	# NOTHING NOBODY CAN NAME IS POOLED. A drive with no manifest may be state
+	# from before manifests; there is no project to pool it for, and saying "no
+	# such session" about a file that is right there would be a lie a hook could
+	# act on. Exit 0: there is nothing to return.
 	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool return "$slug" --json 2>&1)
-	check "return of a VM that is not running exits 0, so a hook may call it twice" 0 "$?"
-	contains "and says there was nothing to return" '"returned":false' "$out"
+	check "return of a drive nobody can name exits 0, so a hook may call it twice" 0 "$?"
+	contains "and says there is no project recorded" "no project recorded" "$out"
+	contains "and it is not returning anything" '"returned":false' "$out"
+
+	# NOTHING UNEXTRACTED IS POOLED EITHER: its drives are the only copy of its
+	# work, and a return that answered 0 would tell a session-end hook the state
+	# was safe to drop.
+	manifest set "$st/$slug.json" purpose=reviewer owner=letibot:x:1 worktree="$proj"
+	manifest add-run "$st/$slug.json" firecode-20260101-000000-1
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool return "$slug" --json 2>&1)
+	check "return of state whose work nobody verified refuses" 1 "$?"
+	contains "and it says the work is not out" "its work is not out" "$out"
+	contains "and that it is keeping what it has" '"returned":false' "$out"
 
 	# A pool member, marked asleep, is what a dispatcher should find.
-	manifest set "$st/$slug.json" purpose=reviewer owner=letibot:x:1 worktree="$proj"
 	manifest extracted "$st/$slug.json" --nothing
 	manifest pool "$st/$slug.json" --project "$pkey" --state sleeping
+
+	# A VM that has already stopped - what `exec` leaves behind - goes back as
+	# its DISKS, with the reset no guest was there to run owed to the next boot.
+	# Exit 0 twice, because a session-end hook calls this and may call it again.
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool return "$slug" --json 2>&1)
+	check "return of a stopped VM whose work is out exits 0" 0 "$?"
+	contains "and it goes back to the pool" '"returned":true' "$out"
+	contains "asleep, because nothing is running" '"state":"sleeping"' "$out"
+	contains "owing the reset to the next boot" '"reset":"owed"' "$out"
+	contains "and the manifest records the debt" "reset_owed" "$(cat "$st/$slug.json")"
+	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool return "$slug" --json 2>&1)
+	check "and a second call, as a hook may make, is still exit 0" 0 "$?"
+
 	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool status --json 2>&1)
 	contains "a sleeping member is listed with its state" '"state":"sleeping"' "$out"
 	out=$(FIRECODE_STATE="$st" FIRECODE_RUNS="$WORK/pool-runs" "$FIRECODE" pool take \
@@ -497,9 +524,12 @@ test_pool_primitives() {
 	contains "a reset hard-resets the worktree" "git reset --hard" "$cmd"
 	contains "and removes what is untracked and ignored" "git clean -xffdq" "$cmd"
 	contains "keeping the caches that make pooling worth it" "-e target" "$cmd"
-	contains "and clearing the agent's conversation" "rm -rf ~/.claude/projects" "$cmd"
-	# shellcheck disable=SC2088  # the guest command's tilde, not this shell's
-	contains "and the shell history" "~/.bash_history" "$cmd"
+	# THE RUN USER'S HOME, not root's: the guest runs the agent as the host's
+	# user, so `~` in a script the host sends as root cleared /root and none of
+	# the conversation this exists to clear.
+	contains "and clearing the agent's conversation" "rm -rf $HOME/.claude/projects" "$cmd"
+	contains "and the shell history" "$HOME/.bash_history" "$cmd"
+	check "in the run user's home, not root's" no "$([[ $cmd == *'~/.claude'* || $cmd == *'~/.'* ]] && echo yes || echo no)"
 	cmd=$(
 		eval "$(sed -n '/^pool_reseed_command() {$/,/^}$/p' "$FIRECODE")"
 		pool_reseed_command
@@ -1524,6 +1554,11 @@ test_ephemeral_vm_releases_state() {
 
 test_ro_image_cached() {
 	local project ref out1
+	# And a project to run in. `local project` alone left it UNSET on bash 5.3,
+	# where `local x` no longer means `x=""` - so the first "$project" under
+	# set -u killed the whole suite, at a test that has nothing to do with what
+	# the run was checking.
+	project=$(make_project)
 	ref="$WORK/testref"
 	mkdir -p "$ref"
 	echo "reference material" >"$ref/note.txt"
