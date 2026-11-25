@@ -3217,7 +3217,8 @@ test_ps_orphans_are_named() {
 		ok "a live owner is not called gone"
 	fi
 
-	json=$(FIRECODE_ROOT="$root" "$FIRECODE" ps --json --orphans 2>&1)
+	# stdout for the machine arm, for the reason `ps --json` below gives.
+	json=$(FIRECODE_ROOT="$root" "$FIRECODE" ps --json --orphans 2>/dev/null)
 	check "--json --orphans carries just the orphan" "1 vm-orphan letibot:s1:999999" \
 		"$(printf '%s' "$json" | python3 -c '
 import json, sys
@@ -3308,7 +3309,12 @@ test_ps_json_is_not_the_prose() {
 	# is the thing being checked, so the test brings its own.
 	root=$(make_empty_root)
 	prose=$(FIRECODE_ROOT="$root" "$FIRECODE" ps 2>&1)
-	json=$(FIRECODE_ROOT="$root" "$FIRECODE" ps --json 2>&1)
+	# The machine arm is read off stdout. stderr is a person's channel: on a Mac
+	# whose short jail alias is another checkout's (the suite's own state
+	# directory moves JAIL_BASE away from it), every call opens with the
+	# "vsock paths may be too long" warning, and a warning in front of the
+	# document made this arm unparseable there.
+	json=$(FIRECODE_ROOT="$root" "$FIRECODE" ps --json 2>/dev/null)
 
 	if [[ $prose == "$json" ]]; then
 		no "--json changes the answer" "both arms printed [$prose]"
@@ -3382,7 +3388,8 @@ test_projects_is_a_registry_not_a_config_file() {
 	local root prose json shape
 	root=$(make_spawn_root)
 	prose=$(FIRECODE_ROOT="$root" "$FIRECODE" projects 2>&1)
-	json=$(FIRECODE_ROOT="$root" "$FIRECODE" projects --json 2>&1)
+	# stdout for the machine arm, for the reason `ps --json` above gives.
+	json=$(FIRECODE_ROOT="$root" "$FIRECODE" projects --json 2>/dev/null)
 
 	if [[ $prose == "$json" ]]; then
 		no "projects --json changes the answer" "both arms printed the same"
