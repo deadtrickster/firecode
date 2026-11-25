@@ -2677,9 +2677,19 @@ cg_alive() {
 	if ((MACOS)); then
 		local -a procfiles
 		mapfile -t procfiles < <(find "$1" -name cgroup.procs 2>/dev/null)
-		((${#procfiles[@]})) || return 1
-		[[ -n $(_cg_live "${procfiles[@]}") ]]
-		return
+		# No `cgroup.procs` anywhere, so this is not a pseudo-cgroup a Mac's own
+		# run made (`cg_join` writes one) - it is the same record in the other
+		# spelling, the one the Linux guard reads below. No run on a Mac writes
+		# `cgroup.events`, so nothing real reaches this arm; what does is a
+		# directory stood up by hand, and the suite stands one up on every host
+		# ("a plain directory with `populated 1` in it is a live run"). Reading it
+		# here is what makes that sentence true on a Mac too - `ps --orphans` and
+		# `down`'s escalation both ask this question before anything else, so on a
+		# Mac they answered about nothing.
+		if ((${#procfiles[@]})); then
+			[[ -n $(_cg_live "${procfiles[@]}") ]]
+			return
+		fi
 	fi
 	grep -qs '^populated 1' "$1/cgroup.events"
 }
