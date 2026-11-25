@@ -6865,7 +6865,14 @@ ephemeral_release() {
 	# Our own lock is on a file about to be unlinked: close it, so the next run
 	# of this project locks a fresh inode rather than a deleted one.
 	if [[ -n ${STATE_FD:-} ]]; then
-		exec {STATE_FD}>&- 2>/dev/null || true
+		# `exec` with no command applies its redirections to THIS shell, so the
+		# `2>/dev/null` that used to sit on this line silenced the rest of the
+		# exit trap - the "ephemeral: removed ..." line below included. Measured
+		# 2026-11-25 on a Mac, where STATE_FD is live here and the number the run
+		# reports was written to state_freed while the sentence never reached
+		# anybody. Braced, so the redirect belongs to the compound and not to the
+		# shell that outlives it.
+		{ exec {STATE_FD}>&-; } 2>/dev/null || true
 		STATE_FD=""
 	fi
 	# Sizes first: du after the rm reports nothing, and the number is the point.
